@@ -13,6 +13,7 @@ never emit game content into the repo (outputs go to the git-ignored `private/`)
 | `cdb_*.txt` | cdb command scripts for crash/throw triage (`-cf`). |
 | `find_init_arrays.py` | Scan the decrypted image for null-bracketed code-pointer arrays (locates C++ static-initializer `.CRT$XC*` tables / vtables for startup RE). Needs pycryptodome. |
 | `find_initterm.py` | Find `_initterm`/`mainCRTStartup` candidates (small indirect-call-loop funcs + their root callers) for startup RE. |
+| `find_maincrt.py` | Find mainCRTStartup candidates (root funcs with CRT-startup signature). Note: indirect/vtable calls make 11k+ functions appear as roots, so static heuristics can't pin it — needs dynamic/decompiler analysis. |
 | `find_xrefs.py` | Find code references to a guest address via `lis`+`addi/ori` formation (xref analysis for startup RE; note: misses `lis`+load/store-offset patterns). Needs pycryptodome. |
 
 Examples (PowerShell):
