@@ -276,6 +276,69 @@ index 60efcd3..feff977 100644
        // Wait.
        if (wait >= 0x100) {
          PrepareForWait();
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index b8eae3c..3ad8199 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #if REX_PLATFORM_WIN32
+@@ -140,6 +141,50 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
++  // [TEST-INJECT] Drive input programmatically when SDL can't receive synthetic keys
++  // (background automation / UIPI: a real keypress is never delivered to SDL's keyboard).
++  // REX_INJECT_SCRIPT="t:hexbtn,t:hexbtn,..." presses each XInput button mask at time t
++  // (seconds since first poll) for REX_INJECT_DUR seconds (default 0.5). Bypasses the
++  // focus gate. Diagnostic/verification only; absent => normal input path.
++  static const char* s_script = std::getenv("REX_INJECT_SCRIPT");
++  if (s_script && out_state) {
++    static const double dur = std::getenv("REX_INJECT_DUR") ? std::atof(std::getenv("REX_INJECT_DUR")) : 0.5;
++    static const unsigned long long t0 = GetTickCount64();
++    double el = (GetTickCount64() - t0) / 1000.0;
++    uint16_t btn = 0;
++    for (const char* p = s_script; *p;) {
++      double t = std::atof(p);
++      const char* colon = std::strchr(p, ':');
++      if (!colon) break;
++      uint16_t b = static_cast<uint16_t>(std::strtoul(colon + 1, nullptr, 16));
++      if (el >= t && el < t + dur) btn |= b;
++      const char* comma = std::strchr(colon, ',');
++      if (!comma) break;
++      p = comma + 1;
++    }
++    // Feed the keystroke queue on button edges (menus often poll XamInputGetKeystroke).
++    static uint16_t s_last = 0;
++    if (btn != s_last) {
++      auto vkfor = [](uint16_t m) -> uint16_t {
++        if (m & 0x0010) return 0x5814;  // START
++        if (m & 0x0020) return 0x5815;  // BACK
++        if (m & 0x1000) return 0x5800;  // A
++        if (m & 0x2000) return 0x5801;  // B
++        if (m & 0x0001) return 0x5810;  // DPAD_UP
++        if (m & 0x0002) return 0x5811;  // DPAD_DOWN
++        if (m & 0x0004) return 0x5812;  // DPAD_LEFT
++        if (m & 0x0008) return 0x5813;  // DPAD_RIGHT
++        return 0; };
++      uint16_t v = vkfor(static_cast<uint16_t>(btn | s_last));
++      if (v) { std::lock_guard lk(state_mutex_); EnqueueKeystroke(v, btn != 0); }
++      s_last = btn;
++    }
++    std::memset(out_state, 0, sizeof(*out_state));
++    out_state->packet_number = ++packet_number_;
++    out_state->gamepad.buttons = btn;
++    return X_ERROR_SUCCESS;
++  }
++
+   UpdateMouseCapture();
+ 
+   if (!is_active() || !has_focus_) {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_debug.cpp b/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
 index 670c446..8c283b8 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
@@ -326,7 +389,7 @@ index 670c446..8c283b8 100644
  
  void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
-index 8b862fc..3954907 100644
+index 8b862fc..c83e713 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
 @@ -21,6 +21,7 @@
@@ -337,7 +400,7 @@ index 8b862fc..3954907 100644
  #include <rex/types.h>
  #include <rex/string.h>
  #include <rex/system/kernel_state.h>
-@@ -555,13 +556,54 @@ u32 RtlComputeCrc32_entry(u32 seed, mapped_void buffer, u32 length) {
+@@ -555,13 +556,53 @@ u32 RtlComputeCrc32_entry(u32 seed, mapped_void buffer, u32 length) {
  }
  
  void RtlCaptureContext_entry() {
@@ -391,7 +454,6 @@ index 8b862fc..3954907 100644
 +  // to a target handler and does NOT return. Raise a host exception so the nearest
 +  // generated SEH_CATCH_ALL wrapper catches it (recompiled-CRT SEH support; the wrapper
 +  // restores the caller frame and returns failure). See src/codegen/function_graph.cpp.
-+  REXKRNL_WARN("RtlUnwind: raising guest SEH unwind to nearest SEH_CATCH_ALL handler");
 +  rex::platform::seh_raise_guest_unwind();
  }
  
