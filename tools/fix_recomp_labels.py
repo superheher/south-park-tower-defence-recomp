@@ -222,7 +222,36 @@ for init_path in glob.glob(os.path.join(GEN, "*_init.cpp")):
             fh.write(txt)
         stub_registered += 1
 
+# --- Fix 5: rewrite rexglue "Unresolved branch" REX_FATALs to a tail call when the target
+# is a known function. rexglue emits REX_FATAL("Unresolved branch from 0xA to 0xB") for an
+# intra-function branch whose target block it couldn't form; if 0xB is registered as a
+# function (e.g. via config/sp_functions.toml), call it + return. NOTE: for a backward
+# (loop) branch this is recursion-as-iteration — fine for shallow loops; a deep loop would
+# need a real local block. Preserves any leading `if (cond)`.
+ub_re = re.compile(
+    r'^(\s*)(if \(.*\) )?REX_FATAL\("Unresolved branch from 0x[0-9A-Fa-f]+ to 0x([0-9A-Fa-f]+)"\);\s*$')
+ub_fixed = 0
+for path in files:
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().splitlines()
+    changed = False
+    for i, ln in enumerate(lines):
+        m = ub_re.match(ln)
+        if not m:
+            continue
+        indent, cond, tgt = m.group(1), m.group(2), m.group(3).upper()
+        if tgt not in func_addrs:
+            continue
+        action = f"sub_{tgt}(ctx, base); return;"
+        lines[i] = f"{indent}{cond}{{ {action} }}" if cond else f"{indent}{action}"
+        ub_fixed += 1
+        changed = True
+    if changed:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines) + "\n")
+
 print(f"defined functions      : {len(func_addrs)}")
+print(f"unresolved-branch -> tail call : {ub_fixed}")
 print(f"EH hook-null fix (sub_8242EEA0): {eh_patched} applied")
 print(f"missing-stub 0x822E38E0: emitted={stub_emitted} registered={stub_registered}")
 print(f"files changed          : {files_changed}/{len(files)}")

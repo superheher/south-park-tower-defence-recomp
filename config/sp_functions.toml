@@ -673,3 +673,4 @@
 "0x825ACF2C" = {}
 "0x825ACF34" = {}
 "0x825ACF94" = {}
+"0x8235278C" = {}  # unresolved-branch target (post-SEH intro-movie path)

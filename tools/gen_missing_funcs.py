@@ -38,6 +38,7 @@ KNOWN_COMPUTED = [
     0x822E38E0,  # adjustor thunk: addi r3,r3,8; b 0x822E2298 (also sub_822E38E8 branch target)
     0x82250288,  # virtual-dispatch tail inside sub_822501C8
     0x82247E20,  # tiny getter (li r3,50; blr) inside sub_82247D58; static-ptr but belt-and-suspenders
+    0x8235278C,  # "Unresolved branch from 0x82352808" target (post-SEH, intro-movie path)
 ]
 
 
