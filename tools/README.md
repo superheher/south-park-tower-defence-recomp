@@ -8,6 +8,9 @@ never emit game content into the repo (outputs go to the git-ignored `private/`)
 | `stfs_extract.py` | Extract files from an STFS (CON/LIVE/PIRS) package — XBLA games, DLC, title updates. `--list`, `--only NAME`, or extract all with `-o DIR`. Validated block→offset math (hash-block skipping); follows the contiguous-block fast path. |
 | `stfs_recon.py` | Dump STFS header + volume descriptor + first file-table entries (calibration / sanity check). |
 | `xex_recon.py` | Parse the plaintext XEX2 header: module flags, base/entry/image size, compression/encryption type, and import libraries + per-library import-record counts. |
+| `xex_decrypt.py` | Independent XEX2 **decrypt + basic-decompress** (retail AES key → session key → CBC → basic blocks), then dump/decode 32-bit words at an address. Cross-checks the recompiler's decode and resolves entry-point questions. Needs `pip install pycryptodome`. Usage: `python tools/xex_decrypt.py private/default.xex 0x824499A0`. |
+| `scan_recomp.py` / `fix_recomp_labels.py` | Scan / post-codegen fixup of generated C++ (see Phase 2/3 notes). |
+| `cdb_*.txt` | cdb command scripts for crash/throw triage (`-cf`). |
 
 Examples (PowerShell):
 
