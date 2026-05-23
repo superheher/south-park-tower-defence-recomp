@@ -65,11 +65,26 @@ class Stfs:
         return self.f.read(n)
 
     def backing(self, b):
+        # Xenia STFS BlockToOffsetSTFS (authoritative). One hash table per level
+        # (0xAA, 0xAA^2, 0xAA^3 blocks). Each *iterated* level adds
+        # ((b + base) // base) * f, which is >=1 even within the first group because
+        # the hash table precedes its data. f = hash-table copies (1 read-only, 2 RW).
+        # (Earlier `b + f*(b//0xAA + ...)` dropped the per-level +1 and drifted by one
+        # block from block 0xAA on, corrupting later sections like .data.)
         f = self.factor
-        return b + f * (b // 0xAA + b // 0x70E4 + b // 0x4AF768)
+        base = 0xAA
+        block = b
+        for _ in range(3):
+            block += ((b + base) // base) * f
+            if b < base:
+                break
+            base *= 0xAA
+        return block
 
     def offset(self, b):
-        return DATA_BASE + self.backing(b) * BLOCK
+        # Block 0's data sits one block after the rounded header (0xB000 -> 0xC000),
+        # and backing(0)==1, so the rounded-header base is DATA_BASE - BLOCK.
+        return (DATA_BASE - BLOCK) + self.backing(b) * BLOCK
 
     def read_block(self, b):
         return self._read_at(self.offset(b), BLOCK)
