@@ -1,13 +1,25 @@
 # RUN.md — building, running, and continuing bring-up
 
-> **Status (2026-05-24):** the recomp **boots all the way to the TITLE SCREEN** —
-> "SOUTH PARK: LET'S GO TOWER DEFENSE PLAY!" with the four boys and **"PRESS START"**
-> (verified by screenshot). Path: runtime init → loads `default.xex` → loads TGA image
-> assets → renders the **animated intro** (Cartman over the town) → intro movie → **title
-> screen**. The long-standing post-rendering hang is **FIXED** (see "The fix that reached
-> the title screen"). Earlier "renders town then black-hangs / doesn't boot" notes are
-> superseded. Full evidence: `knowledge-base/titles/south-park-lgtdp/35-entry-forensics.md`
-> + `40-seh-implementation-plan.md`.
+> **Status (2026-05-24):** the recomp is **INTERACTIVE** — boot → intro → title screen →
+> **MAIN MENU** → LOCAL GAME → **LOBBY** (verified by screenshots). The four boys, the menu
+> (LOCAL GAME / SCRAPBOOK / …), and the local-game lobby ("1/4 SIGNED IN") all render, and
+> **input works** — pressing Start advances title→menu, A selects LOCAL GAME→lobby. Path:
+> runtime init → `default.xex` → TGA image assets → animated intro (Cartman over the town) →
+> intro movie → title → menu → lobby. The long-standing post-render hang is **FIXED** (custom
+> setjmp/longjmp image-EH, below). Full evidence:
+> `knowledge-base/titles/south-park-lgtdp/35-entry-forensics.md` + `40-seh-implementation-plan.md`.
+>
+> **Driving input (important):** real users press a focused gamepad/keyboard normally — the
+> plumbing is wired (`XamInputGetState`/`GetKeystroke` ← `input_system` ← mnk/SDL). **Automated**
+> input must use the env-gated injector (synthetic OS keys never reach SDL here):
+> `REX_INJECT_SCRIPT="66:0010"` presses START at 66 s (`0010`=START, `1000`=A; comma-separate
+> `t:hexbtn` steps; `REX_INJECT_DUR` = hold seconds). That's how the menu/lobby were reached.
+>
+> **Known blockers past the lobby:** (a) a **non-deterministic GPU-fence stall** (main thread
+> spins in `sub_821C6E58` waiting for a guest GPU fence that sometimes doesn't advance → some
+> runs never reach input; proper fix = runtime GPU fence write-back); (b) a **lobby→match crash**
+> `SEH FAULT 0x1A in sub_82101AF0` (the menu/lobby action handler near-null-derefs; also fires
+> on rapid-repeated Start — use single presses with gaps).
 >
 > **The fix that reached the title screen (config-only, no SDK change):** the post-render
 > hang was a **custom setjmp/longjmp EH for image-format detection** — the loader tries
