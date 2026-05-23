@@ -137,7 +137,42 @@ for init_path in glob.glob(os.path.join(GEN, "*_init.cpp")):
         with open(init_path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join(out) + "\n")
 
+# --- Fix 3: EH "enter-try" dispatcher returns 0 when its global hook is null ---
+# sub_8242EEA0 tail-calls a runtime-installed setjmp-style hook at [0x82902438] when set,
+# else FALLS THROUGH leaving r3 = the caller's stale &localbuf (non-zero). That hook is
+# image-initialised to 0 and no installer runs before the worker threads that use it, so
+# callers (e.g. sub_8226F978, the writer factory's init gate) read the stale non-zero r3
+# as "longjmp taken -> SKIP body" and skip critical init callbacks (sub_82277570 sets the
+# writer's buffer cursor [+8] and [+68]) -> null-pointer write crash in sub_8227EB58.
+# With no EH/longjmp infra installed, the correct degenerate value is 0 ("no jump, run
+# body"); inject `r3 = 0` on the null-hook fall-through. Verified (runtime) to unblock the
+# boot past the party/session writer init -> reaches GPU SetInterruptCallback.
+# NOTE: this MASKS a missing hook installer; revisit if real EH/longjmp paths are needed.
+# See knowledge-base/titles/south-park-lgtdp/35-entry-forensics.md.
+EH_MARK = "// [recomp-fix:eh-hook-null]"
+eh_patched = 0
+for path in files:
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().splitlines()
+    out, changed, in_fn, seen_mark = [], False, False, False
+    for ln in lines:
+        if ln.startswith("DEFINE_REX_FUNC(sub_8242EEA0)"):
+            in_fn, seen_mark = True, False
+        elif in_fn and EH_MARK in ln:
+            seen_mark = True
+        elif in_fn and ln == "}":
+            if not seen_mark:
+                out.append("\tctx.r3.s64 = 0; " + EH_MARK + " null EH hook -> run body")
+                eh_patched += 1
+                changed = True
+            in_fn = False
+        out.append(ln)
+    if changed:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(out) + "\n")
+
 print(f"defined functions      : {len(func_addrs)}")
+print(f"EH hook-null fix (sub_8242EEA0): {eh_patched} applied")
 print(f"files changed          : {files_changed}/{len(files)}")
 print(f"goto -> tail call      : {total_tail}")
 print(f"goto -> REX_FATAL trap : {total_trap}")
