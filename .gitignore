@@ -22,6 +22,10 @@ assets/
 *.exe
 *.pdb
 
+# Runtime diagnostics (from the crash handler / logging)
+crash_backtrace.txt
+*.log
+
 # OS / editor
 .DS_Store
 Thumbs.db
