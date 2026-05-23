@@ -101,8 +101,45 @@ for path in files:
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join(lines) + "\n")
 
+# --- Fix 2: drop func_mappings entries the runtime can't register ---
+# runtime.cpp iterates func_mappings[] until guest==0 and *aborts setup* if any
+# entry's address is outside the module range [code_base, code_base+code_size+
+# thunk_reserve). rexglue 0.8 emits two kinds of bad entries: (a) the address-0
+# sentinel `{ 0x0, sub_0 }` FIRST (sorts first -> the zero-terminated loop stops
+# immediately and registers nothing -> "No function registered at <entry>"), and
+# (b) ~dozens of out-of-image stub functions (data-as-code / sentinels such as
+# 0x8260C92C..0xFFFFFFFF). Drop every func_mappings entry outside the valid code
+# range; the array's real terminator `{ 0, nullptr }` is preserved (name != sub_).
+def _const(text, name, default):
+    m = re.search(r'#define\s+' + name + r'\s+0x([0-9A-Fa-f]+)', text)
+    return int(m.group(1), 16) if m else default
+entry_re = re.compile(r'^\s*\{\s*0x([0-9A-Fa-f]+),\s*(sub_[0-9A-Fa-f]+|xstart)\s*\},?\s*$')
+mappings_dropped = 0
+for init_path in glob.glob(os.path.join(GEN, "*_init.cpp")):
+    hdr = init_path[:-4] + ".h"
+    htext = open(hdr, encoding="utf-8", errors="replace").read() if os.path.exists(hdr) else ""
+    code_base = _const(htext, "REX_CODE_BASE", 0x82100000)
+    code_size = _const(htext, "REX_CODE_SIZE", 0)
+    thunk = _const(htext, "REX_THUNK_RESERVE_SIZE", 0x10000)
+    lo, hi = code_base, code_base + code_size + thunk
+    with open(init_path, "r", encoding="utf-8", errors="replace") as fh:
+        ilines = fh.read().splitlines()
+    out = []
+    for ln in ilines:
+        m = entry_re.match(ln)
+        if m:
+            addr = int(m.group(1), 16)
+            if addr < lo or addr >= hi:
+                mappings_dropped += 1
+                continue
+        out.append(ln)
+    if mappings_dropped:
+        with open(init_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(out) + "\n")
+
 print(f"defined functions      : {len(func_addrs)}")
 print(f"files changed          : {files_changed}/{len(files)}")
 print(f"goto -> tail call      : {total_tail}")
 print(f"goto -> REX_FATAL trap : {total_trap}")
 print(f"total rewrites         : {total_tail + total_trap}")
+print(f"func_mappings out-of-range entries dropped: {mappings_dropped}")

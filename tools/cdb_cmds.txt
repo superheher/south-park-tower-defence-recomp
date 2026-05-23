@@ -1,0 +1,13 @@
+$$ cdb command script for crash triage of the recompiled exe.
+$$ Usage:
+$$   cdb -g -G -cf tools/cdb_cmds.txt <exe> --game_data_root=<dir>
+g
+.echo ====CRASH====
+.lastevent
+r
+.echo ====STACK====
+kpn 50
+.echo ====FAULTINST====
+u @rip L6
+.echo ====END====
+q
