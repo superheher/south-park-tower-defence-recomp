@@ -171,8 +171,60 @@ for path in files:
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join(out) + "\n")
 
+# --- Fix 4: emit the analyzer-missed jump-table stub sub_822E38E0 ---
+# rexglue's boundary analyzer misses the 8-byte stub at 0x822E38E0
+# (addi r3,r3,8 ; b 0x822E2298). It is an indirect-call target (runtime FATAL
+# "Call to invalid or unregistered function at 0x822E38E0") AND the direct branch
+# target of sub_822E38E8, which rexglue emits as REX_FATAL "Unresolved call ... to
+# 0x822E38E0". Emit the stub next to sub_822E38E8, rewrite that branch to a tail call,
+# and register the stub in the func table (declared locally in *_init.cpp so init.h is
+# untouched -> no full rebuild). Only this single gap exists in this title's codegen.
+# See knowledge-base/titles/south-park-lgtdp/35-entry-forensics.md.
+STUB_MARK = "[recomp-fix:missing-stub-822E38E0]"
+STUB_DEF = ("// " + STUB_MARK + " analyzer-missed jump stub (addi r3,r3,8; b 0x822E2298)\n"
+            "DECLARE_REX_FUNC(sub_822E38E0); // local decl keeps symbol extern \"C\" (no init.h edit)\n"
+            "DEFINE_REX_FUNC(sub_822E38E0) {\n"
+            "\tREX_FUNC_PROLOGUE();\n"
+            "\tctx.r3.s64 = ctx.r3.s64 + 8;\n"
+            "\tsub_822E2298(ctx, base);\n"
+            "\treturn;\n"
+            "}\n\n")
+STUB_FATAL = 'REX_FATAL("Unresolved call from 0x822E38EC to 0x822E38E0");'
+stub_emitted = stub_registered = 0
+for path in files:
+    txt = open(path, "r", encoding="utf-8", errors="replace").read()
+    if STUB_FATAL not in txt or STUB_MARK in txt:
+        continue
+    out = []
+    for ln in txt.splitlines():
+        if ln.strip().startswith("// FATAL: unresolved function 0x822E38E0"):
+            continue  # drop rexglue's FATAL comment
+        if STUB_FATAL in ln:
+            indent = ln[:len(ln) - len(ln.lstrip())]
+            out.append(indent + "sub_822E38E0(ctx, base); return;")
+            continue
+        out.append(ln)
+    txt = "\n".join(out) + "\n"
+    txt = txt.replace("DEFINE_REX_FUNC(sub_822E38E8) {", STUB_DEF + "DEFINE_REX_FUNC(sub_822E38E8) {", 1)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(txt)
+    stub_emitted += 1
+for init_path in glob.glob(os.path.join(GEN, "*_init.cpp")):
+    txt = open(init_path, "r", encoding="utf-8", errors="replace").read()
+    if STUB_MARK in txt or "{ 0x822E38E0," in txt:
+        continue
+    if "PPCFuncMapping PPCFuncMappings[] = {" in txt and "{ 0x822E38D8, sub_822E38D8 }," in txt:
+        txt = txt.replace("PPCFuncMapping PPCFuncMappings[] = {",
+                          "DECLARE_REX_FUNC(sub_822E38E0); // " + STUB_MARK + "\n\nPPCFuncMapping PPCFuncMappings[] = {", 1)
+        txt = txt.replace("\t{ 0x822E38D8, sub_822E38D8 },\n",
+                          "\t{ 0x822E38D8, sub_822E38D8 },\n\t{ 0x822E38E0, sub_822E38E0 }, // " + STUB_MARK + "\n", 1)
+        with open(init_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(txt)
+        stub_registered += 1
+
 print(f"defined functions      : {len(func_addrs)}")
 print(f"EH hook-null fix (sub_8242EEA0): {eh_patched} applied")
+print(f"missing-stub 0x822E38E0: emitted={stub_emitted} registered={stub_registered}")
 print(f"files changed          : {files_changed}/{len(files)}")
 print(f"goto -> tail call      : {total_tail}")
 print(f"goto -> REX_FATAL trap : {total_trap}")
