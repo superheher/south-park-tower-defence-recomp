@@ -1,0 +1,30 @@
+diff --git a/src/system/user_module.cpp b/src/system/user_module.cpp
+index 6255e3c..32e1865 100644
+--- a/src/system/user_module.cpp
++++ b/src/system/user_module.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <vector>
++#include <cstdlib>
+ 
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
+@@ -211,6 +212,17 @@ X_STATUS UserModule::LoadXexContinue() {
+ 
+   // Cache some commonly used headers...
+   this->xex_module()->GetOptHeader(XEX_HEADER_ENTRY_POINT, &entry_point_);
++  // [bring-up experiment] Allow overriding the guest entry point via env var, to
++  // test starting at the real mainCRTStartup when the XEX entry is a stub. Set
++  // REX_ENTRY_OVERRIDE=0x82xxxxxx. See knowledge-base/.../35-entry-forensics.md.
++  if (const char* ov = std::getenv("REX_ENTRY_OVERRIDE")) {
++    uint32_t v = static_cast<uint32_t>(std::strtoul(ov, nullptr, 0));
++    if (v) {
++      REXSYS_WARN("Entry point OVERRIDDEN via REX_ENTRY_OVERRIDE: {:08X} -> {:08X}",
++                  entry_point_, v);
++      entry_point_ = v;
++    }
++  }
+   this->xex_module()->GetOptHeader(XEX_HEADER_DEFAULT_STACK_SIZE, &stack_size_);
+   is_dll_module_ = !!(header->module_flags & XEX_MODULE_DLL_MODULE);
+ 
