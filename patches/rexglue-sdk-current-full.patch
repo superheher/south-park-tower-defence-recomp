@@ -86,10 +86,10 @@ index 3dd7fa5..915eb6b 100644
    ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
    if (ctx.insn.operands[1] != 0)
 diff --git a/src/codegen/function_graph.cpp b/src/codegen/function_graph.cpp
-index 0c0d1be..4a78efe 100644
+index 0c0d1be..9f01133 100644
 --- a/src/codegen/function_graph.cpp
 +++ b/src/codegen/function_graph.cpp
-@@ -607,28 +607,19 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+@@ -607,28 +607,16 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
    bool generateSeh = sehInfo && !sehInfo->scopes.empty() && ctx.config.generateExceptionHandlers;
    if (generateSeh) {
      emit_println(body, "\t\t}} SEH_CATCH_ALL {{");
@@ -120,9 +120,6 @@ index 0c0d1be..4a78efe 100644
 +    // At catch time `ctx` holds the RAISE-POINT registers (from deep in the unwound call
 +    // chain), not this function's frame. First-cut SEH recovery: restore the caller-saved
 +    // register state captured at entry and return to the caller signalling failure (r3=0).
-+    // This turns a guest SEH unwind into a clean early return instead of corrupting the
-+    // stack (the prior code ran handlers/restore against the wrong frame and rethrew).
-+    // Running the guest __except filter/handler in its own frame is future work.
 +    emit_println(body, "\t\t\tctx.r1.u32 = __seh_r1; ctx.lr = __seh_lr;");
 +    for (int r = 13; r <= 31; ++r)
 +      emit_println(body, "\t\t\tctx.r{}.u64 = __seh_r{};", r, r);
@@ -131,7 +128,7 @@ index 0c0d1be..4a78efe 100644
      emit_println(body, "\t\t}} SEH_END");
      emit_println(body, "\t}}\n");
    } else {
-@@ -674,6 +665,13 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+@@ -674,6 +662,13 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
  
    // If SEH, emit SEH_TRY and indent body
    if (generateSeh) {
