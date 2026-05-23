@@ -1,61 +1,90 @@
 # RUN.md — building, running, and continuing bring-up
 
-> **Status (2026-05-23):** the recomp **builds and runs** (boots the full rexglue
-> runtime and executes guest code), but is **not yet playable** — the title's XEX
-> entry is a stub and its real boot is kernel-orchestrated (research-grade; it does
-> not boot in Xenia either). See `knowledge-base/titles/south-park-lgtdp/35-entry-forensics.md`
-> and `90-progress-report.md`. This doc covers how to build/run to the current state
-> and the harness for continuing the boot work.
+> **Status (2026-05-23):** the recomp **boots and RENDERS the game** — it brings up the
+> full rexglue runtime (D3D12/XMA/SDL/VFS/kernel), executes the recompiled guest code, and
+> **draws the South Park town backdrop via D3D12** (verified by screenshot). It then
+> presents black frames and **hangs** on a worker-thread SEH fault (see "Remaining
+> blocker"). Earlier "not playable / stub entry / doesn't boot in Xenia" notes are
+> **retracted** — the title boots to menus in Xenia and the recomp now renders.
+> Full evidence: `knowledge-base/titles/south-park-lgtdp/35-entry-forensics.md`.
 
 ## Prerequisites
-- Clang 18+ (built with 22.1.6), CMake, Ninja, Python 3 (+ `pip install pycryptodome capstone` for tools).
-- rexglue-sdk built & installed (see `BUILD.md`); local SDK patches under `patches/`
-  applied (`0001` r1 headroom, `0003` lmw, `0004` entry-override) — re-apply after a
-  submodule bump, then rebuild/install the SDK.
-- Game assets: `private/extracted/` (the extracted title tree incl. `default.xex`).
-  **Never committed** (git-ignored).
+- Clang (built with 22.1.6), CMake, Ninja, Python 3 (`pip install pycryptodome capstone`).
+- **rexglue-sdk built & installed with the local patches applied.** Patches live in
+  `patches/` and are applied to the SDK working tree (NOT committed to the submodule):
+  `0001` (r1 stack headroom), `0003` (lmw), `0004` (entry-override env),
+  `0005` (boot-continuation reenter + stack zero), `0007` (SEH exception-recovery
+  first-cut). `patches/rexglue-sdk-current-full.patch` is the **authoritative full diff**
+  (apply this one to a clean SDK to reproduce the exact state, incl. the diagnostics).
+  Re-apply after a submodule bump, then rebuild/install the SDK.
+- Game assets in `private/extracted/` (extracted title tree incl. `default.xex`).
+  **Never committed** (git-ignored). Extract with the fixed `tools/stfs_extract.py`.
+
+## One-time asset setup: movie locale subdir
+The game requests intro/level movies under `Media/Assets/Movies/en-en/` (a locale subdir
+the flat extraction omits). Create it with hardlinks (no data duplication):
+```powershell
+$mov='<repo>\south-park-recomp\private\extracted\media\Assets\Movies'
+New-Item -ItemType Directory -Force "$mov\en-en" | Out-Null
+Get-ChildItem $mov -Filter *.wmv -File | ForEach-Object {
+  $l="$mov\en-en\$($_.Name)"; if(-not(Test-Path $l)){ New-Item -ItemType HardLink -Path $l -Target $_.FullName | Out-Null } }
+```
+(The movies are WMV3+WMA2, which the runtime can't decode, but the file must *open* or the
+intro path stalls. The intro is not the hang — see below.)
 
 ## Build
 ```powershell
+# SDK (after applying patches) — from third_party/rexglue-sdk:
+cmake --build out/build/win-amd64 --target install
+# then copy the fresh runtime next to the app exe:
+copy ..\..\..\third_party\rexglue-sdk\out\install\win-amd64\bin\rexruntime.dll `
+     out\build\win-amd64-relwithdebinfo\rexruntime.dll
+# App:
 cmake --build --preset win-amd64-relwithdebinfo
 ```
 Produces `out/build/win-amd64-relwithdebinfo/south_park_td.exe` (+ `rexruntime.dll`).
-If you rebuilt the SDK, copy its `rexruntime.dll` next to the exe.
+After **codegen** (`rexglue -f codegen`) always run `python tools/fix_recomp_labels.py`.
 
-## Run (current state: boots runtime, runs the stub entry)
+## Run
 ```powershell
 cd <repo>\south-park-recomp
 out\build\win-amd64-relwithdebinfo\south_park_td.exe `
   --game_data_root=<repo>\south-park-recomp\private\extracted
 ```
-- `--game_data_root` is **required** (else: "--game_data_root was not provided").
-- Logs auto-write to `out\build\win-amd64-relwithdebinfo\logs\south_park_td_NNN.log`
-  (sequential). Add `--log_level=trace --log_noisy=true` for maximum detail.
-- The app needs an **interactive desktop** (D3D12 window). From an automated/headless
-  shell it hangs at window creation — launch it from a logged-on session (or a
-  `schtasks /it` task; see `~\xbla-refs\xenia-bin\run_app.bat`).
-- Expected today: runtime initializes (D3D12/XMA/SDL/VFS), loads `game:\default.xex`,
-  runs the guest entry (`TRACE xstart entered r3=0`), logs `Execution complete`, exits.
-  No rendered frame (the entry is a stub).
+- `--game_data_root` is **required**.
+- `--log_level=debug` (or `trace`) for verbose kernel/APU logging.
+- `--mnk_mode=true` makes the keyboard a virtual controller (Escape=Start, Space=A,
+  default OFF) — needed once the boot reaches an interactive screen.
+- Needs an **interactive desktop** (D3D12 window). Logs: `out\build\...\logs\south_park_td_NNN.log`.
+- **Expected today:** runtime init → loads `game:\default.xex` → shaders/pipelines →
+  **renders the town backdrop (~40s)** → goes black and hangs (no crash). Exit codes:
+  `0xC0000005` = AV, `0xC0000409` = fail-fast.
 
-## Continuing the boot work (harness)
-- **Entry override (patch 0004):** `set REX_ENTRY_OVERRIDE=0x82xxxxxx` before launch to
-  start the guest main thread at a different function (e.g. a candidate `mainCRTStartup`).
-  Confirmed working ("Entry point OVERRIDDEN …" in the log).
-- **Candidate finder:** `python tools/find_zeroref_roots.py private/default_dec.bin`
-  → `private/entry_candidates.txt` (zero-reference, prologue-having functions).
-- **Brute-force scripts** (reusable, in `~\xbla-refs\xenia-bin\`):
-  `brute_force.ps1` (default-log pass), `brute_force3.ps1` (run-length/exit), driven via
-  `schtasks /it`. Result so far: **no forced entry boots** (kernel-orchestrated boot).
-- **Xenia oracle:** `~\xbla-refs\xenia-bin\` has stock + canary configured for a
-  boot trace (license_mask=1, discord=false, trace logging). Both crash/stall at the
-  stub entry — use to validate any future fix against the reference emulator.
-- **Analysis tools:** `tools/` — `xex_decrypt.py --save`, `pe_inspect.py`, `pdata.py`,
-  `ppc_dis.py`, `callgraph.py`, `find_crt*.py`. See `tools/README.md`.
+## Diagnostics harness (what works for a live hang)
+- **All-thread guest stacks (no hang):** attach cdb to the running process —
+  `cdb -p <pid> -c "~*k 24; qd"` (qd = detach, leave it running). Guest functions
+  symbolize as `south_park_td!__imp__sub_XXXXXXXX` (RelWithDebInfo). The old "cdb hangs"
+  only applied to *launching* under cdb.
+- **Screenshot the live D3D12 window:** get `Process.MainWindowHandle`, `SetForegroundWindow`,
+  `GetWindowRect`, then `Graphics.CopyFromScreen` (PrintWindow returns black on flip-model
+  swapchains). See `35-entry-forensics.md` for the exact PowerShell.
+- **SEH fault backtrace:** `src/core/seh_win.cpp` `seh_filter` logs `SEH FAULT code=… fault_addr=…
+  bt: …` (symbolized) when it catches a hardware fault — reveals where a recovered-but-dead
+  worker faulted. **WAIT_REG_MEM** stuck-detector in `command_processor.cpp` logs a stalled
+  GPU poll. (Both are diagnostics in the full SDK patch.)
 
-## The remaining blocker (what would make it playable)
-The boot is not reachable by "call the XEX entry" or by forcing any entry. It needs
-either an **interactive decompiler** session (Ghidra/IDA — find how the real init is
-triggered) or a **real-hardware boot trace**. See `35-entry-forensics.md` for the full
-evidence. Once the real entry/sequence is known, wire it via `REX_ENTRY_OVERRIDE` (or a
-launch hook) and Phases 4–6 (rendering, audio, input, save) become normal iteration.
+## Remaining blocker (what would make it playable)
+The boot hangs because a **worker thread faults during image/asset load** and my SEH
+first-cut catches it → the worker dies → the main thread waits forever on its completion
+flag (presenting black frames). Root cause: `sub_8242EA70` is the game's **`RtlRestoreContext`
+/ longjmp** (restores f14–f31, r13–r31, v64–v127, SP=`[buf+144]`, PC=`[buf+308]` from a
+CONTEXT buffer, then `blr`) — a **non-local jump** the static recomp emits as a plain C++
+`return`, so it returns to the caller carrying the restored (setjmp-time) `r31` → null write.
+The game uses standard Win32 table-based SEH (`RtlCaptureContext`, `RtlUnwind`,
+`__C_specific_handler`); there is no guest `setjmp`, so `setjmp_address`/`longjmp_address`
+does not apply. **The fix is a fuller SEH implementation** in the runtime/codegen:
+implement the exception dispatch (`RtlUnwind`/`__C_specific_handler`/`RtlRestoreContext`)
+to drive a correct non-local jump to the (mid-function) resume target — the hardest part
+of static recomp, and the maintainer's chosen "implement SEH" direction. Once a worker can
+take an SEH path and resume, the boot should clear the loading wait toward the menu, then
+Phases 4–6 (rendering correctness, input, audio, save) become normal iteration.

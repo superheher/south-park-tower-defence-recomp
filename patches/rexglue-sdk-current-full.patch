@@ -1,0 +1,418 @@
+diff --git a/include/rex/platform/exceptions.h b/include/rex/platform/exceptions.h
+index 1614b4d..2c45cf0 100644
+--- a/include/rex/platform/exceptions.h
++++ b/include/rex/platform/exceptions.h
+@@ -22,6 +22,9 @@
+ 
+ #include <cstdint>
+ #include <exception>
++#ifdef _WIN32
++#include <excpt.h>  // GetExceptionCode/GetExceptionInformation intrinsics for SEH_CATCH_ALL (file scope!)
++#endif
+ 
+ #include <rex/platform.h>
+ #include <rex/platform/seh.h>
+diff --git a/include/rex/platform/seh.h b/include/rex/platform/seh.h
+index 3b8f739..e4bfa97 100644
+--- a/include/rex/platform/seh.h
++++ b/include/rex/platform/seh.h
+@@ -37,6 +37,14 @@ int seh_filter(u32 code, void* exception_pointers);
+ /// Re-raise the captured exception.
+ [[noreturn]] void seh_rethrow();
+ 
++/// Custom exception code raised by a guest SEH unwind (e.g. RtlUnwind). seh_filter
++/// treats it as EXECUTE_HANDLER so the nearest generated SEH_CATCH_ALL catches it.
++constexpr u32 kGuestSehUnwindCode = 0xE0524548u;  // 'REXH'
++
++/// Raise a guest SEH unwind as a host exception so the nearest SEH_TRY/SEH_CATCH_ALL
++/// wrapper catches it (used to implement RtlUnwind in the recompiled CRT).
++[[noreturn]] void seh_raise_guest_unwind();
++
+ /// Initialize SEH signal handlers (POSIX only, no-op on Windows).
+ void seh_initialize();
+ 
+diff --git a/resources/templates/codegen/init_h.inja b/resources/templates/codegen/init_h.inja
+index 8449a0b..08e6442 100644
+--- a/resources/templates/codegen/init_h.inja
++++ b/resources/templates/codegen/init_h.inja
+@@ -36,6 +36,7 @@
+ #include <rex/perf/counter.h>
+ #include <rex/thread/mutex.h>
+ #include <rex/system/mmio_handler.h>
++#include <rex/platform/exceptions.h>  // SEH_TRY/SEH_CATCH_ALL for generate_exception_handlers
+ 
+ #include <atomic>
+ #include <cassert>
+diff --git a/src/codegen/builders.h b/src/codegen/builders.h
+index 24894f2..56e0a88 100644
+--- a/src/codegen/builders.h
++++ b/src/codegen/builders.h
+@@ -292,6 +292,7 @@ bool build_lwaux(BuilderContext& ctx);
+ bool build_lwax(BuilderContext& ctx);
+ bool build_lwbrx(BuilderContext& ctx);
+ bool build_lwz(BuilderContext& ctx);
++bool build_lmw(BuilderContext& ctx);
+ bool build_lwzu(BuilderContext& ctx);
+ bool build_lwzux(BuilderContext& ctx);
+ bool build_lwzx(BuilderContext& ctx);
+diff --git a/src/codegen/builders/memory.cpp b/src/codegen/builders/memory.cpp
+index 3dd7fa5..915eb6b 100644
+--- a/src/codegen/builders/memory.cpp
++++ b/src/codegen/builders/memory.cpp
+@@ -395,6 +395,25 @@ bool build_stmw(BuilderContext& ctx) {
+   return true;
+ }
+ 
++bool build_lmw(BuilderContext& ctx) {
++  // EA = (rA == 0 ? 0 : r[rA]) + EXTS(d); load r[rD]..r[31] from EA, EA+4, ...
++  // Load-multiple mirror of build_stmw (function epilogues pair lmw with the
++  // prologue's stmw to restore non-volatile GPRs). Without this, any function
++  // using the stmw/lmw save-restore pattern compiles its prologue but throws
++  // REX_UNIMPLEMENTED in its epilogue.
++  uint32_t rD = ctx.insn.operands[0];
++  int32_t offset = static_cast<int32_t>(ctx.insn.operands[1]);
++  uint32_t rA = ctx.insn.operands[2];
++  if (rA != 0)
++    ctx.println("\t{} = {}.u32 + {};", ctx.ea(), ctx.r(rA), offset);
++  else
++    ctx.println("\t{} = {};", ctx.ea(), offset);
++  for (uint32_t i = rD; i <= 31; ++i) {
++    ctx.println("\t{}.u64 = REX_LOAD_U32({} + {});", ctx.r(i), ctx.ea(), (i - rD) * 4);
++  }
++  return true;
++}
++
+ bool build_stwbrx(BuilderContext& ctx) {
+   ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
+   if (ctx.insn.operands[1] != 0)
+diff --git a/src/codegen/function_graph.cpp b/src/codegen/function_graph.cpp
+index 0c0d1be..4a78efe 100644
+--- a/src/codegen/function_graph.cpp
++++ b/src/codegen/function_graph.cpp
+@@ -607,28 +607,19 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+   bool generateSeh = sehInfo && !sehInfo->scopes.empty() && ctx.config.generateExceptionHandlers;
+   if (generateSeh) {
+     emit_println(body, "\t\t}} SEH_CATCH_ALL {{");
+-    emit_println(body, "\t\t\tREXLOG_WARN(\"SEH exception caught in sub_{:08X}\");", base());
+-
+-    if (sehInfo->frameSize > 0) {
+-      emit_println(body, "\t\t\tctx.r12.s64 = ctx.r31.s64 + {};  // Establisher frame pointer",
+-                   sehInfo->frameSize);
+-    }
+-
+-    for (auto it = sehInfo->scopes.rbegin(); it != sehInfo->scopes.rend(); ++it) {
+-      const auto& scope = *it;
+-      if (scope.filter == 0 && scope.handler != 0) {
+-        emit_println(body, "\t\t\tsub_{:08X}(ctx, base);  // __finally handler", scope.handler);
+-      }
+-    }
+-
+-    if (sehInfo->restoreHelper != 0) {
+-      auto* restoreFn = ctx.graph.getFunction(sehInfo->restoreHelper);
+-      if (restoreFn && !restoreFn->name().empty()) {
+-        emit_println(body, "\t\t\t{}(ctx, base);  // Restore caller registers", restoreFn->name());
+-      }
+-    }
+-
+-    emit_println(body, "\t\t\tSEH_RETHROW;");
++    emit_println(body, "\t\t\tREXLOG_WARN(\"SEH: unwind through sub_{:08X} -> return to caller\");",
++                 base());
++    // At catch time `ctx` holds the RAISE-POINT registers (from deep in the unwound call
++    // chain), not this function's frame. First-cut SEH recovery: restore the caller-saved
++    // register state captured at entry and return to the caller signalling failure (r3=0).
++    // This turns a guest SEH unwind into a clean early return instead of corrupting the
++    // stack (the prior code ran handlers/restore against the wrong frame and rethrew).
++    // Running the guest __except filter/handler in its own frame is future work.
++    emit_println(body, "\t\t\tctx.r1.u32 = __seh_r1; ctx.lr = __seh_lr;");
++    for (int r = 13; r <= 31; ++r)
++      emit_println(body, "\t\t\tctx.r{}.u64 = __seh_r{};", r, r);
++    emit_println(body, "\t\t\tctx.r3.s64 = 0;  // signal failure to the caller");
++    emit_println(body, "\t\t\treturn;");
+     emit_println(body, "\t\t}} SEH_END");
+     emit_println(body, "\t}}\n");
+   } else {
+@@ -674,6 +665,13 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+ 
+   // If SEH, emit SEH_TRY and indent body
+   if (generateSeh) {
++    // Capture the caller-saved register state at function entry. These live in function
++    // scope so they are visible in the SEH_CATCH_ALL block (where `ctx` otherwise holds
++    // the raise-point registers from deep in the unwound call chain). On an unhandled
++    // guest exception we restore these and return to the caller cleanly (see catch).
++    emit_println(out, "\tconst uint32_t __seh_r1 = ctx.r1.u32; const uint64_t __seh_lr = ctx.lr;");
++    for (int r = 13; r <= 31; ++r)
++      emit_println(out, "\tconst uint64_t __seh_r{} = ctx.r{}.u64;", r, r);
+     emit_println(out, "\tSEH_TRY {{");
+     std::string indentedBody;
+     indentedBody.reserve(body.size() + body.size() / 20);
+diff --git a/src/codegen/instruction_dispatch.cpp b/src/codegen/instruction_dispatch.cpp
+index 40ae269..279b10d 100644
+--- a/src/codegen/instruction_dispatch.cpp
++++ b/src/codegen/instruction_dispatch.cpp
+@@ -227,6 +227,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
+       {PPC_INST_LWZU, build_lwzu},
+       {PPC_INST_LWZUX, build_lwzux},
+       {PPC_INST_LWZX, build_lwzx},
++      {PPC_INST_LMW, build_lmw},
+       {PPC_INST_LWBRX, build_lwbrx},
+       {PPC_INST_LD, build_ld},
+       {PPC_INST_LDU, build_ldu},
+diff --git a/src/core/seh_win.cpp b/src/core/seh_win.cpp
+index 9fc4763..42d55da 100644
+--- a/src/core/seh_win.cpp
++++ b/src/core/seh_win.cpp
+@@ -13,11 +13,61 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
+ 
+ #include "platform_win.h"
+ 
++#include <rex/logging.h>
++#include <dbghelp.h>
++#include <atomic>
++#include <cstdio>
++#pragma comment(lib, "dbghelp.lib")
++
+ namespace rex::platform {
+ 
+ static thread_local SehThreadState tls_seh_state;
+ static thread_local bool tls_seh_active = false;
+ 
++// [diag] Symbolized backtrace of an SEH-caught hardware fault. The recovery
++// (return-to-caller-as-failure) otherwise hides where a guest worker faulted,
++// which can stall the boot. Capped + first-fault-symbol-init to stay cheap.
++static void seh_dump_fault(EXCEPTION_POINTERS* p) {
++  static std::atomic<int> dumps{0};
++  if (dumps.fetch_add(1) >= 12) return;
++  if (!p || !p->ExceptionRecord || !p->ContextRecord) return;
++  auto* er = p->ExceptionRecord;
++  unsigned long long fault_addr =
++      (er->NumberParameters >= 2) ? (unsigned long long)er->ExceptionInformation[1] : 0ull;
++  HANDLE proc = GetCurrentProcess();
++  static std::atomic<bool> sym_done{false};
++  bool expected = false;
++  if (sym_done.compare_exchange_strong(expected, true)) {
++    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
++    SymInitialize(proc, nullptr, TRUE);
++  }
++  CONTEXT ctx = *p->ContextRecord;
++  STACKFRAME64 sf = {};
++  sf.AddrPC.Offset = ctx.Rip;     sf.AddrPC.Mode = AddrModeFlat;
++  sf.AddrFrame.Offset = ctx.Rbp;  sf.AddrFrame.Mode = AddrModeFlat;
++  sf.AddrStack.Offset = ctx.Rsp;  sf.AddrStack.Mode = AddrModeFlat;
++  std::string bt;
++  char buf[640];
++  for (int i = 0; i < 16; ++i) {
++    if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &sf, &ctx, nullptr,
++                     SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
++      break;
++    if (!sf.AddrPC.Offset) break;
++    char symbuf[sizeof(SYMBOL_INFO) + 512] = {};
++    auto* s = reinterpret_cast<SYMBOL_INFO*>(symbuf);
++    s->SizeOfStruct = sizeof(SYMBOL_INFO);
++    s->MaxNameLen = 511;
++    DWORD64 disp = 0;
++    if (SymFromAddr(proc, sf.AddrPC.Offset, &disp, s))
++      snprintf(buf, sizeof buf, "%s+0x%llX ", s->Name, (unsigned long long)disp);
++    else
++      snprintf(buf, sizeof buf, "0x%llX ", (unsigned long long)sf.AddrPC.Offset);
++    bt += buf;
++  }
++  REXLOG_WARN("SEH FAULT code=0x{:08X} fault_addr=0x{:X} tid={} bt: {}",
++              er->ExceptionCode, fault_addr, (unsigned)GetCurrentThreadId(), bt);
++}
++
+ SehThreadState& seh_thread_state() {
+   return tls_seh_state;
+ }
+@@ -36,12 +86,27 @@ int seh_filter(uint32_t code, void* ep) {
+         tls_seh_state.info[0] = pointers->ExceptionRecord->ExceptionInformation[0];
+         tls_seh_state.info[1] = pointers->ExceptionRecord->ExceptionInformation[1];
+       }
++      seh_dump_fault(pointers);  // [diag] log where the faulting worker died
++      return EXCEPTION_EXECUTE_HANDLER;
++    case kGuestSehUnwindCode:
++      // Guest SEH unwind (e.g. RtlUnwind) raised as a host exception; handle it at the
++      // nearest generated SEH_CATCH_ALL.
++      tls_seh_state.code = code;
+       return EXCEPTION_EXECUTE_HANDLER;
+     default:
+       return EXCEPTION_CONTINUE_SEARCH;
+   }
+ }
+ 
++[[noreturn]] void seh_raise_guest_unwind() {
++  RaiseException(kGuestSehUnwindCode, EXCEPTION_NONCONTINUABLE, 0, nullptr);
++#ifdef __clang__
++  __builtin_unreachable();
++#else
++  __assume(false);
++#endif
++}
++
+ [[noreturn]] void seh_rethrow() {
+   uint32_t code = tls_seh_state.code;
+   ULONG_PTR info[2] = {tls_seh_state.info[0], tls_seh_state.info[1]};
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 60efcd3..feff977 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -1128,6 +1128,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+   bool is_memory = (wait_info & 0x10) != 0;
+ 
+   bool matched = false;
++  uint32_t spin_count = 0;  // [diag] detect a WAIT_REG_MEM that never satisfies
+   do {
+     uint32_t value = 0;
+     if (is_memory) {
+@@ -1169,6 +1170,15 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         break;
+     }
+     if (!matched) {
++      // [diag] Surface a stuck WAIT_REG_MEM: log poll target + live value once it
++      // has clearly failed to satisfy, then periodically to see if it ever moves.
++      if (spin_count == 16 || (spin_count > 16 && (spin_count % 4096) == 0)) {
++        REXGPU_WARN(
++            "WAIT_REG_MEM stuck: is_mem={} poll=0x{:08X} func=0x{:X} ref=0x{:08X} "
++            "mask=0x{:08X} value=0x{:08X} wait=0x{:X} spins={}",
++            is_memory, poll_reg_addr, wait_info & 0x7, ref, mask, value, wait, spin_count);
++      }
++      ++spin_count;
+       // Wait.
+       if (wait >= 0x100) {
+         PrepareForWait();
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
+index 8b862fc..ae7b8b7 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
+@@ -21,6 +21,7 @@
+ #include <rex/kernel/xboxkrnl/threading.h>
+ #include <rex/logging.h>
+ #include <rex/hook.h>
++#include <rex/platform/seh.h>
+ #include <rex/types.h>
+ #include <rex/string.h>
+ #include <rex/system/kernel_state.h>
+@@ -560,8 +561,12 @@ void RtlCaptureContext_entry() {
+ }
+ 
+ void RtlUnwind_entry() {
+-  // TODO(tomc): do we even need this?
+-  REXKRNL_WARN("[STUB] RtlUnwind called - not implemented");
++  // The guest uses Win32 SEH for error handling; on hardware RtlUnwind unwinds the stack
++  // to a target handler and does NOT return. Raise a host exception so the nearest
++  // generated SEH_CATCH_ALL wrapper catches it (recompiled-CRT SEH support; the wrapper
++  // restores the caller frame and returns failure). See src/codegen/function_graph.cpp.
++  REXKRNL_WARN("RtlUnwind: raising guest SEH unwind to nearest SEH_CATCH_ALL handler");
++  rex::platform::seh_raise_guest_unwind();
+ }
+ 
+ void __C_specific_handler_entry() {
+diff --git a/src/system/thread_state.cpp b/src/system/thread_state.cpp
+index eb352a0..fb94c06 100644
+--- a/src/system/thread_state.cpp
++++ b/src/system/thread_state.cpp
+@@ -35,8 +35,16 @@ ThreadState::ThreadState(uint32_t thread_id, uint32_t stack_base, uint32_t pcr_a
+   // Initialize the PPCContext (context_ already points to context_storage_)
+   std::memset(context_, 0, sizeof(::PPCContext));
+ 
+-  // Set initial registers
+-  context_->r1.u64 = stack_base;    // Stack pointer
++  // Set initial registers.
++  // stack_base is the exclusive top of the guest stack and sits on a
++  // PAGE_NOACCESS guard page (usable RW stack is below it). A guest entry thunk
++  // with no prologue may immediately read its caller (loader) frame *above* r1
++  // (e.g. South Park LGTDP's xstart: `addi r1,r1,112; lwz r12,-8(r1)` reads
++  // [r1+104]). Starting r1 exactly at stack_base makes those reads fault on the
++  // guard. Reserve a small, 16-byte-aligned initial frame below stack_base so
++  // the loader-frame reads land in committed RW stack. Harmless for normal
++  // threads (whose functions have prologues).
++  context_->r1.u64 = (stack_base - 0x100) & ~UINT32_C(0xF);  // Stack pointer
+   context_->r13.u64 = pcr_address;  // PCR address
+ 
+   // Note(tomc): the rexglue abi passes memory base via 'base' parameter to each function call,
+diff --git a/src/system/user_module.cpp b/src/system/user_module.cpp
+index 6255e3c..32e1865 100644
+--- a/src/system/user_module.cpp
++++ b/src/system/user_module.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <vector>
++#include <cstdlib>
+ 
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
+@@ -211,6 +212,17 @@ X_STATUS UserModule::LoadXexContinue() {
+ 
+   // Cache some commonly used headers...
+   this->xex_module()->GetOptHeader(XEX_HEADER_ENTRY_POINT, &entry_point_);
++  // [bring-up experiment] Allow overriding the guest entry point via env var, to
++  // test starting at the real mainCRTStartup when the XEX entry is a stub. Set
++  // REX_ENTRY_OVERRIDE=0x82xxxxxx. See knowledge-base/.../35-entry-forensics.md.
++  if (const char* ov = std::getenv("REX_ENTRY_OVERRIDE")) {
++    uint32_t v = static_cast<uint32_t>(std::strtoul(ov, nullptr, 0));
++    if (v) {
++      REXSYS_WARN("Entry point OVERRIDDEN via REX_ENTRY_OVERRIDE: {:08X} -> {:08X}",
++                  entry_point_, v);
++      entry_point_ = v;
++    }
++  }
+   this->xex_module()->GetOptHeader(XEX_HEADER_DEFAULT_STACK_SIZE, &stack_size_);
+   is_dll_module_ = !!(header->module_flags & XEX_MODULE_DLL_MODULE);
+ 
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index db31ff4..65920f1 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -294,8 +294,13 @@ bool XThread::AllocateStack(uint32_t size) {
+   stack_limit_ = address + (padding / 2);
+   stack_base_ = stack_limit_ + size;
+ 
+-  // Initialize the stack with junk
+-  memory()->Fill(stack_alloc_base_, actual_size, 0xBE);
++  // Initialize the stack (patch 0006). Xenia *master* fills with 0xBE poison, which
++  // makes the XapiThreadStartup trampoline's blr jump to 0xBEBEBEBE and crash (this
++  // title returns through an unset kernel continuation slot). Xenia *canary* leaves the
++  // stack zeroed (heap-zeroed) and boots. Match canary: zero the stack so the entry's
++  // continuation reads 0 (handled by the boot-continuation reenter in
++  // FunctionDispatcher::Execute, patch 0005) instead of poison.
++  memory()->Fill(stack_alloc_base_, actual_size, 0x00);
+ 
+   // Setup the guard pages
+   heap->Protect(stack_alloc_base_, padding / 2, memory::kMemoryProtectNoAccess);
+@@ -629,6 +634,36 @@ void XThread::Execute() {
+   REXSYS_NOISY_DEBUG("XThread::Execute - Calling function at {:08X}", address);
+   func(*ctx, base);
+ 
++  // Boot continuation (patch 0005) — the executable entry is the XapiThreadStartup
++  // trampoline: ONE .pdata function (e.g. 0x824499A0..0x82449B58) that codegen split at
++  // its internal blr. The pre-prologue check (..+0x2C) returns via blr to a continuation
++  // the kernel/JIT seeds (the body / boot-driver is at +0x30); rexglue compiles each
++  // guest function in isolation, so that blr becomes a C++ return that unwinds here and
++  // the thread exits ("Execution complete"). Xenia's JIT instead carries control across
++  // the blr into the body; replicate it. Gate to the executable entry so worker/raw
++  // threads are unaffected: follow ctx.lr; a non-sentinel non-function target (0 /
++  // garbage, because we don't seed the kernel return slot) falls through to +0x30.
++  {
++    uint32_t exec_entry = 0;
++    if (auto exec_mod = kernel_state_->GetExecutableModule()) {
++      exec_entry = exec_mod->entry_point();
++    }
++    if (exec_entry != 0 && address == exec_entry) {
++      uint32_t cont = static_cast<uint32_t>(ctx->lr);
++      if (cont != 0xBCBCBCBC && !dispatcher->GetFunction(cont)) {
++        cont = address + 0x30;
++      }
++      while (cont != 0xBCBCBCBC) {
++        PPCFunc* next_fn = dispatcher->GetFunction(cont);
++        if (!next_fn) break;
++        REXSYS_WARN("Boot continuation: dispatching to {:08X} (from {:08X})", cont, address);
++        ctx->lr = 0xBCBCBCBC;
++        next_fn(*ctx, base);
++        cont = static_cast<uint32_t>(ctx->lr);
++      }
++    }
++  }
++
+   exit_code = static_cast<int>(ctx->r3.u32);
+ 
+   // If we got here it means the execute completed without an exit being called.
