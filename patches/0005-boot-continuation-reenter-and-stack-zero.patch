@@ -1,0 +1,57 @@
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index db31ff4..65920f1 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -294,8 +294,13 @@ bool XThread::AllocateStack(uint32_t size) {
+   stack_limit_ = address + (padding / 2);
+   stack_base_ = stack_limit_ + size;
+ 
+-  // Initialize the stack with junk
+-  memory()->Fill(stack_alloc_base_, actual_size, 0xBE);
++  // Initialize the stack (patch 0006). Xenia *master* fills with 0xBE poison, which
++  // makes the XapiThreadStartup trampoline's blr jump to 0xBEBEBEBE and crash (this
++  // title returns through an unset kernel continuation slot). Xenia *canary* leaves the
++  // stack zeroed (heap-zeroed) and boots. Match canary: zero the stack so the entry's
++  // continuation reads 0 (handled by the boot-continuation reenter in
++  // FunctionDispatcher::Execute, patch 0005) instead of poison.
++  memory()->Fill(stack_alloc_base_, actual_size, 0x00);
+ 
+   // Setup the guard pages
+   heap->Protect(stack_alloc_base_, padding / 2, memory::kMemoryProtectNoAccess);
+@@ -629,6 +634,36 @@ void XThread::Execute() {
+   REXSYS_NOISY_DEBUG("XThread::Execute - Calling function at {:08X}", address);
+   func(*ctx, base);
+ 
++  // Boot continuation (patch 0005) — the executable entry is the XapiThreadStartup
++  // trampoline: ONE .pdata function (e.g. 0x824499A0..0x82449B58) that codegen split at
++  // its internal blr. The pre-prologue check (..+0x2C) returns via blr to a continuation
++  // the kernel/JIT seeds (the body / boot-driver is at +0x30); rexglue compiles each
++  // guest function in isolation, so that blr becomes a C++ return that unwinds here and
++  // the thread exits ("Execution complete"). Xenia's JIT instead carries control across
++  // the blr into the body; replicate it. Gate to the executable entry so worker/raw
++  // threads are unaffected: follow ctx.lr; a non-sentinel non-function target (0 /
++  // garbage, because we don't seed the kernel return slot) falls through to +0x30.
++  {
++    uint32_t exec_entry = 0;
++    if (auto exec_mod = kernel_state_->GetExecutableModule()) {
++      exec_entry = exec_mod->entry_point();
++    }
++    if (exec_entry != 0 && address == exec_entry) {
++      uint32_t cont = static_cast<uint32_t>(ctx->lr);
++      if (cont != 0xBCBCBCBC && !dispatcher->GetFunction(cont)) {
++        cont = address + 0x30;
++      }
++      while (cont != 0xBCBCBCBC) {
++        PPCFunc* next_fn = dispatcher->GetFunction(cont);
++        if (!next_fn) break;
++        REXSYS_WARN("Boot continuation: dispatching to {:08X} (from {:08X})", cont, address);
++        ctx->lr = 0xBCBCBCBC;
++        next_fn(*ctx, base);
++        cont = static_cast<uint32_t>(ctx->lr);
++      }
++    }
++  }
++
+   exit_code = static_cast<int>(ctx->r3.u32);
+ 
+   // If we got here it means the execute completed without an exit being called.
