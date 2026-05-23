@@ -279,6 +279,55 @@ index 60efcd3..feff977 100644
        // Wait.
        if (wait >= 0x100) {
          PrepareForWait();
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_debug.cpp b/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
+index 670c446..8c283b8 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
+@@ -21,6 +21,7 @@
+ #include <rex/system/xexception.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtypes.h>
++#include <rex/platform/seh.h>
+ 
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+@@ -127,20 +128,23 @@ void HandleCppException(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
+ }
+ 
+ void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
+-  switch (record->code) {
+-    case 0x406D1388: {
+-      HandleSetThreadName(record);
+-      return;
+-    }
+-    case 0xE06D7363: {
+-      HandleCppException(record);
+-      return;
+-    }
++  // 0x406D1388 = MS_VC_EXCEPTION (SetThreadName debugger notification) — not a real
++  // exception; just record the name and return.
++  if (record->code == 0x406D1388) {
++    HandleSetThreadName(record);
++    return;
+   }
+-
+-  // TODO(benvanik): unwinding.
+-  // This is going to suck.
+-  rex::debug::Break();
++  // Any real guest exception (C++ throw 0xE06D7363, or other status) must PROPAGATE.
++  // Previously this fell through to rex::debug::Break() (abort/no-op), so the guest's
++  // recompiled CRT then ran its own manual SEH dispatch (RtlDispatchException ->
++  // ... -> RtlRestoreContext/sub_8242EA70), whose non-local jump the static recomp
++  // can't perform -> register corruption -> guest-null write -> worker dies -> hang.
++  // Raise it as a host exception so the nearest generated SEH_CATCH_ALL handles it
++  // (recover-to-caller failure), bypassing the broken manual dispatch. See KB
++  // titles/south-park-lgtdp/40-seh-implementation-plan.md.
++  REXKRNL_WARN("RtlRaiseException code=0x{:08X}: raising guest SEH to nearest handler",
++               static_cast<uint32_t>(record->code));
++  rex::platform::seh_raise_guest_unwind();
+ }
+ 
+ void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
 index 8b862fc..ae7b8b7 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
