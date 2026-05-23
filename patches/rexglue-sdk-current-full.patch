@@ -326,7 +326,7 @@ index 670c446..8c283b8 100644
  
  void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
-index 8b862fc..ae7b8b7 100644
+index 8b862fc..3954907 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
 @@ -21,6 +21,7 @@
@@ -337,7 +337,51 @@ index 8b862fc..ae7b8b7 100644
  #include <rex/types.h>
  #include <rex/string.h>
  #include <rex/system/kernel_state.h>
-@@ -560,8 +561,12 @@ void RtlCaptureContext_entry() {
+@@ -555,13 +556,54 @@ u32 RtlComputeCrc32_entry(u32 seed, mapped_void buffer, u32 length) {
+ }
+ 
+ void RtlCaptureContext_entry() {
+-  // TODO(tomc): do we even need this?
+-  REXKRNL_WARN("[STUB] RtlCaptureContext called - not implemented");
++  // Capture the calling thread's PPCContext into the guest CONTEXT buffer (r3), in the exact
++  // layout the title's RtlRestoreContext (sub_8242EA70) reads: f14..f31@+0..136, SP(r1)@+144,
++  // r13..r31@+152..296, packed CR@+304, continuation PC(=lr)@+308 (VMX@+320 not yet). This is
++  // the FOUNDATION of SEH dispatch; RtlUnwind (scope walk + set target) and RtlRestoreContext
++  // (call the __except funclet) are still TODO. See KB titles/south-park-lgtdp/40-seh-*.
++  auto* thread = rex::system::XThread::GetCurrentThread();
++  if (!thread) {
++    REXKRNL_WARN("RtlCaptureContext: no current thread");
++    return;
++  }
++  auto& ctx = *thread->thread_state()->context();
++  uint32_t buf = ctx.r3.u32;
++  if (!buf) return;
++  auto* mem = REX_KERNEL_MEMORY();
++  auto p64 = [&](uint32_t off, uint64_t v) {
++    *mem->TranslateVirtual<uint64_t*>(buf + off) = rex::byte_swap(v);
++  };
++  auto p32 = [&](uint32_t off, uint32_t v) {
++    *mem->TranslateVirtual<uint32_t*>(buf + off) = rex::byte_swap(v);
++  };
++  p64(0, ctx.f14.u64);   p64(8, ctx.f15.u64);   p64(16, ctx.f16.u64);  p64(24, ctx.f17.u64);
++  p64(32, ctx.f18.u64);  p64(40, ctx.f19.u64);  p64(48, ctx.f20.u64);  p64(56, ctx.f21.u64);
++  p64(64, ctx.f22.u64);  p64(72, ctx.f23.u64);  p64(80, ctx.f24.u64);  p64(88, ctx.f25.u64);
++  p64(96, ctx.f26.u64);  p64(104, ctx.f27.u64); p64(112, ctx.f28.u64); p64(120, ctx.f29.u64);
++  p64(128, ctx.f30.u64); p64(136, ctx.f31.u64);
++  p64(144, ctx.r1.u64);
++  p64(152, ctx.r13.u64); p64(160, ctx.r14.u64); p64(168, ctx.r15.u64); p64(176, ctx.r16.u64);
++  p64(184, ctx.r17.u64); p64(192, ctx.r18.u64); p64(200, ctx.r19.u64); p64(208, ctx.r20.u64);
++  p64(216, ctx.r21.u64); p64(224, ctx.r22.u64); p64(232, ctx.r23.u64); p64(240, ctx.r24.u64);
++  p64(248, ctx.r25.u64); p64(256, ctx.r26.u64); p64(264, ctx.r27.u64); p64(272, ctx.r28.u64);
++  p64(280, ctx.r29.u64); p64(288, ctx.r30.u64); p64(296, ctx.r31.u64);
++  auto nib = [](const auto& c) -> uint32_t {
++    return (uint32_t(c.lt) << 3) | (uint32_t(c.gt) << 2) | (uint32_t(c.eq) << 1) | uint32_t(c.so);
++  };
++  uint32_t cr = (nib(ctx.cr0) << 28) | (nib(ctx.cr1) << 24) | (nib(ctx.cr2) << 20) |
++                (nib(ctx.cr3) << 16) | (nib(ctx.cr4) << 12) | (nib(ctx.cr5) << 8) |
++                (nib(ctx.cr6) << 4) | nib(ctx.cr7);
++  p32(304, cr);
++  p32(308, static_cast<uint32_t>(ctx.lr));
  }
  
  void RtlUnwind_entry() {
