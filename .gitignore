@@ -1,0 +1,30 @@
+# Copyrighted / derived game data — never commit
+/extracted/
+/private/
+*.xex
+*.xexp
+default.xex
+assets/
+
+# Generated recompiler output (reproducible from XEX + config)
+/generated/
+/ppc/
+/out/
+*.gen.cpp
+*.gen.h
+
+# Build
+/build/
+**/build/
+/cmake-build-*/
+*.o
+*.obj
+*.exe
+*.pdb
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
+.idea/
