@@ -11,6 +11,7 @@ never emit game content into the repo (outputs go to the git-ignored `private/`)
 | `xex_decrypt.py` | Independent XEX2 **decrypt + basic-decompress** (retail AES key → session key → CBC → basic blocks), then dump/decode 32-bit words at an address. Cross-checks the recompiler's decode and resolves entry-point questions. Needs `pip install pycryptodome`. Usage: `python tools/xex_decrypt.py private/default.xex 0x824499A0`. |
 | `scan_recomp.py` / `fix_recomp_labels.py` | Scan / post-codegen fixup of generated C++ (see Phase 2/3 notes). |
 | `cdb_*.txt` | cdb command scripts for crash/throw triage (`-cf`). |
+| `find_init_arrays.py` | Scan the decrypted image for null-bracketed code-pointer arrays (locates C++ static-initializer `.CRT$XC*` tables / vtables for startup RE). Needs pycryptodome. |
 
 Examples (PowerShell):
 
