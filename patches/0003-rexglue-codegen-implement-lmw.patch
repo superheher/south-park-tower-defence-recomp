@@ -1,0 +1,54 @@
+diff --git a/src/codegen/builders.h b/src/codegen/builders.h
+index 24894f2..56e0a88 100644
+--- a/src/codegen/builders.h
++++ b/src/codegen/builders.h
+@@ -292,6 +292,7 @@ bool build_lwaux(BuilderContext& ctx);
+ bool build_lwax(BuilderContext& ctx);
+ bool build_lwbrx(BuilderContext& ctx);
+ bool build_lwz(BuilderContext& ctx);
++bool build_lmw(BuilderContext& ctx);
+ bool build_lwzu(BuilderContext& ctx);
+ bool build_lwzux(BuilderContext& ctx);
+ bool build_lwzx(BuilderContext& ctx);
+diff --git a/src/codegen/builders/memory.cpp b/src/codegen/builders/memory.cpp
+index 3dd7fa5..915eb6b 100644
+--- a/src/codegen/builders/memory.cpp
++++ b/src/codegen/builders/memory.cpp
+@@ -395,6 +395,25 @@ bool build_stmw(BuilderContext& ctx) {
+   return true;
+ }
+ 
++bool build_lmw(BuilderContext& ctx) {
++  // EA = (rA == 0 ? 0 : r[rA]) + EXTS(d); load r[rD]..r[31] from EA, EA+4, ...
++  // Load-multiple mirror of build_stmw (function epilogues pair lmw with the
++  // prologue's stmw to restore non-volatile GPRs). Without this, any function
++  // using the stmw/lmw save-restore pattern compiles its prologue but throws
++  // REX_UNIMPLEMENTED in its epilogue.
++  uint32_t rD = ctx.insn.operands[0];
++  int32_t offset = static_cast<int32_t>(ctx.insn.operands[1]);
++  uint32_t rA = ctx.insn.operands[2];
++  if (rA != 0)
++    ctx.println("\t{} = {}.u32 + {};", ctx.ea(), ctx.r(rA), offset);
++  else
++    ctx.println("\t{} = {};", ctx.ea(), offset);
++  for (uint32_t i = rD; i <= 31; ++i) {
++    ctx.println("\t{}.u64 = REX_LOAD_U32({} + {});", ctx.r(i), ctx.ea(), (i - rD) * 4);
++  }
++  return true;
++}
++
+ bool build_stwbrx(BuilderContext& ctx) {
+   ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
+   if (ctx.insn.operands[1] != 0)
+diff --git a/src/codegen/instruction_dispatch.cpp b/src/codegen/instruction_dispatch.cpp
+index 40ae269..279b10d 100644
+--- a/src/codegen/instruction_dispatch.cpp
++++ b/src/codegen/instruction_dispatch.cpp
+@@ -227,6 +227,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
+       {PPC_INST_LWZU, build_lwzu},
+       {PPC_INST_LWZUX, build_lwzux},
+       {PPC_INST_LWZX, build_lwzx},
++      {PPC_INST_LMW, build_lmw},
+       {PPC_INST_LWBRX, build_lwbrx},
+       {PPC_INST_LD, build_ld},
+       {PPC_INST_LDU, build_ldu},
