@@ -1,25 +1,27 @@
-# tools/ — extraction & asset prep (Phase 1)
+# tools/ — extraction & recon
 
-Reproducible tooling to turn the **dump** into recompiler inputs. Outputs go to
-`../private/` and the asset content root (both git-ignored).
+Read-only, reproducible helpers used in Phase 1. They never modify the dump and
+never emit game content into the repo (outputs go to the git-ignored `private/`).
 
-Deliverables of this stage:
+| Tool | Purpose |
+|------|---------|
+| `stfs_extract.py` | Extract files from an STFS (CON/LIVE/PIRS) package — XBLA games, DLC, title updates. `--list`, `--only NAME`, or extract all with `-o DIR`. Validated block→offset math (hash-block skipping); follows the contiguous-block fast path. |
+| `stfs_recon.py` | Dump STFS header + volume descriptor + first file-table entries (calibration / sanity check). |
+| `xex_recon.py` | Parse the plaintext XEX2 header: module flags, base/entry/image size, compression/encryption type, and import libraries + per-library import-record counts. |
 
-1. `private/default.xex` — extracted from the main LIVE/STFS package
-   `58410931/000D0000/...`. Verify the first 4 bytes are `XEX2`.
-2. The **asset tree** the loader reads (for the runtime VFS to mount later).
-3. Classification of the two `00000002` marketplace packages — is either a
-   **Title Update** (`*.xexp`)? Keep it if so (feeds the recompiler patch input).
+Examples (PowerShell):
 
-STFS extraction notes (for a purpose-written reader):
+```powershell
+$pkg = "<dump>\58410931\000D0000\<hash>"
+python tools\stfs_extract.py "$pkg" --list                       # inventory
+python tools\stfs_extract.py "$pkg" --only default.xex -o private\default.xex
+python tools\stfs_extract.py "$pkg" -o private\extracted          # full asset tree
+python tools\xex_recon.py private\default.xex                     # XEX recon
+```
 
-- Magic `LIVE` at offset 0; data region starts at `0xC000`; block size `0x1000`.
-- Hash blocks interleave the data: a level-0 hash block precedes every `0xAA`
-  (170) data blocks (read-only vs read-write affects backup-hash spacing).
-- The volume descriptor gives the file-table block; file-table entries are
-  `0x40` bytes (name, flags, block count, starting block, size).
-
-A third-party extractor (wxPirs / Velocity / a QuickBMS STFS script) is an
-acceptable bootstrap, but a small committed Python/CLI extractor here is
-preferred for reproducibility. Record XEX recon results in
-`../../knowledge-base/20-dump-analysis.md`.
+Phase 1 outputs (this title): `private/default.xex` (8,499,200 B, `XEX2`) and the
+full asset tree under `private/extracted/` (1,555 files, 872.7 MiB). The two
+`00000002` packages are DLC markers, not a Title Update — see the case study
+`knowledge-base/titles/south-park-lgtdp/10-dump-analysis.md`. The algorithms are
+generalized in `knowledge-base/general/25-containers-and-extraction.md` and
+`general/20-xex-format.md`.
