@@ -13,6 +13,7 @@ include(generated/rexglue.cmake)
 # Sources
 set(SOUTHPARKTD_SOURCES
     src/main.cpp
+    src/stubs.cpp
 )
 
 if(WIN32)
