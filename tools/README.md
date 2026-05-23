@@ -21,7 +21,14 @@ never emit game content into the repo (outputs go to the git-ignored `private/`)
 | `callgraph.py` | Build a **direct** `bl` call graph over the `.pdata` function list; `roots` / `initterm` / `callers`/`callees`. Caveat: C++ titles are indirect-call-dominated, so this alone can't pin `main` (documented in KB `45`). |
 | `find_initarray.py` | Scan `.rdata` for runs of big-endian `.text` pointers (C++ init arrays **and** vtables). |
 | `find_crt.py` | **Boundary-independent** global `bl` caller map (scans every aligned word — not limited by function boundaries) + `_initterm`-shape matcher. `callers <addr>` is reliable; `initterm` is noisy (the pattern is generic). |
-| `ghidra_pre_funcs.py` / `ghidra_find_main.py` | Ghidra **headless** pre/post scripts (Jython): define functions from `.pdata` starts, then query the resolved call graph for entry/roots/CRT candidates. Run via `analyzeHeadless ... -loader BinaryLoader -loader-baseAddr 0x82000000 -processor PowerPC:BE:64:default -preScript ghidra_pre_funcs.py -postScript ghidra_find_main.py`. (Caveat: forcing `.pdata` starts can split functions — prefer Ghidra's own analysis for clean boundaries.) |
+| `ghidra_pre_funcs.py` / `ghidra_find_main.py` / `ghidra_dump_roots.py` | Ghidra **headless** Jython scripts: define functions from `.pdata`; query the resolved call graph for entry/roots; decompile top roots to spot the CRT entry. Run via `analyzeHeadless ... -loader BinaryLoader -loader-baseAddr 0x82000000 -processor PowerPC:BE:64:default -postScript <script>`. |
+| `find_crt_initarray.py` | Find the function forming the C/C++ init-array bounds (`_initterm(&__xc_a,&__xc_z)`) via `lis`+`addi`/`ori` into `.rdata` bounding a `.text`-pointer run. (Caveat: in vtable-heavy titles this matches C++ constructors; see KB `45`.) |
+| `find_security_cookie.py` | Find `__security_cookie` (the `.data` global with ~1 writer + many readers) → `__security_init_cookie` → `mainCRTStartup`. (Caveat: matches game *singletons* in singleton-heavy titles; see KB `45`.) |
+
+> Note: the CRT-entry finders (`find_crt*`, `find_security_cookie`, the Ghidra root
+> dump) are sound *techniques* but were **defeated** on South Park by its extreme
+> C++/vtable/singleton/VMX128 density — `mainCRTStartup` could not be pinned
+> headlessly. Documented as a reusable lesson in `knowledge-base/general/45`.
 
 To produce the decrypted image these consume: `python tools/xex_decrypt.py private/default.xex 0x82449968 --save private/default_dec.bin`.
 
