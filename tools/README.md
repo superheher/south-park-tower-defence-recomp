@@ -15,6 +15,13 @@ never emit game content into the repo (outputs go to the git-ignored `private/`)
 | `find_initterm.py` | Find `_initterm`/`mainCRTStartup` candidates (small indirect-call-loop funcs + their root callers) for startup RE. |
 | `find_maincrt.py` | Find mainCRTStartup candidates (root funcs with CRT-startup signature). Note: indirect/vtable calls make 11k+ functions appear as roots, so static heuristics can't pin it — needs dynamic/decompiler analysis. |
 | `find_xrefs.py` | Find code references to a guest address via `lis`+`addi/ori` formation (xref analysis for startup RE; note: misses `lis`+load/store-offset patterns). Needs pycryptodome. |
+| `pe_inspect.py` | Parse the **decrypted** PE image: machine type, sections, data directories, and TLS directory + callback list. Confirms e.g. "no TLS callbacks". Usage: `python tools/pe_inspect.py private/default_dec.bin`. |
+| `pdata.py` | Parse the `.pdata`/EXCEPTION table = **authoritative function-start table** (big-endian; auto-locates the table). `count` / `list N` / `find <addr>` (is an address a function start? which function contains it?). |
+| `ppc_dis.py` | Disassemble a guest address range from the decrypted image (capstone, **big-endian PPC**). `python tools/ppc_dis.py private/default_dec.bin 0x824499A0 0x82449B58`. Needs `pip install capstone`. |
+| `callgraph.py` | Build a **direct** `bl` call graph over the `.pdata` function list; `roots` / `initterm` / `callers`/`callees`. Caveat: C++ titles are indirect-call-dominated, so this alone can't pin `main` (documented in KB `45`). |
+| `find_initarray.py` | Scan `.rdata` for runs of big-endian `.text` pointers (C++ init arrays **and** vtables). |
+
+To produce the decrypted image these consume: `python tools/xex_decrypt.py private/default.xex 0x82449968 --save private/default_dec.bin`.
 
 Examples (PowerShell):
 

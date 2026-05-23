@@ -64,6 +64,13 @@ else:
 print(f"decompressed image: {len(out)} bytes (expect ~0x{image_size:X})")
 print(f"image[0:2] = {out[0:2]!r}  (expect b'MZ' if decode correct)")
 
+# Optional: save the decrypted PE image to a file (for a decompiler / objdump)
+if "--save" in sys.argv:
+    sp = sys.argv[sys.argv.index("--save") + 1]
+    with open(sp, "wb") as f:
+        f.write(out)
+    print(f"saved decrypted image ({len(out)} bytes) -> {sp}")
+
 # Cross-check entry points: XEX optional header vs embedded PE AddressOfEntryPoint
 xex_entry = opt.get(0x00010100, 0)
 e_lfanew = struct.unpack_from("<I", out, 0x3C)[0]
