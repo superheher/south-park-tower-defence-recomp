@@ -15,6 +15,7 @@ base  = int(sys.argv[4], 16) if len(sys.argv) > 4 else 0x82000000
 
 md = Cs(CS_ARCH_PPC, CS_MODE_BIG_ENDIAN + CS_MODE_32)
 md.detail = False
+md.skipdata = True   # continue past VMX128/data-in-code instead of stopping
 
 off = start - base
 code = img[off: end - base]

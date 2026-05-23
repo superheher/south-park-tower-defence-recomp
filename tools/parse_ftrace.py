@@ -80,6 +80,22 @@ elif cmd == "thread":
     print(f"functions on thread mask 0x{bit:X} ({len(ts)}), sorted by address:")
     for s, d in ts[:60]:
         print(f"  0x{s:08X} calls={d['calls']} callers={[hex(c) for c in d['callers']]}")
+elif cmd == "outermost":
+    # boot chain order ~ stack depth: a callee called from a HIGHER stack address is
+    # OUTER (closer to the entry frame). Rank funcs by their max stack-addr caller.
+    def maxstk(d):
+        s = [c for c in d["callers"] if 0x70000000 <= c < 0x71000000]
+        return max(s) if s else 0
+    rs = sorted(((maxstk(d), s, d) for s, d in funcs.items() if maxstk(d)), reverse=True)
+    print("functions called from the highest stack frames (outermost boot chain first):")
+    for stk, s, d in rs[:25]:
+        print(f"  caller_stk=0x{stk:08X} -> func 0x{s:08X} calls={d['calls']} thr=0x{d['threads']:X}")
+elif cmd == "initarray":
+    # the .rdata init-array slots that called boot functions = __xi/__xc bounds
+    slots = sorted(set(c for d in funcs.values() for c in d["callers"] if 0x82000600 <= c < 0x820E8A9C))
+    if slots:
+        print(f"init-array slots (.rdata) that invoked boot fns: {len(slots)}, range 0x{slots[0]:08X}..0x{slots[-1]:08X}")
+        for c in slots: print(f"  0x{c:08X}")
 elif cmd == "insns":
     # dump which instructions of a function actually executed (and counts)
     t = int(sys.argv[3], 16); tf = containing(t) or t
