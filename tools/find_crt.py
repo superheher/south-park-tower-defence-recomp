@@ -88,3 +88,26 @@ elif cmd == "callers":
     a = int(sys.argv[3], 16)
     cs = callers.get(a, [])
     print(f"global bl callers of 0x{a:08X} [{len(cs)}]: " + " ".join(f"{c:08X}" for c in cs))
+elif cmd == "maincrt":
+    # mainCRTStartup signature: a function that calls 2+ distinct _initterm-shaped
+    # functions (C-init __xi + C++-init __xc), and is itself a root (no bl callers).
+    import bisect
+    starts = sorted(set(b32(pd_off + k*8) for k in range(n)))
+    bl_targets = set(callers.keys())
+    def containing(addr):
+        i = bisect.bisect_right(starts, addr) - 1
+        return starts[i] if i >= 0 else None
+    initterms = [s for s in (set(callers.keys()) | set(starts)) if is_initterm(s)]
+    # map: caller-func -> set of _initterm-shaped funcs it calls
+    callee_inits = {}
+    for F in initterms:
+        for site in callers.get(F, []):
+            cf = containing(site)
+            if cf is not None:
+                callee_inits.setdefault(cf, set()).add(F)
+    cand = [(cf, inits) for cf, inits in callee_inits.items() if len(inits) >= 2]
+    cand.sort(key=lambda x: (cf_is_root := (x[0] not in bl_targets), len(x[1])), reverse=True)
+    print(f"functions calling 2+ _initterm-shaped funcs ({len(cand)}):")
+    for cf, inits in cand[:25]:
+        root = "ROOT" if cf not in bl_targets else f"called_by={len(callers.get(cf,[]))}"
+        print(f"  0x{cf:08X}  [{root}]  initterm_callees={len(inits)}: " + " ".join(f"{x:08X}" for x in sorted(inits)))
