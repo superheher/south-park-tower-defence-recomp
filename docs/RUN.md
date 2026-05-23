@@ -1,12 +1,23 @@
 # RUN.md — building, running, and continuing bring-up
 
-> **Status (2026-05-23):** the recomp **boots and RENDERS the game** — it brings up the
-> full rexglue runtime (D3D12/XMA/SDL/VFS/kernel), executes the recompiled guest code, and
-> **draws the South Park town backdrop via D3D12** (verified by screenshot). It then
-> presents black frames and **hangs** on a worker-thread SEH fault (see "Remaining
-> blocker"). Earlier "not playable / stub entry / doesn't boot in Xenia" notes are
-> **retracted** — the title boots to menus in Xenia and the recomp now renders.
-> Full evidence: `knowledge-base/titles/south-park-lgtdp/35-entry-forensics.md`.
+> **Status (2026-05-24):** the recomp **boots all the way to the TITLE SCREEN** —
+> "SOUTH PARK: LET'S GO TOWER DEFENSE PLAY!" with the four boys and **"PRESS START"**
+> (verified by screenshot). Path: runtime init → loads `default.xex` → loads TGA image
+> assets → renders the **animated intro** (Cartman over the town) → intro movie → **title
+> screen**. The long-standing post-rendering hang is **FIXED** (see "The fix that reached
+> the title screen"). Earlier "renders town then black-hangs / doesn't boot" notes are
+> superseded. Full evidence: `knowledge-base/titles/south-park-lgtdp/35-entry-forensics.md`
+> + `40-seh-implementation-plan.md`.
+>
+> **The fix that reached the title screen (config-only, no SDK change):** the post-render
+> hang was a **custom setjmp/longjmp EH for image-format detection** — the loader tries
+> each format, "try JPEG" does `setjmp` (`sub_8242EEA0`), and a non-JPEG (the assets are
+> **TGA**) `longjmp`s (`sub_8242EA70`) back so the loader tries the next format. Set in the
+> manifest `[entrypoint]`: `setjmp_address = 0x8242EEA0`, `longjmp_address = 0x8242EA70`
+> (rexglue's `ppc_setjmp/longjmp`). Then the boot hit a cross-function-branch FATAL
+> (`0x821F23EC`); fixed by registering the 18 unresolved-branch targets in
+> `config/sp_functions.toml` (via `tools/gen_missing_funcs.py` KNOWN_COMPUTED, now
+> cumulative). See `40-seh-implementation-plan.md`.
 
 ## Prerequisites
 - Clang (built with 22.1.6), CMake, Ninja, Python 3 (`pip install pycryptodome capstone`).
@@ -56,9 +67,16 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
 - `--mnk_mode=true` makes the keyboard a virtual controller (Escape=Start, Space=A,
   default OFF) — needed once the boot reaches an interactive screen.
 - Needs an **interactive desktop** (D3D12 window). Logs: `out\build\...\logs\south_park_td_NNN.log`.
-- **Expected today:** runtime init → loads `game:\default.xex` → shaders/pipelines →
-  **renders the town backdrop (~40s)** → goes black and hangs (no crash). Exit codes:
-  `0xC0000005` = AV, `0xC0000409` = fail-fast.
+- **Expected today:** runtime init → loads `game:\default.xex` → shaders/pipelines → TGA
+  asset load → **animated intro** (Cartman over the town, ~30s) → intro movie (black; the
+  WMV has no decoder) → **TITLE SCREEN "PRESS START" (~55–60s)**. Stays there awaiting input.
+  Exit codes: `0xC0000005` = AV, `0xC0000409` = fail-fast.
+- **At the title screen, press Start** (gamepad Start, or `--mnk_mode=true` + **Escape**) to
+  advance to the main menu. NOTE: the window must hold **input focus** (the mnk driver gates
+  on it). Synthetic/automated key injection from a background process is unreliable (other
+  desktop windows steal focus); test input with the game window actually focused (click it).
+  The input plumbing is wired (`XamInputGetState → input_system → mnk`, `has_focus_` defaults
+  true) — pressing Start as a real user with the window focused is the way to verify.
 
 ## Diagnostics harness (what works for a live hang)
 - **All-thread guest stacks (no hang):** attach cdb to the running process —
@@ -73,18 +91,30 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
   worker faulted. **WAIT_REG_MEM** stuck-detector in `command_processor.cpp` logs a stalled
   GPU poll. (Both are diagnostics in the full SDK patch.)
 
-## Remaining blocker (what would make it playable)
-The boot hangs because a **worker thread faults during image/asset load** and my SEH
-first-cut catches it → the worker dies → the main thread waits forever on its completion
-flag (presenting black frames). Root cause: `sub_8242EA70` is the game's **`RtlRestoreContext`
-/ longjmp** (restores f14–f31, r13–r31, v64–v127, SP=`[buf+144]`, PC=`[buf+308]` from a
-CONTEXT buffer, then `blr`) — a **non-local jump** the static recomp emits as a plain C++
-`return`, so it returns to the caller carrying the restored (setjmp-time) `r31` → null write.
-The game uses standard Win32 table-based SEH (`RtlCaptureContext`, `RtlUnwind`,
-`__C_specific_handler`); there is no guest `setjmp`, so `setjmp_address`/`longjmp_address`
-does not apply. **The fix is a fuller SEH implementation** in the runtime/codegen:
-implement the exception dispatch (`RtlUnwind`/`__C_specific_handler`/`RtlRestoreContext`)
-to drive a correct non-local jump to the (mid-function) resume target — the hardest part
-of static recomp, and the maintainer's chosen "implement SEH" direction. Once a worker can
-take an SEH path and resume, the boot should clear the loading wait toward the menu, then
-Phases 4–6 (rendering correctness, input, audio, save) become normal iteration.
+## Next steps (toward playable)
+The title screen is reached. To progress through `boot → menu → match → win/lose → save`:
+1. **PRESS START → main menu.** Verify input as a real user (window focused; gamepad Start
+   or mnk Escape). If a real user's Start doesn't register, debug the input path
+   (`XamInputGetState`/`XamInputGetKeystroke` ← `input_system` ← mnk/SDL; check the SDL
+   focus event fires and which input API the title polls). Automated injection here is
+   unreliable — not a reliable signal of a port bug.
+2. **Menu → match.** Expect more analyzer-missed cross-function branch targets (REX_FATAL
+   "Unresolved call ... to 0x...") on new code paths — harvest them
+   (`grep -rho "Unresolved call from .* to 0x[0-9A-F]*" generated/default/*.cpp`), add to
+   `gen_missing_funcs.py` KNOWN_COMPUTED, regen. (11 such targets currently remain as traps
+   but are off the boot→title path; their bodies ARE emitted — if one is hit, also teach
+   `fix_recomp_labels` Fix-5 to tail-call an already-emitted target function.)
+3. **Intro movie:** WMV3+WMA2 has no decoder, so it shows black with an "A SKIP" overlay;
+   it advances on its own to the title. If a later movie blocks, stub movie playback to
+   complete-immediately.
+4. Then Phases 4–6 (render correctness, audio XMA→SDL, save/continue) are normal iteration.
+
+## What fixed the old SEH/image-load hang (history)
+The post-render hang was NOT standard `.xdata` SEH (the earlier guess). It was a **custom
+hand-rolled setjmp/longjmp** used for image-format detection: the loader (`sub_82459B00`)
+tries each format; "try JPEG" (`sub_82458010`) `setjmp`s a CONTEXT (`sub_8242EEA0`,
+buf=`r1+720`=vtable+144), and on "not a JPEG" the decoder's raiseError (`sub_82456198`)
+`longjmp`s (`sub_8242EA70`=RtlRestoreContext) back, so the loader tries the next format
+(TGA). Modeled exactly by rexglue's `ppc_setjmp/longjmp` (same buffer, live setjmp frame).
+Fix = manifest `setjmp_address=0x8242EEA0` + `longjmp_address=0x8242EA70` (config-only).
+Full root-cause + the dead-ends in `knowledge-base/titles/south-park-lgtdp/40-seh-implementation-plan.md`.
