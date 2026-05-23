@@ -4,10 +4,10 @@ Prerequisites on this Windows 11 host:
 
 | Tool | Version | Note |
 |------|---------|------|
-| Clang | **20+** (clang-cl / VS2022 "C++ Clang tools") | **Required** — recomp output needs Clang. Not yet installed on host. |
-| CMake | 3.25+ | present |
-| Ninja | any recent | present |
-| PowerShell 7 (`pwsh`) | 7.x | for the rexglue **PSReX** lifecycle |
+| Clang | **20+** (clang-cl / VS2022 "C++ Clang tools") | **Installed: 22.1.6** via scoop (user-scope) |
+| CMake | 3.25+ | present (4.3.1) |
+| Ninja | any recent | present (1.13.2) |
+| PowerShell 7 (`pwsh`) | 7.x | **Installed: 7.6.2** via scoop |
 | Python | 3.10+ | extraction/asset tooling |
 | Vulkan SDK | optional | only for the Vulkan backend; D3D12 is primary |
 
