@@ -12,6 +12,7 @@ never emit game content into the repo (outputs go to the git-ignored `private/`)
 | `scan_recomp.py` / `fix_recomp_labels.py` | Scan / post-codegen fixup of generated C++ (see Phase 2/3 notes). |
 | `cdb_*.txt` | cdb command scripts for crash/throw triage (`-cf`). |
 | `find_init_arrays.py` | Scan the decrypted image for null-bracketed code-pointer arrays (locates C++ static-initializer `.CRT$XC*` tables / vtables for startup RE). Needs pycryptodome. |
+| `find_initterm.py` | Find `_initterm`/`mainCRTStartup` candidates (small indirect-call-loop funcs + their root callers) for startup RE. |
 | `find_xrefs.py` | Find code references to a guest address via `lis`+`addi/ori` formation (xref analysis for startup RE; note: misses `lis`+load/store-offset patterns). Needs pycryptodome. |
 
 Examples (PowerShell):
