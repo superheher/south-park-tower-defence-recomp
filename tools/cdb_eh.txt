@@ -1,0 +1,9 @@
+$$ Break on first C++ exception (REX_UNIMPLEMENTED throws std::runtime_error).
+sxe eh
+g
+.echo ====EXC====
+.exr -1
+.echo ====STACK====
+kpn 45
+.echo ====END====
+q

@@ -1,0 +1,7 @@
+$$ Trace whether the entry init chain runs. r3 is at PPCContext+0x18 (rcx=&ctx).
+bp south_park_td!__imp__xstart ".echo ==XSTART==; dq @rcx+0x18 L1; gc"
+bp south_park_td!__imp__sub_8244EC20 ".echo ==EC20_HIT==; gc"
+bp south_park_td!__imp__sub_8244EC28 ".echo ==EC28_HIT==; gc"
+g
+.echo ==PROG_END==
+q

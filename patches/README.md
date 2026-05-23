@@ -14,4 +14,7 @@ cmake --build --preset win-amd64-release --target install   # in third_party/rex
 
 | Patch | Fixes |
 |-------|-------|
-| `0001-rexglue-thread-r1-stack-headroom.patch` | Initial guest `r1` was set to `stack_base`, which sits on the stack's `PAGE_NOACCESS` guard page. A no-prologue XEX entry thunk that reads its caller frame *above* `r1` (South Park's `xstart`: `addi r1,r1,112; lwz r12,-8(r1)`) faults. Reserve a small 16-byte-aligned initial frame below `stack_base`. See `knowledge-base/titles/south-park-lgtdp/30-boot-log.md`. |
+| `0001-rexglue-thread-r1-stack-headroom.patch` | Initial guest `r1` was set to `stack_base`, which sits on the stack's `PAGE_NOACCESS` guard page. A no-prologue XEX entry thunk that reads its caller frame *above* `r1` (South Park's `xstart`: `addi r1,r1,112; lwz r12,-8(r1)`) faults. Reserve a small 16-byte-aligned initial frame below `stack_base`. |
+| `0002-rexglue-mainthread-r3-entry-sentinel.patch` | `PrepareModuleLaunch` launched the main thread with `start_context = 0` (→ guest `r3 = 0`). XDK CRT entry thunks double as the thread trampoline and only run process init when `r3 == -1` (`xstart: cmpwi r3,-1; bne <epilogue>`), so init was skipped. Pass `0xFFFFFFFF`. |
+
+Both detailed in `knowledge-base/titles/south-park-lgtdp/30-boot-log.md`.

@@ -1,0 +1,5 @@
+.reload /f
+bm south_park_td!__imp__xstart ".echo ====XSTART_HIT====; dq @rcx+0x18 L1; kpn 8"
+g
+.echo ====AFTER_G====
+q
