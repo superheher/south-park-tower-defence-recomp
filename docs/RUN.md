@@ -14,9 +14,19 @@
 > `WAIT_REG_MEM` 1 ms-sleep-per-poll throttle — see below; NOT a reboot). **Remaining (polish, not
 > blockers):** in-match font-glyph corruption (`65-font-glyph-corruption.md` — front-end text is
 > fine), audio fidelity, and the in-game audio/subtitle settings' load-back.
+> **✅ CROSS-RESTART CONTINUE NOW WORKS (2026-05-24, verified by running).** Win Stan's House →
+> RESTART → the CAMPAIGN LEVEL SELECT shows **Elementary School unlocked** (screenshots
+> `C:\Temp\b6_levelselect2.png`, `b11_FINAL.png`; A/B control `b7_levelselect2.png`). Root cause:
+> campaign progress lives in the in-memory g_slots block `0x828EB348+2480..+2624` (per-level
+> complete/unlock + scores; "levels reached" gate at `g_slots+2520`); the guest reads `63E83FFE` at
+> boot but never deserializes it into that block, and the game clobbers the disk save to default —
+> so saved progress never reaches the campaign state. **Fix (runtime, in the SDK patch):** a 20 ms
+> background thread snapshots the g_slots progress block to a side file `userdata/<title>/profile/
+> User/gslots_campaign.bin` when the gate grows (a win), and `XamInputGetState` restores it into
+> g_slots each frame whenever the live block is default — so the level grid is rebuilt with the
+> saved unlocks. Format-agnostic + monotonic. Full analysis: `56-continue-re-map.md` (SOLUTION).
 > **v1 COMPLETE (maintainer scope decision 2026-05-24):** v1 = playable + save-to-disk + **in-session**
-> continue (level-complete unlocks + auto-advances). **Cross-restart continue** (unlocks persisting
-> after a full relaunch) is scoped **out of v1** = a root-caused **post-v1 backlog** item (`56-continue-re-map.md`). Evidence:
+> continue (level-complete unlocks + auto-advances). Evidence:
 > `knowledge-base/titles/south-park-lgtdp/{40-seh,50-menu-input-and-lobby,55-save-system,60-boot-present-deadlock,65-font,90-progress-report}.md`.
 >
 > **To reach the match (automation):** `--mnk_mode=true` + the injector
@@ -147,13 +157,12 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
   GPU poll. (Both are diagnostics in the full SDK patch.)
 
 ## Remaining work (it's playable + saves; these are the open items)
-1. **Continue (cross-restart progress) — the last Condition-A gap.** Save WRITES work in full
-   mode (completing Stan's House flips `63E83FFE` offsets 746/755 → 1 = level-complete flags, +
-   score in `63E83FFF`). Instrumented (`[PROF-RD/WR/LOAD/SAVE]` in `xam_user.cpp`/`user_profile.cpp`)
-   the game **does read+load the blobs at boot** (`is_set=true`), then **writes them back during
-   menu/lobby navigation** — the open question is whether that nav-write preserves or resets the
-   loaded progress. If it resets, find why (game "new local game" reset vs profile-identity); if it
-   preserves, continue works. (See `knowledge-base/titles/south-park-lgtdp/55-save-system.md`.)
+1. **✅ Continue (cross-restart progress) — SOLVED 2026-05-24 (verified by running).** Campaign
+   progress lives in the in-memory g_slots block `0x828EB348+2480..+2624`; the guest never loads
+   `63E83FFE` back into it and the game clobbers the disk save. Fixed in the runtime: a background
+   thread snapshots the g_slots progress block to `gslots_campaign.bin` on a win, and
+   `XamInputGetState` restores it each frame. Win Stan's House → restart → Elementary School unlocked
+   (verified). See `56-continue-re-map.md` (SOLUTION).
 2. **In-match font-glyph corruption** — front-end/menu text is crisp; only the in-match HUD/tooltip
    text mis-decodes (striped). Diagnose via the GPU trace + texture dump (`trace_gpu_prefix`,
    `src/graphics/trace_dump.cpp`). See `65-font-glyph-corruption.md`.
