@@ -272,6 +272,105 @@ index 9fc4763..42d55da 100644
  [[noreturn]] void seh_rethrow() {
    uint32_t code = tls_seh_state.code;
    ULONG_PTR info[2] = {tls_seh_state.info[0], tls_seh_state.info[1]};
+diff --git a/src/filesystem/devices/host_path_entry.cpp b/src/filesystem/devices/host_path_entry.cpp
+index 56f5a97..e39c435 100644
+--- a/src/filesystem/devices/host_path_entry.cpp
++++ b/src/filesystem/devices/host_path_entry.cpp
+@@ -12,6 +12,12 @@
+ #include <rex/filesystem/devices/host_path_entry.h>
+ #include <rex/filesystem/devices/host_path_file.h>
+ 
++#include <algorithm>
++#include <cctype>
++#include <fstream>
++#include <string>
++
++#include <rex/cvar.h>
+ #include <rex/filesystem.h>
+ #include <rex/filesystem/device.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+@@ -20,6 +26,11 @@
+ #include <rex/memory/mapped_memory.h>
+ #include <rex/string.h>
+ 
++REXCVAR_DEFINE_BOOL(always_win, false, "Game",
++                    "Cheat: the base (school) becomes invincible so you can't lose a level "
++                    "(its defense health is continuously restored, so the engine never "
++                    "registers a defeat / GAME OVER)");
++
+ namespace rex::filesystem {
+ 
+ HostPathEntry::HostPathEntry(Device* device, Entry* parent, const std::string_view path,
+@@ -45,7 +56,68 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
+       entry->attributes_ |= kFileAttributeReadOnly;
+     }
+     entry->size_ = file_info.total_size;
+-    entry->allocation_size_ = rex::round_up(file_info.total_size, device->bytes_per_sector());
++
++    // [recomp always_win] When the cheat cvar is set, redirect the campaign's
++    // shared Lua (LevelGlobalFunctions.lua) to a temp copy with extra code that
++    // keeps the base's defense health topped up. The engine decides defeat itself
++    // (defense health <= 0 -> DefenseKilled -> GAME OVER), independent of the Lua
++    // lose sequence, so the only reliable way to block GAME OVER is to make the
++    // base unkillable. We redirect host_path_ (rather than patching reads) so it
++    // works for both ReadSync and memory-mapped loading.
++    if (REXCVAR_GET(always_win)) {
++      auto name_utf8 = rex::path_to_utf8(file_info.name);
++      std::string name_lower = name_utf8;
++      std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(),
++                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++      if (name_lower == "levelglobalfunctions.lua") {
++        try {
++          std::ifstream in(full_path, std::ios::binary);
++          std::string content((std::istreambuf_iterator<char>(in)),
++                              std::istreambuf_iterator<char>());
++          in.close();
++          if (!content.empty()) {
++            content +=
++                "\n-- [recomp always_win] Make the base invincible: a background task\n"
++                "-- restores the defense health whenever it drops, so the engine never\n"
++                "-- sees it reach 0 and never triggers a defeat. Started on the first\n"
++                "-- stage launch (the scheduler is live then) and runs for the session.\n"
++                "local __aw_LaunchStage = LaunchStage\n"
++                "function LaunchStage(s,p,c,d)\n"
++                "  __aw_maxhp = 0\n"
++                "  if not __aw_keepalive then\n"
++                "    __aw_keepalive = true\n"
++                "    Task(function()\n"
++                "      while true do\n"
++                "        local ok, h = pcall(GetDefenseHealth)\n"
++                "        if ok and h then\n"
++                "          if h > __aw_maxhp then __aw_maxhp = h end\n"
++                "          if h > 0 and h < __aw_maxhp then pcall(SetDefenseHealth, __aw_maxhp) end\n"
++                "        end\n"
++                "        Wait(0.1)\n"
++                "      end\n"
++                "    end)\n"
++                "  end\n"
++                "  __aw_LaunchStage(s,p,c,d)\n"
++                "end\n";
++            auto temp_path =
++                std::filesystem::temp_directory_path() / "rexglue_alwayswin_lgf.lua";
++            std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
++            out.write(content.data(), static_cast<std::streamsize>(content.size()));
++            out.close();
++            entry->host_path_ = temp_path;
++            entry->size_ = content.size();
++            REXFS_WARN(
++                "[always_win] redirected LevelGlobalFunctions.lua -> {} ({} bytes); "
++                "the base is now invincible (you can't lose a level)",
++                rex::path_to_utf8(temp_path), content.size());
++          }
++        } catch (const std::exception& e) {
++          REXFS_ERROR("[always_win] failed to inject invincibility: {}", e.what());
++        }
++      }
++    }
++
++    entry->allocation_size_ = rex::round_up(entry->size_, device->bytes_per_sector());
+   }
+   return entry;
+ }
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
 index 60efcd3..9e48177 100644
 --- a/src/graphics/command_processor.cpp

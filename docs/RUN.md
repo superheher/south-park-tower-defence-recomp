@@ -127,6 +127,15 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
 - **`--license_mask=1` is required for save/continue** — without it the title runs as a TRIAL
   (shows "UNLOCK FULL GAME") and persists nothing. Set it for a copy you own.
 - `--user_data_root=<dir>` = a writable save dir (profile/progress land in `<dir>/58410931/profile/`).
+- **`--always_win=1` (cheat, optional)** = makes the base (school) **invincible** so you can't
+  lose a level. The engine declares defeat itself when the base's defense health hits 0
+  (`DefenseKilled` → GAME OVER), independent of the Lua lose sequence, so the cheat keeps the
+  defense health topped up (a background Lua task restores it) → the engine never registers a
+  defeat. You still play normally and clear waves to win; you just can't get a GAME OVER from
+  the base being destroyed. Implemented runtime-side (no asset edits): with the cvar set,
+  `LevelGlobalFunctions.lua` is served from a temp copy with the keep-alive appended. See
+  `knowledge-base/.../66-always-win-invincibility.md`. (Does not cover non-base losses such as
+  a time-up mode, if any.)
 - `--window_width/--window_height` set the startup window size (0 = app default ~1296×759).
 - `--log_level=debug` (or `trace`) for verbose kernel/APU logging.
 - `--mnk_mode=true` makes the keyboard a virtual controller (Escape=Start, Space=A,
