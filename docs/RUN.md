@@ -13,7 +13,10 @@
 > the **session-enroll fix** (`fix_recomp_labels` Fix 6), and the **boot spin-yield fix** (the CP
 > `WAIT_REG_MEM` 1 ms-sleep-per-poll throttle — see below; NOT a reboot). **Remaining (polish, not
 > blockers):** in-match font-glyph corruption (`65-font-glyph-corruption.md` — front-end text is
-> fine), audio fidelity, and the in-game audio/subtitle settings' load-back. Evidence:
+> fine), audio fidelity, and the in-game audio/subtitle settings' load-back.
+> **v1 COMPLETE (maintainer scope decision 2026-05-24):** v1 = playable + save-to-disk + **in-session**
+> continue (level-complete unlocks + auto-advances). **Cross-restart continue** (unlocks persisting
+> after a full relaunch) is scoped **out of v1** = a root-caused **post-v1 backlog** item (`56-continue-re-map.md`). Evidence:
 > `knowledge-base/titles/south-park-lgtdp/{40-seh,50-menu-input-and-lobby,55-save-system,60-boot-present-deadlock,65-font,90-progress-report}.md`.
 >
 > **To reach the match (automation):** `--mnk_mode=true` + the injector
