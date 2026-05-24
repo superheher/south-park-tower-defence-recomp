@@ -22,6 +22,16 @@
 > `REX_INJECT_SCRIPT="66:0010"` presses START at 66 s (`0010`=START, `1000`=A; comma-separate
 > `t:hexbtn` steps; `REX_INJECT_DUR` = hold seconds). That's how the menu/lobby were reached.
 >
+> **Focus-INDEPENDENT live input (`REX_INPUT_FILE`):** set `REX_INPUT_FILE=<path>` and the runtime
+> re-reads that file every poll for the current XInput button mask (hex) and reports it as pad
+> state **without needing window focus** (OS key injection is ignored by SDL when unfocused;
+> input-system-level injection is reliable). Masks: `0010`=START `0020`=BACK `1000`=A `2000`=B
+> `0001/0002/0004/0008`=DPAD U/D/L/R. Write the mask to press, write `0` to release (a tap = mask
+> then 0); menus get edge-triggered keystrokes. It is OR'd with real SDL pad/keyboard. **One-click
+> launcher with this wired in:** `out/build/win-amd64-relwithdebinfo/launch_game.bat` — run it, and
+> the game can be driven by writing masks to `live_input.txt` next to the exe (great for remote/RustDesk
+> use, or automation, where the window can't hold focus).
+>
 > **⚠ Boot deadlock (2026-05-24, environment-sensitive):** after ~250 launch/kill cycles in one
 > long session the build began **deadlocking at the first frame present, ~100% of boots** (log
 > freezes ~4 KB after `SetInterruptCallback`, no input ever polled). Root cause (cdb): a
