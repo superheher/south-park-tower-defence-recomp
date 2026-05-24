@@ -770,7 +770,7 @@ index 333becb..1d288f9 100644
  
    upload_ranges_.clear();
 diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
-index b8eae3c..dd58d35 100644
+index b8eae3c..f06bb1e 100644
 --- a/src/input/mnk/mnk_input_driver.cpp
 +++ b/src/input/mnk/mnk_input_driver.cpp
 @@ -19,6 +19,8 @@
@@ -782,7 +782,19 @@ index b8eae3c..dd58d35 100644
  #include <cstring>
  
  #if REX_PLATFORM_WIN32
-@@ -140,6 +142,88 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+@@ -30,6 +32,11 @@ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller
+ REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
+ REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
+     .range(0.01, 10.0);
++REXCVAR_DEFINE_BOOL(mnk_mouse_look, false, "Input",
++                    "Capture the mouse for camera / right-stick control (hides the cursor and "
++                    "re-centers it every frame, locking it to the window). Default OFF keeps the "
++                    "cursor free; mouse BUTTONS still map to triggers, only mouse movement won't "
++                    "drive the right stick.");
+ 
+ REXCVAR_DEFINE_STRING(keybind_a, "Space", "Input/Keybinds/Controller", "A button");
+ REXCVAR_DEFINE_STRING(keybind_b, "Shift", "Input/Keybinds/Controller", "B button");
+@@ -140,6 +147,88 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
      return X_ERROR_DEVICE_NOT_CONNECTED;
    }
  
@@ -871,6 +883,19 @@ index b8eae3c..dd58d35 100644
    UpdateMouseCapture();
  
    if (!is_active() || !has_focus_) {
+@@ -278,7 +367,11 @@ void MnkInputDriver::UpdateMouseCapture() {
+   if (!attached_window_)
+     return;
+ 
+-  bool should_capture = IsEnabled() && has_focus_ && is_active();
++  // [recomp] Only grab/hide/re-center the cursor when mouse-look is explicitly enabled. By
++  // default the cursor stays free + visible (the capture made it impossible to move or resize
++  // the window). Buttons/triggers are unaffected (read from key state, not from capture).
++  bool should_capture =
++      REXCVAR_GET(mnk_mouse_look) && IsEnabled() && has_focus_ && is_active();
+ 
+   if (should_capture && !mouse_captured_) {
+     mouse_captured_ = true;
 diff --git a/src/kernel/xam/xam_input.cpp b/src/kernel/xam/xam_input.cpp
 index 80c3634..92c179e 100644
 --- a/src/kernel/xam/xam_input.cpp
@@ -1124,10 +1149,31 @@ index 670c446..8c283b8 100644
  
  void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
-index 3f1a852..f459ce8 100644
+index 3f1a852..ed746dc 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
-@@ -100,6 +100,41 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
+@@ -17,6 +17,7 @@
+ #include <rex/logging.h>
+ #include <rex/memory.h>
+ #include <rex/hook.h>
++#include <rex/cvar.h>
+ #include <rex/types.h>
+ #include <rex/system/info/file.h>
+ #include <rex/system/kernel_state.h>
+@@ -32,6 +33,12 @@
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
++// [recomp] Hide the Xbox Live Arcade boot logo (ArcadeLogo.ptc). Its frames are JPEG-compressed
++// in the source asset, so the full-screen splash shows blocky/ringing artifacts. With this set,
++// NtCreateFile reports it as not-found -> the game shows black and proceeds. Default off.
++REXCVAR_DEFINE_BOOL(skip_arcade_logo, false, "Game",
++                    "Skip the Xbox Live Arcade boot logo (ArcadeLogo.ptc); shows black instead.");
++
+ struct CreateOptions {
+   // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
+   static const uint32_t FILE_DIRECTORY_FILE = 0x00000001;
+@@ -100,6 +107,41 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
    return true;
  }
  
@@ -1169,7 +1215,26 @@ index 3f1a852..f459ce8 100644
  u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
                         ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attrs,
                         ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
-@@ -149,6 +184,29 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+@@ -133,6 +175,18 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+     return X_STATUS_OBJECT_NAME_INVALID;
+   }
+ 
++  // [recomp] Optionally hide the Xbox Live Arcade boot logo (its JPEG frames look blocky
++  // full-screen): report ArcadeLogo.ptc as not-found so the game shows black and continues.
++  if (REXCVAR_GET(skip_arcade_logo) && target_path.find("ArcadeLogo") != std::string::npos) {
++    REXKRNL_INFO("[NtCreateFile] skip_arcade_logo: hiding '{}'", target_path);
++    *handle_out = X_INVALID_HANDLE_VALUE;
++    if (io_status_block) {
++      io_status_block->status = X_STATUS_NO_SUCH_FILE;
++      io_status_block->information = 0;
++    }
++    return X_STATUS_NO_SUCH_FILE;
++  }
++
+   if (object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
+       object_attrs->root_directory != 0) {
+     auto root_file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(object_attrs->root_directory);
+@@ -149,6 +203,29 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
        root_entry, target_path, rex::filesystem::FileDisposition((uint32_t)creation_disposition),
        desired_access, (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
        (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file, &file_action);
@@ -1403,3 +1468,53 @@ index db31ff4..65920f1 100644
    exit_code = static_cast<int>(ctx->r3.u32);
  
    // If we got here it means the execute completed without an exit being called.
+diff --git a/src/ui/window_win.cpp b/src/ui/window_win.cpp
+index 09c44a3..fbc0161 100644
+--- a/src/ui/window_win.cpp
++++ b/src/ui/window_win.cpp
+@@ -36,6 +36,9 @@
+ #include <shellapi.h>
+ #include <tpcshrd.h>
+ 
++REXCVAR_DEFINE_STRING(window_icon, "", "UI/Window",
++                      "Path to a .ico file to use as the window/taskbar icon (empty = none).");
++
+ namespace {
+ 
+ uint32_t ResolveWindowWidth(uint32_t requested_width) {
+@@ -282,6 +285,35 @@ bool Win32Window::OpenImpl() {
+     SendMessageW(hwnd_, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon_));
+   }
+ 
++  // [recomp] Optional window/taskbar icon from a .ico file (e.g. the title's SouthPark.png
++  // converted to .ico), passed via --window_icon=<path>. LoadImageW handles a multi-size .ico.
++  {
++    const std::string& icon_path = REXCVAR_GET(window_icon);
++    if (!icon_path.empty()) {
++      int wlen =
++          MultiByteToWideChar(CP_UTF8, 0, icon_path.data(), int(icon_path.size()), nullptr, 0);
++      std::wstring wpath(size_t(wlen), L'\0');
++      MultiByteToWideChar(CP_UTF8, 0, icon_path.data(), int(icon_path.size()), wpath.data(), wlen);
++      HICON big = static_cast<HICON>(
++          LoadImageW(nullptr, wpath.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE));
++      HICON small_icon = static_cast<HICON>(
++          LoadImageW(nullptr, wpath.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
++                     GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
++      if (big) {
++        SendMessageW(hwnd_, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
++        SetClassLongPtrW(hwnd_, GCLP_HICON, reinterpret_cast<LONG_PTR>(big));
++      }
++      HICON small_for_title = small_icon ? small_icon : big;
++      if (small_for_title) {
++        SendMessageW(hwnd_, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_for_title));
++        SetClassLongPtrW(hwnd_, GCLP_HICONSM, reinterpret_cast<LONG_PTR>(small_for_title));
++      }
++      if (!big && !small_icon) {
++        REXLOG_WARN("window_icon: failed to load '{}'", icon_path);
++      }
++    }
++  }
++
+   // Move the window to the requested monitor before entering fullscreen so
+   // that MonitorFromWindow picks the correct display.
+   if (int32_t monitor_index = REXCVAR_GET(monitor); monitor_index > 0) {
