@@ -289,18 +289,19 @@ index 60efcd3..59476f4 100644
        if (wait >= 0x100) {
          PrepareForWait();
 diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
-index b8eae3c..3ad8199 100644
+index b8eae3c..dd58d35 100644
 --- a/src/input/mnk/mnk_input_driver.cpp
 +++ b/src/input/mnk/mnk_input_driver.cpp
-@@ -19,6 +19,7 @@
+@@ -19,6 +19,8 @@
  
  #include <algorithm>
  #include <cmath>
++#include <cstdio>
 +#include <cstdlib>
  #include <cstring>
  
  #if REX_PLATFORM_WIN32
-@@ -140,6 +141,50 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+@@ -140,6 +142,88 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
      return X_ERROR_DEVICE_NOT_CONNECTED;
    }
  
@@ -341,6 +342,44 @@ index b8eae3c..3ad8199 100644
 +      uint16_t v = vkfor(static_cast<uint16_t>(btn | s_last));
 +      if (v) { std::lock_guard lk(state_mutex_); EnqueueKeystroke(v, btn != 0); }
 +      s_last = btn;
++    }
++    std::memset(out_state, 0, sizeof(*out_state));
++    out_state->packet_number = ++packet_number_;
++    out_state->gamepad.buttons = btn;
++    return X_ERROR_SUCCESS;
++  }
++
++  // [LIVE-INPUT] Focus-INDEPENDENT live input source. REX_INPUT_FILE points to a small text file
++  // holding the current XInput button mask in hex (e.g. "1000"=A, "0010"=START, "0002"=DPAD_DOWN,
++  // "2000"=B, "0020"=BACK, "0001/4/8"=DPAD up/left/right). It is re-read every poll and reported as
++  // the pad state WITHOUT requiring window focus (unlike OS key injection, which SDL ignores when
++  // unfocused). Menus that poll GetKeystroke get edge-triggered keystrokes. Write the mask to press,
++  // write "0" (or empty) to release; a momentary tap = write mask then write 0. The InputSystem ORs
++  // this with any real SDL pad/keyboard, so it augments rather than replaces real input.
++  static const char* s_input_file = std::getenv("REX_INPUT_FILE");
++  if (s_input_file && out_state) {
++    uint16_t btn = 0;
++    if (FILE* f = std::fopen(s_input_file, "rb")) {
++      char buf[32] = {0};
++      size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
++      std::fclose(f);
++      if (n) btn = static_cast<uint16_t>(std::strtoul(buf, nullptr, 16));
++    }
++    static uint16_t s_lastf = 0;
++    if (btn != s_lastf) {
++      auto vkfor = [](uint16_t m) -> uint16_t {
++        if (m & 0x0010) return 0x5814;  // START
++        if (m & 0x0020) return 0x5815;  // BACK
++        if (m & 0x1000) return 0x5800;  // A
++        if (m & 0x2000) return 0x5801;  // B
++        if (m & 0x0001) return 0x5810;  // DPAD_UP
++        if (m & 0x0002) return 0x5811;  // DPAD_DOWN
++        if (m & 0x0004) return 0x5812;  // DPAD_LEFT
++        if (m & 0x0008) return 0x5813;  // DPAD_RIGHT
++        return 0; };
++      uint16_t v = vkfor(static_cast<uint16_t>(btn | s_lastf));
++      if (v) { std::lock_guard lk(state_mutex_); EnqueueKeystroke(v, btn != 0); }
++      s_lastf = btn;
 +    }
 +    std::memset(out_state, 0, sizeof(*out_state));
 +    out_state->packet_number = ++packet_number_;
