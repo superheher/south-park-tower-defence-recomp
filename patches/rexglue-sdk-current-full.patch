@@ -428,6 +428,29 @@ index 3877b1a..b147398 100644
    }
  
    // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 333becb..f0d958a 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -128,6 +128,18 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
+     return;
+   }
+ 
++  // [recomp fix: in-match font-glyph corruption] The active/staging valid-flag buffer SWAP
++  // below must be atomic w.r.t. MemoryInvalidationCallback (which runs under this same global
++  // lock on guest CPU writes). Without it, the unlocked exchange() races the invalidation: a
++  // guest thread loads the active pointer, then we swap, then it clears the now-RETIRED buffer
++  // -> the just-invalidated page stays VALID in the new active buffer for one frame -> the
++  // RequestRanges fast-path skips the re-upload -> the GPU samples last frame's bytes for those
++  // pages. Harmless for static textures (menu atlas, uploaded once) but the in-match text path
++  // re-rasterizes a dynamic glyph texture EVERY frame, so its pages are invalidated every frame
++  // and hit this race -> vertical-striped glyphs that vary per render. The global lock is a
++  // recursive std::mutex; acquiring it here once per frame is cheap. See KB 65.
++  auto global_lock = global_critical_region_.Acquire();
++
+   uint64_t* staging = staging_valid_flags_.load(std::memory_order_acquire);
+   if (!staging || !num_system_page_flags_) {
+     gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
 diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
 index b8eae3c..dd58d35 100644
 --- a/src/input/mnk/mnk_input_driver.cpp

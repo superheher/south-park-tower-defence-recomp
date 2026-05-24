@@ -163,9 +163,13 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
    thread snapshots the g_slots progress block to `gslots_campaign.bin` on a win, and
    `XamInputGetState` restores it each frame. Win Stan's House → restart → Elementary School unlocked
    (verified). See `56-continue-re-map.md` (SOLUTION).
-2. **In-match font-glyph corruption** — front-end/menu text is crisp; only the in-match HUD/tooltip
-   text mis-decodes (striped). Diagnose via the GPU trace + texture dump (`trace_gpu_prefix`,
-   `src/graphics/trace_dump.cpp`). See `65-font-glyph-corruption.md`.
+2. **✅ In-match font-glyph corruption — SOLVED 2026-05-24 (verified by running, clean A/B).** It was
+   a cross-thread race in the GPU shared-memory page-validity tracking (the lock-free double-buffer
+   swap in `shared_memory.cpp` ran without the global lock → a just-invalidated dynamic-font page
+   stayed "valid" for a frame → the GPU sampled stale bytes → vertical stripes that varied per
+   render; menu text is a static atlas so it was unaffected). Fixed by making the swap atomic under
+   the global lock. Before: in-match "GINGER ▦▦"; after: "GINGER KIDS" clean. See
+   `65-font-glyph-corruption.md` (SOLUTION).
 3. **Audio fidelity** — the XMA thread runs; needs ear verification + any conversion fixes.
 4. **Boot speed** — ~4–5 min to title (the CP loops to resolve fences after the spin-yield fix); a
    follow-up could tighten the spin/sleep thresholds.
