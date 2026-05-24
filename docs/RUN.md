@@ -22,11 +22,20 @@
 > `REX_INJECT_SCRIPT="66:0010"` presses START at 66 s (`0010`=START, `1000`=A; comma-separate
 > `t:hexbtn` steps; `REX_INJECT_DUR` = hold seconds). That's how the menu/lobby were reached.
 >
-> **Known blockers past the lobby:** (a) a **non-deterministic GPU-fence stall** (main thread
+> **⚠ Boot deadlock (2026-05-24, environment-sensitive):** after ~250 launch/kill cycles in one
+> long session the build began **deadlocking at the first frame present, ~100% of boots** (log
+> freezes ~4 KB after `SetInterruptCallback`, no input ever polled). Root cause (cdb): a
+> **present/vsync deadlock** — the swap path (`XE_SWAP → IssueSwap → RefreshGuestOutput`) blocks
+> while `Presenter::DXGIUITickThread` spins on a disruptor `wait_until_published`. `--vsync=false`
+> clears it but then stalls on a `WAIT_REG_MEM` GPU fence (`0x1FC9B006`, no escape). The same
+> build booted to a **match win** earlier the same session, so this is degraded host GPU-driver/DWM
+> vsync delivery (or a latent present-path race). **A reboot is the fastest restore**; then boot
+> with default `vsync=true`. Full analysis: `knowledge-base/titles/south-park-lgtdp/60-boot-present-deadlock.md`.
+>
+> **Known blockers past the lobby:** a **non-deterministic GPU-fence stall** (main thread
 > spins in `sub_821C6E58` waiting for a guest GPU fence that sometimes doesn't advance → some
-> runs never reach input; proper fix = runtime GPU fence write-back); (b) a **lobby→match crash**
-> `SEH FAULT 0x1A in sub_82101AF0` (the menu/lobby action handler near-null-derefs; also fires
-> on rapid-repeated Start — use single presses with gaps).
+> runs never reach input; proper fix = runtime GPU fence write-back). (The earlier lobby→match
+> crash `SEH 0x1A in sub_82101AF0` is **FIXED** — the session-enroll fix, `fix_recomp_labels` Fix 6.)
 >
 > **The fix that reached the title screen (config-only, no SDK change):** the post-render
 > hang was a **custom setjmp/longjmp EH for image-format detection** — the loader tries
