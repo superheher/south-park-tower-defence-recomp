@@ -249,7 +249,7 @@ index 9fc4763..42d55da 100644
    uint32_t code = tls_seh_state.code;
    ULONG_PTR info[2] = {tls_seh_state.info[0], tls_seh_state.info[1]};
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 60efcd3..feff977 100644
+index 60efcd3..59476f4 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -1128,6 +1128,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
@@ -260,7 +260,7 @@ index 60efcd3..feff977 100644
    do {
      uint32_t value = 0;
      if (is_memory) {
-@@ -1169,6 +1170,15 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1169,6 +1170,27 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
          break;
      }
      if (!matched) {
@@ -273,6 +273,18 @@ index 60efcd3..feff977 100644
 +            is_memory, poll_reg_addr, wait_info & 0x7, ref, mask, value, wait, spin_count);
 +      }
 +      ++spin_count;
++      // [recomp stop-gap] A WAIT_REG_MEM has no PM4 timeout: if the gated guest fence never
++      // resolves it hangs the command processor forever (observed in the boot present/vsync +
++      // fence deadlock). After a large spin budget, proceed anyway -- in the stuck cases the GPU
++      // work it gates is already complete. Verify post-reboot; the real fix is runtime GPU-fence
++      // write-back. See knowledge-base/titles/south-park-lgtdp/60-boot-present-deadlock.md.
++      if (spin_count > 500000u) {
++        REXGPU_WARN(
++            "WAIT_REG_MEM escape: proceeding after {} spins (poll=0x{:08X} func=0x{:X} "
++            "ref=0x{:08X} mask=0x{:08X})",
++            spin_count, poll_reg_addr, wait_info & 0x7, ref, mask);
++        break;
++      }
        // Wait.
        if (wait >= 0x100) {
          PrepareForWait();
