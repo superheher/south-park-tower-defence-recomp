@@ -14,9 +14,10 @@
 > `WAIT_REG_MEM` 1 ms-sleep-per-poll throttle — see below; NOT a reboot). **Polish backlog worked
 > 2026-05-24 (see `knowledge-base/.../67-polish-backlog.md` + "Remaining work" below):** in-match
 > font corruption FIXED (`65`), cross-restart continue FIXED (`56`), Elementary `en-en` assets FIXED
-> (locale fallback), boot profiled (~50–60 s warm). **Open:** audio fidelity (path correct + clips
-> produced — needs a human ear); intro/cutscene WMV black & silent (no decoder — documented,
-> skippable); online features out of scope.
+> (locale fallback), boot profiled (~50–60 s warm), **intro/cutscene `.wmv` movies VERIFIED PLAYING
+> (video + audio) via the game's own in-software WMV3/WMA2 decoders — the old "black & silent" note
+> was an unverified assumption; `70`** (likely unblocked by the `65` page-validity fix). **Open:**
+> audio fidelity (path correct + clips produced — needs a human ear); online features out of scope.
 > **✅ CROSS-RESTART CONTINUE NOW WORKS (2026-05-24, verified by running).** Win Stan's House →
 > RESTART → the CAMPAIGN LEVEL SELECT shows **Elementary School unlocked** (screenshots
 > `C:\Temp\b6_levelselect2.png`, `b11_FINAL.png`; A/B control `b7_levelselect2.png`). Root cause:
@@ -100,9 +101,9 @@ open with the locale segment stripped (a locale-subdir fallback; see
 `Movies/en-en/`" step is **no longer required** (harmless if already done). Verified: the
 campaign level-select slides/diagrams load and render; 0 remaining `en-en` `0xc000000f` failures.
 
-(The movies are **WMV3 video + WMA2 audio (ASF)**, which the runtime can't decode, so cutscenes
-play **black & silent** — they open and are **user-skippable** ("Ⓐ SKIP"), and the boot does not
-block on them. This is a documented limitation, `67` §4. `LuaScripts/School.lua` is genuinely
+(The movies are **WMV3 video + WMA2 audio (ASF)**; the **game decodes them in-software itself** and
+they **play (video + audio)** — verified by running (`70`, `67` §4). They are **user-skippable**
+("Ⓐ SKIP", the game's own prompt) and the boot does not block on them. `LuaScripts/School.lua` is genuinely
 absent from the dump — a benign optional per-level script; Elementary School plays without it.)
 
 ## Build
@@ -164,8 +165,8 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
   default OFF) — needed once the boot reaches an interactive screen.
 - Needs an **interactive desktop** (D3D12 window). Logs: `out\build\...\logs\south_park_td_NNN.log`.
 - **Expected today:** runtime init → loads `game:\default.xex` → shaders/pipelines → TGA
-  asset load → **animated intro** (Cartman over the town, ~30s) → intro movie (black; the
-  WMV has no decoder) → **TITLE SCREEN "PRESS START" (~55–60s)**. Stays there awaiting input.
+  asset load → splash → **intro movie `sp_xbox_0_intro.wmv`** (real video + audio, Cartman over the
+  town, ~22s, "Ⓐ SKIP") → **TITLE SCREEN "PRESS START" (~55–60s)**. Stays there awaiting input.
   Exit codes: `0xC0000005` = AV, `0xC0000409` = fail-fast.
 - **At the title screen, press Start** (gamepad Start, or `--mnk_mode=true` + **Escape**) to
   advance to the main menu. NOTE: the window must hold **input focus** (the mnk driver gates
@@ -221,10 +222,12 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
    The CP fence loop is **healthy** (0 `WAIT_REG_MEM` stuck). The old "~4–5 min" was a one-time
    **cold shader cache** first boot (live translation of the whole set), cached thereafter. The
    residual is **game-paced, user-skippable** intro animation — no cheap runtime win remains. (`67` §3.)
-6. **Intro / cutscene WMV movies — black & silent (documented limitation, won't-fix for v1).** WMV3
-   video + WMA2 audio (ASF); the runtime has no WMV3/VC-1 or WMA2 decoder (XMA only). The files open
-   (locale fallback covers `Movies/en-en/`) and are **user-skippable**; the boot doesn't block on
-   them. Adding a decoder is out of scope for v1. (`67` §4.)
+6. **Intro / cutscene WMV movies — ✅ PLAY (video + audio), premise corrected 2026-05-24.** The old
+   "black & silent, no decoder" note was an **unverified assumption**; in reality the **game decodes
+   the WMV3+WMA2 `.wmv` in-software itself** and the movies play (verified by running: animating intro
+   video + audio + completes/advances; removing the `.wmv` → the scene goes black, proving the game
+   decodes it). Likely unblocked by the `65` GPU page-validity fix (decoded-frame texture upload). A
+   host libavcodec path was built+proven then reverted (unnecessary). User-skippable. (`70`, `67` §4.)
 7. **Online co-op / leaderboards / achievements / avatars — out of scope for v1** (stubbed offline).
 
 ## What fixed the old SEH/image-load hang (history)
