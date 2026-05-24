@@ -185,13 +185,15 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
    thread snapshots the g_slots progress block to `gslots_campaign.bin` on a win, and
    `XamInputGetState` restores it each frame. Win Stan's House → restart → Elementary School unlocked
    (verified). See `56-continue-re-map.md` (SOLUTION).
-2. **✅ In-match font-glyph corruption — SOLVED 2026-05-24 (verified by running, clean A/B).** It was
-   a cross-thread race in the GPU shared-memory page-validity tracking (the lock-free double-buffer
-   swap in `shared_memory.cpp` ran without the global lock → a just-invalidated dynamic-font page
-   stayed "valid" for a frame → the GPU sampled stale bytes → vertical stripes that varied per
-   render; menu text is a static atlas so it was unaffected). Fixed by making the swap atomic under
-   the global lock. Before: in-match "GINGER ▦▦"; after: "GINGER KIDS" clean. See
-   `65-font-glyph-corruption.md` (SOLUTION).
+2. **✅ Font-glyph corruption (striped text) — FULLY SOLVED 2026-05-24 (verified by running on real
+   hardware).** Stale page-valid state in the GPU shared-memory upload-skip optimization left
+   per-frame CPU-rasterized glyph pages wrongly "valid" → re-upload skipped → GPU sampled stale bytes
+   → intermittent vertical stripes (in-match hint, menu difficulty NORMAL/HARD, results
+   SCORE/BONUS/TOTAL; varied per visit / per machine). An initial swap-lock was insufficient. Full
+   fix (per upstream rexglue-sdk **issue #341**): rebuild the valid-flag `staging` buffer as a FULL
+   snapshot each frame (not the flawed incremental copy) + serialize the fast-path read + **default
+   `clear_memory_page_state=false`** (force re-upload) for this title — the only config that renders
+   every screen clean. See `65-font-glyph-corruption.md` (FULL RESOLUTION).
 3. **✅ Elementary `en-en` asset gap — SOLVED 2026-05-24 (verified by running).** The campaign
    slides/diagrams under `Frontend/Graphics/en-en/` failed `NtCreateFile` `0xc000000f`; the runtime
    now retries with the locale segment stripped (locale-subdir fallback in `NtCreateFile`). 8
