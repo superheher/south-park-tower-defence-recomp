@@ -273,7 +273,7 @@ index 9fc4763..42d55da 100644
    uint32_t code = tls_seh_state.code;
    ULONG_PTR info[2] = {tls_seh_state.info[0], tls_seh_state.info[1]};
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 60efcd3..5fdff25 100644
+index 60efcd3..9e48177 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -406,6 +406,17 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
@@ -320,13 +320,15 @@ index 60efcd3..5fdff25 100644
    do {
      uint32_t value = 0;
      if (is_memory) {
-@@ -1169,6 +1192,27 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1169,21 +1192,56 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
          break;
      }
      if (!matched) {
 +      // [diag] Surface a stuck WAIT_REG_MEM: log poll target + live value once it
 +      // has clearly failed to satisfy, then periodically to see if it ever moves.
-+      if (spin_count == 16 || (spin_count > 16 && (spin_count % 4096) == 0)) {
++      // Only log fences that exceed the fast-poll budget (genuinely slow); fences resolving within
++      // it are normal and were spamming the log (heavy I/O that throttled the CP).
++      if (spin_count == 12000 || (spin_count > 12000 && (spin_count % 100000) == 0)) {
 +        REXGPU_WARN(
 +            "WAIT_REG_MEM stuck: is_mem={} poll=0x{:08X} func=0x{:X} ref=0x{:08X} "
 +            "mask=0x{:08X} value=0x{:08X} wait=0x{:X} spins={}",
@@ -347,8 +349,45 @@ index 60efcd3..5fdff25 100644
 +      }
        // Wait.
        if (wait >= 0x100) {
-         PrepareForWait();
-@@ -1347,7 +1391,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+-        PrepareForWait();
+-        if (!REXCVAR_GET(vsync)) {
+-          // User wants it fast and dangerous.
++        // [recomp fix] Fast-poll (memory sync + yield, NO 1 ms sleep) for a short budget before
++        // falling back to sleeping. The original slept ~1 ms on every unmatched poll, so a fence
++        // that takes many polls to resolve makes the CP crawl and fall far behind the guest's frame
++        // pacing -> the guest's post-frame fence wait never sees the CP catch up (the boot intro
++        // freeze after the first presented frame). MaybeYield lets the guest thread run to write the
++        // fence and lets the CP be rescheduled immediately, so fast fences resolve in microseconds
++        // and the CP keeps step. Same waits, just not throttled -> rendering stays correct.
++        if (spin_count < 8000u) {
++          rex::thread::SyncMemory();
+           rex::thread::MaybeYield();
+         } else {
+-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+-        }
+-        rex::thread::SyncMemory();
+-        ReturnFromWait();
++          PrepareForWait();
++          if (!REXCVAR_GET(vsync)) {
++            // User wants it fast and dangerous.
++            rex::thread::MaybeYield();
++          } else {
++            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
++          }
++          rex::thread::SyncMemory();
++          ReturnFromWait();
+ 
+-        if (!worker_running_) {
+-          // Short-circuited exit.
+-          return false;
++          if (!worker_running_) {
++            // Short-circuited exit.
++            return false;
++          }
+         }
+       } else {
+         rex::thread::MaybeYield();
+@@ -1347,7 +1405,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
    // Writeback initiator.
    WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
    uint32_t data_value;
@@ -358,7 +397,7 @@ index 60efcd3..5fdff25 100644
      // Write counter (GPU vblank counter?).
      data_value = counter_;
    } else {
-@@ -1356,6 +1401,15 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+@@ -1356,6 +1415,15 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
    }
    auto endianness = static_cast<xenos::Endian>(address & 0x3);
    address &= ~0x3;
