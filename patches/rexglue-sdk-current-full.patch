@@ -530,6 +530,34 @@ index b8eae3c..dd58d35 100644
    UpdateMouseCapture();
  
    if (!is_active() || !has_focus_) {
+diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
+index a016440..de9b1fd 100644
+--- a/src/kernel/xam/xam_user.cpp
++++ b/src/kernel/xam/xam_user.cpp
+@@ -260,6 +260,8 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+   for (uint32_t n = 0; n < setting_count; ++n) {
+     uint32_t setting_id = setting_ids[n];
+     auto setting = user_profile->GetSetting(setting_id);
++    REXKRNL_WARN("[PROF-RD] id={:08X} found={} is_set={}", setting_id,
++                 setting != nullptr, setting && setting->is_set);
+ 
+     std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
+     out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
+@@ -329,10 +331,10 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
+       continue;
+     }
+ 
+-    REXKRNL_DEBUG(
+-        "XamUserWriteProfileSettings: setting index [{}]:"
+-        " from={} setting_id={:08X} data.type={}",
+-        n, (uint32_t)setting.from, (uint32_t)setting.setting_id, setting.data.type);
++    REXKRNL_WARN(
++        "[PROF-WR] index [{}]: from={} setting_id={:08X} data.type={} bin.size={}",
++        n, (uint32_t)setting.from, (uint32_t)setting.setting_id, setting.data.type,
++        (uint32_t)setting.data.binary.size);
+ 
+     switch (setting_type) {
+       case UserProfile::Setting::Type::CONTENT:
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_debug.cpp b/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
 index 670c446..8c283b8 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
@@ -702,6 +730,30 @@ index 6255e3c..32e1865 100644
    this->xex_module()->GetOptHeader(XEX_HEADER_DEFAULT_STACK_SIZE, &stack_size_);
    is_dll_module_ = !!(header->module_flags & XEX_MODULE_DLL_MODULE);
  
+diff --git a/src/system/xam/user_profile.cpp b/src/system/xam/user_profile.cpp
+index a77f5e6..df5615f 100644
+--- a/src/system/xam/user_profile.cpp
++++ b/src/system/xam/user_profile.cpp
+@@ -147,6 +147,10 @@ void UserProfile::LoadSetting(UserProfile::Setting* setting) {
+       fclose(file);
+       setting->Deserialize(serialized_data);
+       setting->loaded_title_id = kernel_state_->title_id();
++      REXSYS_WARN("[PROF-LOAD] id={:08X} LOADED {} bytes from disk", setting->setting_id,
++                  input_file_size);
++    } else {
++      REXSYS_WARN("[PROF-LOAD] id={:08X} no file on disk (fresh)", setting->setting_id);
+     }
+   } else {
+     // Unsupported for now.  Other settings aren't per-game and need to be
+@@ -165,6 +169,8 @@ void UserProfile::SaveSetting(UserProfile::Setting* setting) {
+     auto file = rex::filesystem::OpenFile(file_path, "wb");
+     fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
+     fclose(file);
++    REXSYS_WARN("[PROF-SAVE] id={:08X} WROTE {} bytes to disk", setting->setting_id,
++                (uint32_t)serialized_setting.size());
+   } else {
+     // Unsupported for now.  Other settings aren't per-game and need to be
+     // stored some other way.
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
 index db31ff4..65920f1 100644
 --- a/src/system/xthread.cpp
