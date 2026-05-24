@@ -250,7 +250,29 @@ for path in files:
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join(lines) + "\n")
 
+# --- Fix 6: enroll the local signed-in player as a session player (lobby->match crash class) ---
+# sub_82297F30 turns an "open" slot into a session player (state 3 + runs the bctrl that inits
+# the session object at slot+2488) via loc_82298008, but routes the LOCAL signed-in player's
+# else-path to state 1 (li r11,1; goto loc_8229802C) WITHOUT that +2488 init. Then every session-
+# player query sub_82297C48(i) (valid only for state 3/4) returns null for the active local
+# player, and many callers (sub_82101AF0 [+26], sub_8216A8E8 [+28], the whole sub_8216Axxx
+# family) deref it unconditionally -> the lobby->match crash class. Fix: drop the state-1
+# shortcut so the local player FALLS THROUGH into loc_82298008 (session-enroll: +2488 init +
+# state 3). Verified live: slot-0 state becomes 3, the crash class clears, the boot reaches an
+# in-game tower-defense match. See knowledge-base/titles/south-park-lgtdp/50-menu-input-and-lobby.md.
+SE_MARK = "[recomp-fix:session-enroll]"
+SE_OLD = "\t// li r11,1\n\tctx.r11.s64 = 1;\n\t// b 0x8229802c\n\tgoto loc_8229802C;\nloc_82298008:"
+SE_NEW = "\t// " + SE_MARK + " local signed-in player -> session-enroll path (state 3 + slot+2488 init)\nloc_82298008:"
+se_patched = 0
+for path in files:
+    txt = open(path, "r", encoding="utf-8", errors="replace").read()
+    if SE_OLD in txt and SE_MARK not in txt:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(txt.replace(SE_OLD, SE_NEW, 1))
+        se_patched += 1
+
 print(f"defined functions      : {len(func_addrs)}")
+print(f"session-enroll fix (sub_82297F30): {se_patched} applied")
 print(f"unresolved-branch -> tail call : {ub_fixed}")
 print(f"EH hook-null fix (sub_8242EEA0): {eh_patched} applied")
 print(f"missing-stub 0x822E38E0: emitted={stub_emitted} registered={stub_registered}")
