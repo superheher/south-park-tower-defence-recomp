@@ -170,7 +170,14 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
    render; menu text is a static atlas so it was unaffected). Fixed by making the swap atomic under
    the global lock. Before: in-match "GINGER ▦▦"; after: "GINGER KIDS" clean. See
    `65-font-glyph-corruption.md` (SOLUTION).
-3. **Audio fidelity** — the XMA thread runs; needs ear verification + any conversion fixes.
+3. **Audio fidelity — path verified functional + objectively correct (2026-05-24); fidelity-by-ear
+   pending a human listener.** Verified: "Audio system initialized", the "XMA Decoder" thread runs,
+   no audio errors; the SDL output is objectively correct — 48000 Hz, 6ch (5.1) with stereo
+   fallback, F32LE, `sequential_6_BE_to_interleaved_{2,6}_LE` conversion (correct endian + channel
+   handling; `sdl_audio_driver.cpp`). The sample rate/channels match Xbox 360 XAudio2. **No objective
+   conversion bug found to fix.** The only open aspect is subjective fidelity (does the XMA-decoded
+   audio sound right), which requires listening — boot the full version and listen in a match; report
+   any distortion/pitch/dropouts. (An AI agent cannot ear-verify.)
 4. **Boot speed** — ~4–5 min to title (the CP loops to resolve fences after the spin-yield fix); a
    follow-up could tighten the spin/sleep thresholds.
 
