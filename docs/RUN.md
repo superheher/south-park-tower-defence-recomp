@@ -143,6 +143,15 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
   `knowledge-base/.../66-always-win-invincibility.md`. (Does not cover non-base losses such as
   a time-up mode, if any.)
 - `--window_width/--window_height` set the startup window size (0 = app default ~1296×759).
+- **`--window_icon=<path.ico>`** sets the window/taskbar icon (the launcher ships `SouthPark.ico`,
+  converted from the game's 64×64 `SouthPark.png`). Empty = no icon.
+- **`--skip_arcade_logo=1`** hides the Xbox Live Arcade boot logo (`ArcadeLogo.ptc`), whose frames
+  are **JPEG-compressed** in the source so the full-screen splash shows block/ringing artifacts
+  (the rest of the UI is lossless PNG/TGA and looks crisp). With it set, the runtime reports the
+  asset not-found → the boot skips straight to the crisp Microsoft Game Studios splash. Default off.
+- **`--mnk_mouse_look=1`** re-enables mouse capture for camera/right-stick (hides + locks the cursor
+  to the window). **Default OFF** — the cursor stays free + visible so you can move/resize the
+  window; mouse buttons still map to triggers either way.
 - `--log_level=debug` (or `trace`) for verbose kernel/APU logging.
 - **`--audio_dump=<file>` (diagnostic)** — appends the exact interleaved **F32LE** PCM handed to
   SDL to `<file>` (the real audio output, downmixed to the device's channel count). Convert with
