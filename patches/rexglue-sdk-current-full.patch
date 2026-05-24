@@ -443,10 +443,31 @@ index 56f5a97..e39c435 100644
    return entry;
  }
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 60efcd3..9e48177 100644
+index 60efcd3..34331cb 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
-@@ -406,6 +406,17 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
+@@ -37,9 +37,18 @@
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
+-REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
++REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+-                    "Disable for minor CPU overhead reduction, but may break memory coherency.")
++                    "[recomp: defaulted OFF — KB 65 / rexglue-sdk #341] When ON, this skip-upload "
++                    "optimization intermittently keeps per-frame CPU-rasterized dynamic glyph pages "
++                    "marked already-valid and skips their re-upload -> the GPU samples stale bytes "
++                    "-> vertical-striped text that varies every visit (in-match hints, menu "
++                    "difficulty labels, results SCORE/BONUS/TOTAL). The #341 full-copy fix and the "
++                    "shared_memory.cpp read lock make the ON path as correct as possible, but the "
++                    "skip itself is still stale for this title's per-frame same-address glyph "
++                    "rasterization, so OFF (force re-upload) is the reliable cure (verified clean by "
++                    "running; the GPU-written coherency risk did not manifest — a full match + "
++                    "results render correctly).")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
+@@ -406,6 +415,17 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
    write_ptr_index_event_->Set();
  }
  
@@ -464,7 +485,7 @@ index 60efcd3..9e48177 100644
  uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
    if (index < RegisterFile::kRegisterCount) {
      return register_file_->values[index];
-@@ -721,6 +732,17 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -721,6 +741,17 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
        assert_always();
        break;
      }
@@ -482,7 +503,7 @@ index 60efcd3..9e48177 100644
    } while (reader.read_count());
  
    OnPrimaryBufferEnd();
-@@ -1128,6 +1150,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1128,6 +1159,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
    bool is_memory = (wait_info & 0x10) != 0;
  
    bool matched = false;
@@ -490,7 +511,7 @@ index 60efcd3..9e48177 100644
    do {
      uint32_t value = 0;
      if (is_memory) {
-@@ -1169,21 +1192,56 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1169,21 +1201,56 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
          break;
      }
      if (!matched) {
@@ -557,7 +578,7 @@ index 60efcd3..9e48177 100644
          }
        } else {
          rex::thread::MaybeYield();
-@@ -1347,7 +1405,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+@@ -1347,7 +1414,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
    // Writeback initiator.
    WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
    uint32_t data_value;
@@ -567,7 +588,7 @@ index 60efcd3..9e48177 100644
      // Write counter (GPU vblank counter?).
      data_value = counter_;
    } else {
-@@ -1356,6 +1415,15 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+@@ -1356,6 +1424,15 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
    }
    auto endianness = static_cast<xenos::Endian>(address & 0x3);
    address &= ~0x3;
@@ -599,7 +620,7 @@ index 3877b1a..b147398 100644
  
    // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
-index 333becb..f0d958a 100644
+index 333becb..1d288f9 100644
 --- a/src/graphics/shared_memory.cpp
 +++ b/src/graphics/shared_memory.cpp
 @@ -128,6 +128,18 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
@@ -621,6 +642,133 @@ index 333becb..f0d958a 100644
    uint64_t* staging = staging_valid_flags_.load(std::memory_order_acquire);
    if (!staging || !num_system_page_flags_) {
      gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
+@@ -135,26 +147,19 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
+     return;
+   }
+ 
+-  uint32_t dirty_mask = dirty_blocks_.exchange(0, std::memory_order_relaxed);
+-  uint32_t dirty_count = rex::bit_count(dirty_mask);
+-  if (dirty_count == 0 || dirty_count > 16) {
+-    std::memcpy(staging, system_page_flags_valid_and_gpu_written_.data(),
+-                num_system_page_flags_ * sizeof(uint64_t));
+-  } else {
+-    while (dirty_mask) {
+-      uint32_t block_index;
+-      rex::bit_scan_forward(dirty_mask, &block_index);
+-      dirty_mask &= ~(uint32_t(1) << block_index);
+-      uint32_t entry_offset = block_index * 64;
+-      if (entry_offset >= num_system_page_flags_) {
+-        continue;
+-      }
+-      uint32_t entry_count = std::min(uint32_t(64), num_system_page_flags_ - entry_offset);
+-      std::memcpy(staging + entry_offset,
+-                  system_page_flags_valid_and_gpu_written_.data() + entry_offset,
+-                  entry_count * sizeof(uint64_t));
+-    }
+-  }
++  // [recomp fix: font-glyph corruption — rexglue-sdk issue #341] The incremental per-dirty-
++  // block copy here was flawed: `staging` is the buffer retired two swaps ago, so its NON-dirty
++  // blocks still hold stale valid bits; copying only the dirty blocks left those stale "valid"
++  // flags in the new active buffer -> pages that should be invalid read as valid -> RequestRanges
++  // skips their re-upload -> the GPU samples stale bytes. On South Park LGTDP that struck the
++  // per-frame CPU-rasterized dynamic glyph textures -> intermittent vertical-striped text
++  // (in-match hints, menu difficulty labels, results TOTAL), varying by timing/hardware; the
++  // upstream report saw missing character geometry on Ninja Gaiden 2. Fix: always rebuild
++  // `staging` as a FULL snapshot of the master flags (the upstream issue forces
++  // dirty_mask = UINT32_MAX; we memcpy the whole buffer directly). Still drain dirty_blocks_.
++  dirty_blocks_.exchange(0, std::memory_order_relaxed);
++  std::memcpy(staging, system_page_flags_valid_and_gpu_written_.data(),
++              num_system_page_flags_ * sizeof(uint64_t));
+ 
+   uint64_t* old_active = active_valid_flags_.exchange(staging, std::memory_order_acq_rel);
+   staging_valid_flags_.store(old_active, std::memory_order_release);
+@@ -454,43 +459,56 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     }
+   }
+ 
+-  uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_acquire);
+-  if (valid_flags) {
+-    bool all_valid = true;
+-    for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+-      if (!range.second) {
+-        continue;
+-      }
+-      uint32_t page_first = range.first >> page_size_log2_;
+-      uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+-      uint32_t block_first = page_first >> 6;
+-      uint32_t block_last = page_last >> 6;
+-      for (uint32_t i = block_first; i <= block_last; ++i) {
+-        uint64_t block_valid = valid_flags[i];
+-        if (i == block_first) {
+-          uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
+-          block_valid |= block_before;
++  // [recomp fix: font-glyph corruption pt2 — KB 65] This fast-path "all pages already valid
++  // -> skip upload" check reads active_valid_flags_ CONTENTS, which MemoryInvalidationCallback
++  // and the frame-end swap mutate under global_critical_region_. Reading it lock-free raced
++  // them: a page just invalidated by a guest CPU write could still read VALID here -> the
++  // upload was wrongly skipped -> the GPU sampled stale bytes -> intermittent, timing/HW-
++  // dependent vertical-striped glyphs. KB 65's first fix only locked the swap; serialize this
++  // reader too, so EVERY access to the valid-flag buffer contents is under the one global lock
++  // (no data race). Scoped so the lock is released before UploadRanges() below. (Confirmed it
++  // is the skip path: clear_memory_page_state=false, which forces uploads, renders clean.)
++  uint64_t* valid_flags = nullptr;
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
++    if (valid_flags) {
++      bool all_valid = true;
++      for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
++        if (!range.second) {
++          continue;
+         }
+-        if (i == block_last && (page_last & 63) != 63) {
+-          uint64_t block_inside = (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+-          block_valid |= ~block_inside;
++        uint32_t page_first = range.first >> page_size_log2_;
++        uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
++        uint32_t block_first = page_first >> 6;
++        uint32_t block_last = page_last >> 6;
++        for (uint32_t i = block_first; i <= block_last; ++i) {
++          uint64_t block_valid = valid_flags[i];
++          if (i == block_first) {
++            uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
++            block_valid |= block_before;
++          }
++          if (i == block_last && (page_last & 63) != 63) {
++            uint64_t block_inside = (uint64_t(1) << ((page_last & 63) + 1)) - 1;
++            block_valid |= ~block_inside;
++          }
++          if (block_valid != UINT64_MAX) {
++            all_valid = false;
++            break;
++          }
+         }
+-        if (block_valid != UINT64_MAX) {
+-          all_valid = false;
++        if (!all_valid) {
+           break;
+         }
+       }
+-      if (!all_valid) {
+-        break;
++      if (all_valid) {
++        COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
++        COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
++                          uint32_t(merged_ranges.size()));
++        COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count", 0);
++        return true;
+       }
+     }
+-    if (all_valid) {
+-      COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
+-      COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
+-                        uint32_t(merged_ranges.size()));
+-      COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count", 0);
+-      return true;
+-    }
+   }
+ 
+   upload_ranges_.clear();
 diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
 index b8eae3c..dd58d35 100644
 --- a/src/input/mnk/mnk_input_driver.cpp
