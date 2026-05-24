@@ -1,9 +1,10 @@
 # RUN.md — building, running, and continuing bring-up
 
-> **Status (2026-05-24):** the recomp reaches an **in-game TOWER-DEFENSE MATCH** —
+> **Status (2026-05-24):** the recomp **PLAYS A MATCH TO A WIN — single-player is playable** —
 > `boot → intro → title → MAIN MENU → LOCAL GAME → lobby → game-mode (Campaign) → level select
-> (Stan's House) → the MATCH renders` (snowy map, enemy path, character units; screenshot-
-> verified, **input works**, no crash through the chain). Two root fixes got here: the
+> (Stan's House) → the MATCH (waves spawn, units defend) → "STAGE COMPLETE!" (win) → CONTINUE`
+> (screenshot-verified, **input works**, **no crash anywhere**, rendering correct, XMA audio
+> thread running). Two root fixes got here: the
 > **image-load setjmp/longjmp EH** (below) and the **session-enroll fix** (the local signed-in
 > player must be enrolled as a "session player" — `fix_recomp_labels` Fix 6 — or session-player
 > queries null-deref at lobby→match). **Remaining for full single-player playability:** play
