@@ -1,13 +1,19 @@
 # RUN.md — building, running, and continuing bring-up
 
-> **Status (2026-05-24):** the recomp is **INTERACTIVE** — boot → intro → title screen →
-> **MAIN MENU** → LOCAL GAME → **LOBBY** (verified by screenshots). The four boys, the menu
-> (LOCAL GAME / SCRAPBOOK / …), and the local-game lobby ("1/4 SIGNED IN") all render, and
-> **input works** — pressing Start advances title→menu, A selects LOCAL GAME→lobby. Path:
-> runtime init → `default.xex` → TGA image assets → animated intro (Cartman over the town) →
-> intro movie → title → menu → lobby. The long-standing post-render hang is **FIXED** (custom
-> setjmp/longjmp image-EH, below). Full evidence:
-> `knowledge-base/titles/south-park-lgtdp/35-entry-forensics.md` + `40-seh-implementation-plan.md`.
+> **Status (2026-05-24):** the recomp reaches an **in-game TOWER-DEFENSE MATCH** —
+> `boot → intro → title → MAIN MENU → LOCAL GAME → lobby → game-mode (Campaign) → level select
+> (Stan's House) → the MATCH renders` (snowy map, enemy path, character units; screenshot-
+> verified, **input works**, no crash through the chain). Two root fixes got here: the
+> **image-load setjmp/longjmp EH** (below) and the **session-enroll fix** (the local signed-in
+> player must be enrolled as a "session player" — `fix_recomp_labels` Fix 6 — or session-player
+> queries null-deref at lobby→match). **Remaining for full single-player playability:** play
+> through to win/lose, save/continue, audio (XMA→SDL). Evidence:
+> `knowledge-base/titles/south-park-lgtdp/{40-seh,50-menu-input-and-lobby,90-progress-report}.md`.
+>
+> **To reach the match (automation):** `--mnk_mode=true` + the injector
+> `REX_INJECT_SCRIPT="66:0010,78:1000,92:0010,106:1000,120:1000,134:1000,150:1000"` (Start→menu,
+> A→LOCAL GAME, Start→lobby-begin, A→game-mode NEXT, A→level select, A→Stan's House → match).
+> A real user just presses the buttons on the focused window.
 >
 > **Driving input (important):** real users press a focused gamepad/keyboard normally — the
 > plumbing is wired (`XamInputGetState`/`GetKeystroke` ← `input_system` ← mnk/SDL). **Automated**
