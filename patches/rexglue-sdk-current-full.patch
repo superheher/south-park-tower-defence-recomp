@@ -249,10 +249,28 @@ index 9fc4763..42d55da 100644
    uint32_t code = tls_seh_state.code;
    ULONG_PTR info[2] = {tls_seh_state.info[0], tls_seh_state.info[1]};
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 60efcd3..59476f4 100644
+index 60efcd3..2fcb3a9 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
-@@ -1128,6 +1128,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -721,6 +721,17 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+       assert_always();
+       break;
+     }
++    // [recomp fix] Periodic ring read-pointer write-back (the upstream TODO above). Publish the
++    // CP's CURRENT ring position to the guest's read-back pointer DURING the batch, not only after
++    // ExecutePrimaryBuffer returns. Without this, a guest that polls the read-back pointer mid-batch
++    // (the post-frame GPU-fence wait sub_821BFF48->sub_821C6E58 on 0xFFC9B000) cannot see the CP's
++    // progress and deadlocks against the CP still executing this batch -> the boot intro freezes
++    // after the first presented frame. This keeps rendering correct (it only surfaces real progress).
++    if (read_ptr_writeback_ptr_) {
++      memory::store_and_swap<uint32_t>(
++          memory_->TranslatePhysical(read_ptr_writeback_ptr_),
++          static_cast<uint32_t>(reader.read_offset() / sizeof(uint32_t)));
++    }
+   } while (reader.read_count());
+ 
+   OnPrimaryBufferEnd();
+@@ -1128,6 +1139,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
    bool is_memory = (wait_info & 0x10) != 0;
  
    bool matched = false;
@@ -260,7 +278,7 @@ index 60efcd3..59476f4 100644
    do {
      uint32_t value = 0;
      if (is_memory) {
-@@ -1169,6 +1170,27 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1169,6 +1181,27 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
          break;
      }
      if (!matched) {
