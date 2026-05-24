@@ -11,9 +11,12 @@
 > **All input was driven WITHOUT window focus** via `REX_INPUT_FILE`/`live_input.txt` (below) —
 > the maintainer's idea. Three root fixes got here: the **image-load setjmp/longjmp EH** (below),
 > the **session-enroll fix** (`fix_recomp_labels` Fix 6), and the **boot spin-yield fix** (the CP
-> `WAIT_REG_MEM` 1 ms-sleep-per-poll throttle — see below; NOT a reboot). **Remaining (polish, not
-> blockers):** in-match font-glyph corruption (`65-font-glyph-corruption.md` — front-end text is
-> fine), audio fidelity, and the in-game audio/subtitle settings' load-back.
+> `WAIT_REG_MEM` 1 ms-sleep-per-poll throttle — see below; NOT a reboot). **Polish backlog worked
+> 2026-05-24 (see `knowledge-base/.../67-polish-backlog.md` + "Remaining work" below):** in-match
+> font corruption FIXED (`65`), cross-restart continue FIXED (`56`), Elementary `en-en` assets FIXED
+> (locale fallback), boot profiled (~50–60 s warm). **Open:** audio fidelity (path correct + clips
+> produced — needs a human ear); intro/cutscene WMV black & silent (no decoder — documented,
+> skippable); online features out of scope.
 > **✅ CROSS-RESTART CONTINUE NOW WORKS (2026-05-24, verified by running).** Win Stan's House →
 > RESTART → the CAMPAIGN LEVEL SELECT shows **Elementary School unlocked** (screenshots
 > `C:\Temp\b6_levelselect2.png`, `b11_FINAL.png`; A/B control `b7_levelselect2.png`). Root cause:
@@ -87,17 +90,20 @@
 - Game assets in `private/extracted/` (extracted title tree incl. `default.xex`).
   **Never committed** (git-ignored). Extract with the fixed `tools/stfs_extract.py`.
 
-## One-time asset setup: movie locale subdir
-The game requests intro/level movies under `Media/Assets/Movies/en-en/` (a locale subdir
-the flat extraction omits). Create it with hardlinks (no data duplication):
-```powershell
-$mov='<repo>\south-park-recomp\private\extracted\media\Assets\Movies'
-New-Item -ItemType Directory -Force "$mov\en-en" | Out-Null
-Get-ChildItem $mov -Filter *.wmv -File | ForEach-Object {
-  $l="$mov\en-en\$($_.Name)"; if(-not(Test-Path $l)){ New-Item -ItemType HardLink -Path $l -Target $_.FullName | Out-Null } }
-```
-(The movies are WMV3+WMA2, which the runtime can't decode, but the file must *open* or the
-intro path stalls. The intro is not the hang — see below.)
+## Asset setup: locale subdir — now automatic (no manual step needed)
+The game requests localized assets under a locale subdir `…/en-en/` (intro/level **movies**
+under `Media/Assets/Movies/en-en/`, and campaign **slides/diagrams** under
+`Media/Assets/Frontend/Graphics/en-en/`) that the flat extraction omits — the files live in
+the parent dir. **The runtime now handles this automatically:** `NtCreateFile` retries a failed
+open with the locale segment stripped (a locale-subdir fallback; see
+`knowledge-base/.../67-polish-backlog.md` §1). So the old manual "hardlink the WMVs into
+`Movies/en-en/`" step is **no longer required** (harmless if already done). Verified: the
+campaign level-select slides/diagrams load and render; 0 remaining `en-en` `0xc000000f` failures.
+
+(The movies are **WMV3 video + WMA2 audio (ASF)**, which the runtime can't decode, so cutscenes
+play **black & silent** — they open and are **user-skippable** ("Ⓐ SKIP"), and the boot does not
+block on them. This is a documented limitation, `67` §4. `LuaScripts/School.lua` is genuinely
+absent from the dump — a benign optional per-level script; Elementary School plays without it.)
 
 ## Build
 ```powershell
@@ -138,6 +144,13 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
   a time-up mode, if any.)
 - `--window_width/--window_height` set the startup window size (0 = app default ~1296×759).
 - `--log_level=debug` (or `trace`) for verbose kernel/APU logging.
+- **`--audio_dump=<file>` (diagnostic)** — appends the exact interleaved **F32LE** PCM handed to
+  SDL to `<file>` (the real audio output, downmixed to the device's channel count). Convert with
+  `ffmpeg -f f32le -ar 48000 -ac <channels> -i <file> out.flac` (channel count is logged once as
+  `audio_dump: capturing N-channel ...`). For offline audio-fidelity auditioning. NOTE: on a
+  headless/remote box whose audio endpoint doesn't pace playback, SDL may drain faster than
+  real-time and pad the dump with silence — strip the exact-zero frames to recover a real-time
+  clip (`knowledge-base/.../67-polish-backlog.md` §2).
 - `--mnk_mode=true` makes the keyboard a virtual controller (Escape=Start, Space=A,
   default OFF) — needed once the boot reaches an interactive screen.
 - Needs an **interactive desktop** (D3D12 window). Logs: `out\build\...\logs\south_park_td_NNN.log`.
@@ -179,16 +192,29 @@ out\build\win-amd64-relwithdebinfo\south_park_td.exe `
    render; menu text is a static atlas so it was unaffected). Fixed by making the swap atomic under
    the global lock. Before: in-match "GINGER ▦▦"; after: "GINGER KIDS" clean. See
    `65-font-glyph-corruption.md` (SOLUTION).
-3. **Audio fidelity — path verified functional + objectively correct (2026-05-24); fidelity-by-ear
-   pending a human listener.** Verified: "Audio system initialized", the "XMA Decoder" thread runs,
-   no audio errors; the SDL output is objectively correct — 48000 Hz, 6ch (5.1) with stereo
-   fallback, F32LE, `sequential_6_BE_to_interleaved_{2,6}_LE` conversion (correct endian + channel
-   handling; `sdl_audio_driver.cpp`). The sample rate/channels match Xbox 360 XAudio2. **No objective
-   conversion bug found to fix.** The only open aspect is subjective fidelity (does the XMA-decoded
-   audio sound right), which requires listening — boot the full version and listen in a match; report
-   any distortion/pitch/dropouts. (An AI agent cannot ear-verify.)
-4. **Boot speed** — ~4–5 min to title (the CP loops to resolve fences after the spin-yield fix); a
-   follow-up could tighten the spin/sleep thresholds.
+3. **✅ Elementary `en-en` asset gap — SOLVED 2026-05-24 (verified by running).** The campaign
+   slides/diagrams under `Frontend/Graphics/en-en/` failed `NtCreateFile` `0xc000000f`; the runtime
+   now retries with the locale segment stripped (locale-subdir fallback in `NtCreateFile`). 8
+   `locale-fallback: served` hits, 0 remaining failures, the school diagram renders. See
+   `67-polish-backlog.md` §1. (`School.lua` is genuinely absent — a benign optional script.)
+4. **Audio fidelity — path objectively correct + clips produced; ear sign-off pending (needs a
+   human).** The XMA→SDL output is objectively correct — 48000 Hz, 6ch (5.1) with stereo fallback,
+   F32LE; on a stereo device the **5.1→stereo downmix is a correct fold** (center −6 dB to L/R,
+   surrounds summed, LFE dropped, normalized; `conversion.h`). A captured menu→match clip is
+   **real-time with no clipping (peak 0.43)**. Lossless clips were produced for auditioning via the
+   new `--audio_dump` cvar (above). **Subjective fidelity requires listening on a real audio device**
+   — an agent can't ear-verify. (A 3× SDL drain in the headless capture is an environment artifact,
+   not a port bug — `67` §2.)
+5. **Boot speed — profiled 2026-05-24: ~50–60 s to title on a warm cache** (publisher splash ~15 s →
+   in-engine animated intro ~45 s → title ~50–60 s; runtime/CRT init <1 s; shaders load from cache).
+   The CP fence loop is **healthy** (0 `WAIT_REG_MEM` stuck). The old "~4–5 min" was a one-time
+   **cold shader cache** first boot (live translation of the whole set), cached thereafter. The
+   residual is **game-paced, user-skippable** intro animation — no cheap runtime win remains. (`67` §3.)
+6. **Intro / cutscene WMV movies — black & silent (documented limitation, won't-fix for v1).** WMV3
+   video + WMA2 audio (ASF); the runtime has no WMV3/VC-1 or WMA2 decoder (XMA only). The files open
+   (locale fallback covers `Movies/en-en/`) and are **user-skippable**; the boot doesn't block on
+   them. Adding a decoder is out of scope for v1. (`67` §4.)
+7. **Online co-op / leaderboards / achievements / avatars — out of scope for v1** (stubbed offline).
 
 ## What fixed the old SEH/image-load hang (history)
 The post-render hang was NOT standard `.xdata` SEH (the earlier guess). It was a **custom
