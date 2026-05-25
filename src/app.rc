@@ -1,0 +1,4 @@
+// Windows resource: embed the application icon so south_park_td.exe shows the
+// South Park icon in Explorer / the taskbar before launch. The lowest-numbered
+// icon resource becomes the executable's default icon.
+1 ICON "SouthPark.ico"

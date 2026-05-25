@@ -19,9 +19,20 @@ set(SOUTHPARKTD_SOURCES
 )
 
 if(WIN32)
+    enable_language(RC)
+    list(APPEND SOUTHPARKTD_SOURCES src/app.rc)  # embeds the .exe icon
     add_executable(south_park_td WIN32 ${SOUTHPARKTD_SOURCES})
 else()
     add_executable(south_park_td ${SOUTHPARKTD_SOURCES})
 endif()
 
 rexglue_setup_target(south_park_td)
+
+# Keep SouthPark.ico next to the exe so the runtime window_icon default finds it.
+if(WIN32)
+    add_custom_command(TARGET south_park_td POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/SouthPark.ico"
+            "$<TARGET_FILE_DIR:south_park_td>/SouthPark.ico"
+        VERBATIM)
+endif()
