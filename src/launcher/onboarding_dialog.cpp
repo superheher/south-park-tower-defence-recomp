@@ -410,4 +410,41 @@ void OnboardingDialog::OnDraw(ImGuiIO& io) {
   ImGui::End();
 }
 
+// --- LoadingDialog ---------------------------------------------------------
+
+LoadingDialog::LoadingDialog(rex::ui::ImGuiDrawer* drawer) : rex::ui::ImGuiDialog(drawer) {}
+
+void LoadingDialog::OnDraw(ImGuiIO& io) {
+  const double now = ImGui::GetTime();
+  if (start_time_ < 0) start_time_ = now;
+  const double elapsed = now - start_time_;
+
+  const bool dismiss = elapsed > 90.0 || ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+                       ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
+                       ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+                       ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                       ImGui::IsKeyPressed(ImGuiKey_Space, false);
+
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 10.0f), ImGuiCond_Always,
+                          ImVec2(0.5f, 0.0f));
+  ImGui::SetNextWindowBgAlpha(0.85f);
+  const ImGuiWindowFlags flags =
+      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_AlwaysAutoResize |
+      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+      ImGuiWindowFlags_NoNav;
+  if (ImGui::Begin("##sp_loading", nullptr, flags)) {
+    const char spinner[] = {'|', '/', '-', '\\'};
+    const char c = spinner[static_cast<int>(now * 8) % 4];
+    ImGui::Text("%c  Starting South Park - first launch is preparing graphics (compiling shaders).",
+                c);
+    ImGui::TextDisabled(
+        "   The window may stay black for up to a minute. This happens only once.  "
+        "(click / Esc to dismiss)");
+  }
+  ImGui::End();
+
+  if (dismiss) Close();
+}
+
 }  // namespace splaunch

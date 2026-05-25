@@ -87,6 +87,18 @@ class SouthParkTdApp : public rex::ReXApp {
     return std::nullopt;  // async: wizard drives the resume
   }
 
+  // On the first launch the cold shader-cache build can leave the window black for
+  // a while. Show a small non-blocking overlay so it does not look hung. Only when
+  // the shader cache is empty (i.e. genuinely the first run).
+  void OnPostSetup() override {
+    if (!imgui_drawer()) return;
+    std::error_code ec;
+    const auto& cache = cache_root();
+    const bool first_launch =
+        cache.empty() || !std::filesystem::exists(cache, ec) || std::filesystem::is_empty(cache, ec);
+    if (first_launch) new splaunch::LoadingDialog(imgui_drawer());
+  }
+
   // Drag-and-drop: dropping a dump file/folder onto the window during onboarding
   // fills the wizard's path (which then auto-validates). The engine already
   // accepts drops (Win32 WM_DROPFILES -> OnFileDrop); we just consume it here.

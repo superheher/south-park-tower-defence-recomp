@@ -70,4 +70,19 @@ class OnboardingDialog : public rex::ui::ImGuiDialog {
   bool first_draw_ = true;
 };
 
+// A small, non-blocking "first launch: compiling shaders" overlay (top bar). The
+// cold shader-cache build can leave the window black for a while; this reassures
+// the user it is not hung. Self-dismisses after a timeout or on any click/key.
+// Shown only on the first launch (empty shader cache).
+class LoadingDialog : public rex::ui::ImGuiDialog {
+ public:
+  explicit LoadingDialog(rex::ui::ImGuiDrawer* drawer);
+
+ protected:
+  void OnDraw(ImGuiIO& io) override;
+
+ private:
+  double start_time_ = -1.0;
+};
+
 }  // namespace splaunch
