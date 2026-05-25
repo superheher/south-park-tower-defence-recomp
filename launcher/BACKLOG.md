@@ -30,12 +30,12 @@ See `INTEGRATION.md` and the `launcher-onboarding` memory for details.
 ---
 
 ## Settings / UX
-- [ ] **In-game settings (no restart)** — 🔧 open the curated settings UI from a hotkey while
-      playing, instead of re-running with `--setup`.
-      *How:* in `OnCreateDialogs`, `rex::ui::RegisterBind("bind_launcher_settings","F5",...)` to
-      toggle an `ImGuiDialog` that reuses the wizard's settings rendering (factor the settings
-      block out of `OnboardingDialog::OnDraw` into a shared helper). Hot cvars apply live; window/
-      fullscreen/resolution are restart-scoped → persist to config, note "applies next launch".
+- [x] **In-game settings (no restart)** — DONE. **F5** toggles a `SettingsDialog` overlay over the
+      running game (`OnCreateDialogs` registers the bind). It reuses `DrawSettingsControls()` (the
+      settings block factored out of the wizard) and persists to config on close. The input
+      active-callback is re-pointed (OnPostSetup) to `!WantCaptureMouse` so overlay clicks don't
+      leak to the guest. Verified by running: F5 opens the panel over the title/intro, F5 closes +
+      saves.
 - [ ] **"Reset to defaults" button** — ⚡ clear the `[settings]` in `launcher.toml` and re-apply
       `LauncherDefaults()`. Add to the settings panel.
 - [ ] **UI / font scaling for high-DPI (4K)** — 🔧 the ImGui UI is small on 4K.

@@ -10,11 +10,15 @@
 #include <optional>
 #include <string>
 
+#include <imgui.h>
+
 #include <rex/cvar.h>
+#include <rex/input/input_system.h>
 #include <rex/logging.h>
 #include <rex/rex_app.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_manager.h>
+#include <rex/ui/keybinds.h>
 #include <rex/ui/ui_event.h>
 
 #include "launcher/launcher.h"
@@ -92,6 +96,14 @@ class SouthParkTdApp : public rex::ReXApp {
   // the shader cache is empty (i.e. genuinely the first run).
   void OnPostSetup() override {
     if (!imgui_drawer()) return;
+    // Suppress guest mouse input whenever ANY ImGui overlay (incl. our F5 settings)
+    // captures the mouse, so clicking toggles does not leak into the game.
+    if (runtime() && runtime()->input_system()) {
+      static_cast<rex::input::InputSystem*>(runtime()->input_system())->SetActiveCallback([this]() {
+        auto* d = imgui_drawer();
+        return !d || !d->GetIO().WantCaptureMouse;
+      });
+    }
     std::error_code ec;
     const auto& cache = cache_root();
     const bool first_launch =
@@ -130,9 +142,25 @@ class SouthParkTdApp : public rex::ReXApp {
     }
   }
 
-  // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}  // M5 settings
+  // In-game settings: F5 toggles a settings overlay (no restart, no .bat). Same
+  // panel as the wizard; changes apply live where possible and persist on close.
+  void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    rex::ui::RegisterBind("bind_launcher_settings", "F5", "Toggle in-game settings",
+                          [this, drawer] {
+                            if (launcher_settings_) {
+                              launcher_settings_->RequestClose();
+                            } else {
+                              launcher_settings_ = new splaunch::SettingsDialog(
+                                  drawer, user_data_root(), game_data_root().string(),
+                                  [this]() { launcher_settings_ = nullptr; });
+                            }
+                          });
+  }
+
+  void OnShutdown() override { rex::ui::UnregisterBind("bind_launcher_settings"); }
 
  private:
   splaunch::BootstrapResult bootstrap_;          // result of the early bootstrap
   splaunch::OnboardingDialog* onboarding_ = nullptr;  // open wizard (for file-drop), else null
+  splaunch::SettingsDialog* launcher_settings_ = nullptr;  // open in-game settings, else null
 };

@@ -232,6 +232,83 @@ void OnboardingDialog::DrawBrowser(ImGuiIO& io) {
   if (ImGui::Button("Close browser")) browser_open_ = false;
 }
 
+void DrawSettingsControls(const std::filesystem::path& user_data_root, const std::string& game_dir) {
+  auto BoolCvar = [](const char* label, const char* name) {
+    bool b = rex::cvar::Query<bool>(name);
+    if (ImGui::Checkbox(label, &b)) ApplyCvar(name, b ? "true" : "false");
+  };
+  {
+    bool full = rex::cvar::Query<uint32_t>("license_mask") != 0;
+    if (ImGui::Checkbox("Full version (unlock everything; saves progress)", &full))
+      ApplyCvar("license_mask", full ? "1" : "0");
+  }
+  BoolCvar("Fullscreen", "fullscreen");
+  BoolCvar("Use keyboard & mouse as a controller", "mnk_mode");
+  BoolCvar("Mute audio", "audio_mute");
+  BoolCvar("Invincibility (your base can't be destroyed)", "always_win");
+  BoolCvar("Auto-fire snowballs (hold the throw button)", "autofire");
+  BoolCvar("Auto-install DLC found next to the game", "auto_dlc");
+
+  ImGui::Separator();
+  ImGui::TextUnformatted("Graphics");
+  {
+    int rs = rex::cvar::Query<int32_t>("resolution_scale");
+    rs = rs < 1 ? 1 : (rs > 3 ? 3 : rs);
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::SliderInt("Internal resolution", &rs, 1, 3, "%dx (sharper)"))
+      ApplyCvar("resolution_scale", std::to_string(rs));
+  }
+  {
+    static const char* kEffects[] = {"bilinear", "cas", "fsr"};
+    std::string cur = rex::cvar::Query<std::string>("present_effect");
+    int idx = 0;
+    for (int i = 0; i < 3; ++i)
+      if (cur == kEffects[i]) idx = i;
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::Combo("Output filter", &idx, kEffects, 3)) ApplyCvar("present_effect", kEffects[idx]);
+    if (idx != 0) {
+      float sh = static_cast<float>(rex::cvar::Query<double>("present_cas_additional_sharpness"));
+      ImGui::SetNextItemWidth(220);
+      if (ImGui::SliderFloat("Sharpness", &sh, 0.0f, 1.0f, "%.2f"))
+        ApplyCvar("present_cas_additional_sharpness", std::to_string(sh));
+    }
+  }
+
+  if (ImGui::TreeNode("Advanced")) {
+    BoolCvar("Skip arcade logo", "skip_arcade_logo");
+    BoolCvar("VSync", "vsync");
+    BoolCvar("Letterbox (keep aspect ratio)", "present_letterbox");
+    BoolCvar("Crop overscan", "present_allow_overscan_cutoff");
+    int w = rex::cvar::Query<int32_t>("window_width");
+    ImGui::SetNextItemWidth(160);
+    if (ImGui::InputInt("Window width", &w)) ApplyCvar("window_width", std::to_string(w));
+    int h = rex::cvar::Query<int32_t>("window_height");
+    ImGui::SetNextItemWidth(160);
+    if (ImGui::InputInt("Window height", &h)) ApplyCvar("window_height", std::to_string(h));
+    ImGui::TextDisabled("Window size / fullscreen take effect on the next launch.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Folders & saves");
+    if (ImGui::Button("Open data folder") && !user_data_root.empty())
+      OpenInFileManager(user_data_root);
+    ImGui::SameLine();
+    if (ImGui::Button("Open logs folder"))
+      OpenInFileManager(rex::filesystem::GetExecutableFolder() / "logs");
+    ImGui::SameLine();
+    if (ImGui::Button("Open game folder") && !game_dir.empty()) {
+      std::filesystem::path gp(game_dir);
+      OpenInFileManager(std::filesystem::is_directory(gp) ? gp : gp.parent_path());
+    }
+    static std::string s_backup_msg;
+    if (ImGui::Button("Backup saves now")) {
+      std::string dest = BackupSaves(user_data_root);
+      s_backup_msg = dest.empty() ? "Nothing to back up yet." : ("Backed up to: " + dest);
+    }
+    if (!s_backup_msg.empty()) ImGui::TextDisabled("%s", s_backup_msg.c_str());
+    ImGui::TreePop();
+  }
+}
+
 void OnboardingDialog::OnDraw(ImGuiIO& io) {
   if (first_draw_) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
@@ -308,80 +385,8 @@ void OnboardingDialog::OnDraw(ImGuiIO& io) {
 
     ImGui::Spacing();
     if (ImGui::CollapsingHeader("Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
-      auto BoolCvar = [](const char* label, const char* name) {
-        bool b = rex::cvar::Query<bool>(name);
-        if (ImGui::Checkbox(label, &b)) ApplyCvar(name, b ? "true" : "false");
-      };
-      {
-        bool full = rex::cvar::Query<uint32_t>("license_mask") != 0;
-        if (ImGui::Checkbox("Full version (unlock everything; saves progress)", &full))
-          ApplyCvar("license_mask", full ? "1" : "0");
-      }
-      BoolCvar("Fullscreen", "fullscreen");
-      BoolCvar("Use keyboard & mouse as a controller", "mnk_mode");
-      BoolCvar("Mute audio", "audio_mute");
-      BoolCvar("Invincibility (your base can't be destroyed)", "always_win");
-      BoolCvar("Auto-fire snowballs (hold the throw button)", "autofire");
-      BoolCvar("Auto-install DLC found next to the game", "auto_dlc");
-
-      ImGui::Separator();
-      ImGui::TextUnformatted("Graphics");
-      {
-        int rs = rex::cvar::Query<int32_t>("resolution_scale");
-        rs = rs < 1 ? 1 : (rs > 3 ? 3 : rs);
-        ImGui::SetNextItemWidth(220);
-        if (ImGui::SliderInt("Internal resolution", &rs, 1, 3, "%dx (sharper)"))
-          ApplyCvar("resolution_scale", std::to_string(rs));
-      }
-      {
-        static const char* kEffects[] = {"bilinear", "cas", "fsr"};
-        std::string cur = rex::cvar::Query<std::string>("present_effect");
-        int idx = 0;
-        for (int i = 0; i < 3; ++i)
-          if (cur == kEffects[i]) idx = i;
-        ImGui::SetNextItemWidth(220);
-        if (ImGui::Combo("Output filter", &idx, kEffects, 3)) ApplyCvar("present_effect", kEffects[idx]);
-        if (idx != 0) {
-          float sh = static_cast<float>(rex::cvar::Query<double>("present_cas_additional_sharpness"));
-          ImGui::SetNextItemWidth(220);
-          if (ImGui::SliderFloat("Sharpness", &sh, 0.0f, 1.0f, "%.2f"))
-            ApplyCvar("present_cas_additional_sharpness", std::to_string(sh));
-        }
-      }
-
-      if (ImGui::TreeNode("Advanced")) {
-        BoolCvar("Skip arcade logo", "skip_arcade_logo");
-        BoolCvar("VSync", "vsync");
-        BoolCvar("Letterbox (keep aspect ratio)", "present_letterbox");
-        BoolCvar("Crop overscan", "present_allow_overscan_cutoff");
-        int w = rex::cvar::Query<int32_t>("window_width");
-        ImGui::SetNextItemWidth(160);
-        if (ImGui::InputInt("Window width", &w)) ApplyCvar("window_width", std::to_string(w));
-        int h = rex::cvar::Query<int32_t>("window_height");
-        ImGui::SetNextItemWidth(160);
-        if (ImGui::InputInt("Window height", &h)) ApplyCvar("window_height", std::to_string(h));
-        ImGui::TextDisabled("Window size / fullscreen take effect on the next launch.");
-
-        ImGui::Separator();
-        ImGui::TextUnformatted("Folders & saves");
-        if (ImGui::Button("Open data folder") && !user_data_root_.empty())
-          splaunch::OpenInFileManager(user_data_root_);
-        ImGui::SameLine();
-        if (ImGui::Button("Open logs folder"))
-          splaunch::OpenInFileManager(rex::filesystem::GetExecutableFolder() / "logs");
-        ImGui::SameLine();
-        if (ImGui::Button("Open game folder") && !result_resolved_.empty()) {
-          std::filesystem::path gp(result_resolved_);
-          splaunch::OpenInFileManager(std::filesystem::is_directory(gp) ? gp : gp.parent_path());
-        }
-        if (ImGui::Button("Backup saves now")) {
-          std::string dest = splaunch::BackupSaves(user_data_root_);
-          last_backup_msg_ = dest.empty() ? "Nothing to back up yet." : ("Backed up to: " + dest);
-        }
-        if (!last_backup_msg_.empty()) ImGui::TextDisabled("%s", last_backup_msg_.c_str());
-        ImGui::TreePop();
-      }
-      ImGui::TextDisabled("Saved when you press Play. Re-run with --setup to change later.");
+      DrawSettingsControls(user_data_root_, result_resolved_);
+      ImGui::TextDisabled("Saved when you press Play. Re-open later with Setup.bat / --setup / in-game F5.");
     }
     // Online co-op is intentionally not exposed here (that feature is paused).
 
@@ -409,6 +414,42 @@ void OnboardingDialog::OnDraw(ImGuiIO& io) {
     }
   }
   ImGui::End();
+}
+
+// --- SettingsDialog (in-game, F5) ------------------------------------------
+
+SettingsDialog::SettingsDialog(rex::ui::ImGuiDrawer* drawer, std::filesystem::path user_data_root,
+                               std::string game_dir, std::function<void()> on_close)
+    : rex::ui::ImGuiDialog(drawer),
+      user_data_root_(std::move(user_data_root)),
+      game_dir_(std::move(game_dir)),
+      on_close_(std::move(on_close)) {}
+
+void SettingsDialog::RequestClose() { Close(); }
+
+void SettingsDialog::OnClose() {
+  SaveGameAndSettings(game_dir_);  // persist the live-applied settings
+  if (on_close_) on_close_();
+}
+
+void SettingsDialog::OnDraw(ImGuiIO& io) {
+  io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard;
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                          ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowSize(ImVec2(560, 0), ImGuiCond_Appearing);
+  bool open = true;
+  bool want_close = false;
+  if (ImGui::Begin("Settings (press F5 again to close)", &open,
+                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+    DrawSettingsControls(user_data_root_, game_dir_);
+    ImGui::Separator();
+    ImGui::TextDisabled(
+        "Changes apply now where possible; window size / fullscreen / resolution take "
+        "effect next launch. Saved automatically on close.");
+    if (ImGui::Button("Close", ImVec2(120, 0))) want_close = true;
+  }
+  ImGui::End();
+  if (!open || want_close || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) Close();
 }
 
 // --- LoadingDialog ---------------------------------------------------------

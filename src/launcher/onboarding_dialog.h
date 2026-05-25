@@ -49,7 +49,6 @@ class OnboardingDialog : public rex::ui::ImGuiDialog {
   std::function<void(std::string)> on_play_;
   std::function<void()> on_quit_;
   std::filesystem::path user_data_root_;  // for the "open data folder" / backup buttons
-  std::string last_backup_msg_;           // transient status after a save backup
 
   char path_buf_[1024] = {};
   std::string validated_path_;       // path last passed to Validate()
@@ -68,6 +67,31 @@ class OnboardingDialog : public rex::ui::ImGuiDialog {
 
   unsigned prev_pad_ = 0;            // previous gamepad mask (edge detection)
   bool first_draw_ = true;
+};
+
+// Draw the shared settings controls (the same checkboxes/sliders/graphics/advanced
+// the wizard shows). Used by both the onboarding wizard and the in-game settings
+// overlay. `user_data_root` and `game_dir` drive the folder/backup buttons. Applies
+// changes to cvars live; the caller decides when to persist to config.
+void DrawSettingsControls(const std::filesystem::path& user_data_root, const std::string& game_dir);
+
+// In-game settings overlay, toggled by a hotkey (F5) while playing. Reuses
+// DrawSettingsControls. Persists settings to config on close (no restart needed
+// for the hot settings; window/resolution apply next launch).
+class SettingsDialog : public rex::ui::ImGuiDialog {
+ public:
+  SettingsDialog(rex::ui::ImGuiDrawer* drawer, std::filesystem::path user_data_root,
+                 std::string game_dir, std::function<void()> on_close);
+  void RequestClose();  // for the hotkey toggle
+
+ protected:
+  void OnDraw(ImGuiIO& io) override;
+  void OnClose() override;
+
+ private:
+  std::filesystem::path user_data_root_;
+  std::string game_dir_;
+  std::function<void()> on_close_;
 };
 
 // A small, non-blocking "first launch: compiling shaders" overlay (top bar). The
