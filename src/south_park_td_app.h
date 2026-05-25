@@ -96,14 +96,11 @@ class SouthParkTdApp : public rex::ReXApp {
   // the shader cache is empty (i.e. genuinely the first run).
   void OnPostSetup() override {
     if (!imgui_drawer()) return;
-    // Suppress guest mouse input whenever ANY ImGui overlay (incl. our F5 settings)
-    // captures the mouse, so clicking toggles does not leak into the game.
-    if (runtime() && runtime()->input_system()) {
-      static_cast<rex::input::InputSystem*>(runtime()->input_system())->SetActiveCallback([this]() {
-        auto* d = imgui_drawer();
-        return !d || !d->GetIO().WantCaptureMouse;
-      });
-    }
+    // NOTE: do NOT override the input active-callback here. The SDK's callback
+    // returns "active" unless a built-in overlay is open; overriding it to read
+    // ImGui WantCaptureMouse every poll breaks guest keyboard (the mnk driver
+    // gates on is_active(), and WantCaptureMouse is read cross-thread from the
+    // guest poll). The F5 settings overlay is navigable by keyboard/gamepad.
     std::error_code ec;
     const auto& cache = cache_root();
     const bool first_launch =

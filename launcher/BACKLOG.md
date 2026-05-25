@@ -86,6 +86,18 @@ See `INTEGRATION.md` and the `launcher-onboarding` memory for details.
 - [ ] **FPS limit / present-mode options** — 🔧 if useful; expose relevant present cvars
       (`vulkan_allow_present_mode_immediate`, etc.) — verify they apply for this title.
 
+## Known minor issues
+- [ ] **F5 settings overlay: mouse clicks can reach the guest** — ⚡/🔧 while the F5 overlay is open,
+      clicking a toggle also sends the mapped trigger (LMB→RT) to the game behind it. Workaround:
+      navigate the overlay with keyboard/gamepad (ImGui nav). PROPER FIX: gate guest input only
+      while `launcher_settings_` is open, e.g. `if (!launcher_settings_) return true; return
+      !imgui_drawer()->GetIO().WantCaptureMouse;` in a re-pointed input active-callback.
+      **CRITICAL GOTCHA (caused a keyboard regression once):** the active-callback is read from the
+      GUEST poll thread every frame; do NOT read `WantCaptureMouse` during normal play (overlay
+      closed) — return `true` early. The mnk keyboard path is gated by `is_active()` (mnk_input_driver
+      :234), so a flaky/cross-thread `is_active()` kills all keyboard input. Verify with a REAL
+      keyboard (synthetic SendKeys/SendInput do NOT reach the mnk driver, only the app keybind path).
+
 ## Robustness / diagnostics
 - [ ] **Surface crashes** — 🔧 `main.cpp` already writes `crash_backtrace.txt`. On the next launch,
       if a recent crash file exists, show a dialog "last run crashed — open log?" with an
