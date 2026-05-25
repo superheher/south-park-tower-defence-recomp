@@ -43,9 +43,12 @@ HOW TO PLAY
        - a folder of extracted game files (containing default.xex)
      Use the path box or the Browse... button (mouse, keyboard, or gamepad).
   3. Adjust settings if you like, then Play. Your choice is remembered, so the
-     next launch goes straight into the game.
+     next launch goes STRAIGHT INTO THE GAME (the wizard does not show again).
 
-  To change the game or settings later:  south_park_td.exe --setup
+OPEN SETTINGS / CHANGE GAME LATER
+  Once a game is chosen, running south_park_td.exe goes straight into the game.
+  To get the setup & settings wizard back, double-click *** Setup.bat ***
+  (or run "south_park_td.exe --setup" from a terminal).
 
 BRING YOUR OWN GAME
   This package contains NO game data. You must supply your own legally-obtained
@@ -58,6 +61,15 @@ FRONTENDS (Playnite / Steam / EmuDeck / scripts)
   See INTEGRATION.md for the full cvar / config-file / exit-code contract.
 "@
 Set-Content -Path (Join-Path $appdir "README.txt") -Value $readme -Encoding ascii
+
+# Setup.bat: a discoverable double-click that re-opens the onboarding/settings
+# wizard (the exe alone goes straight into the game once a game is configured).
+$setupBat = @'
+@echo off
+rem Open the South Park setup & settings wizard (choose your game / change settings).
+start "" "%~dp0south_park_td.exe" --setup
+'@
+Set-Content -Path (Join-Path $appdir "Setup.bat") -Value $setupBat -Encoding ascii
 
 # Rebuild the zip fresh (never in-place-update a multi-file zip).
 if (Test-Path $OutZip) { Remove-Item $OutZip -Force }

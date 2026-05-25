@@ -31,7 +31,9 @@ the *same* engine without the UI. "Combined by default, separable by contract."
 
 Controls in the wizard: **mouse**, **keyboard** (Enter = Play, Esc = Quit), or a
 **gamepad** (Start = Play, B = Quit, D-pad/A to navigate — good for a Steam Deck or
-couch). To change your game or settings later, run with `--setup`.
+couch). Once a game is set, the exe goes **straight into the game** with no wizard.
+To change your game or settings later, double-click **`Setup.bat`** (shipped in the
+package) — or run `south_park_td.exe --setup`.
 
 ---
 
