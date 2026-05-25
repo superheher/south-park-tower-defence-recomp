@@ -6,7 +6,9 @@
 #
 param(
   [string]$BuildDir = (Join-Path $PSScriptRoot "..\out\build\win-amd64-relwithdebinfo"),
-  [string]$OutZip   = "C:\Temp\SouthParkTD-win64.zip"
+  [string]$OutZip   = (Join-Path $env:USERPROFILE "Downloads\southtd\SouthParkTD-win64.zip"),
+  # Also unzip next to the archive (into <OutZip dir>\SouthParkTD) for immediate testing.
+  [bool]$Extract    = $true
 )
 $ErrorActionPreference = "Stop"
 
@@ -79,4 +81,12 @@ Remove-Item -Recurse -Force $stage
 
 $mb = [math]::Round((Get-Item $OutZip).Length / 1MB, 1)
 Write-Host "Built $OutZip ($mb MB)"
-Get-ChildItem $appdir -ErrorAction SilentlyContinue  # (stage already removed; informational)
+
+# Unzip right next to the archive for immediate testing (clean any prior extract).
+if ($Extract) {
+  $extractRoot  = Split-Path $OutZip
+  $extractedApp = Join-Path $extractRoot "SouthParkTD"
+  if (Test-Path $extractedApp) { Remove-Item -Recurse -Force $extractedApp }
+  Expand-Archive -Path $OutZip -DestinationPath $extractRoot -Force
+  Write-Host "Extracted to $extractedApp"
+}
