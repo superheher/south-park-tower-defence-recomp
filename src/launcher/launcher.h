@@ -84,6 +84,10 @@ Config LoadConfig();
 // Write atomically to ConfigFile() (creates ConfigDir()). Returns success.
 bool SaveConfig(const Config& cfg);
 
+// Persist a chosen game source path (keeping any existing saved settings).
+// Used by the onboarding wizard when the user confirms a game.
+bool SaveGamePath(const std::string& game_path);
+
 // ---------------------------------------------------------------------------
 // Bootstrap resolution (the "brain")
 // ---------------------------------------------------------------------------

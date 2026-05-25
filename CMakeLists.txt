@@ -15,6 +15,7 @@ set(SOUTHPARKTD_SOURCES
     src/main.cpp
     src/stubs.cpp
     src/launcher/launcher.cpp
+    src/launcher/onboarding_dialog.cpp
 )
 
 if(WIN32)

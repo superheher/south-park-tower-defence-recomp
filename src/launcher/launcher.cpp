@@ -273,6 +273,13 @@ bool SaveConfig(const Config& cfg) {
   return true;
 }
 
+bool SaveGamePath(const std::string& game_path) {
+  Config c = LoadConfig();
+  c.schema_version = kSchemaVersion;
+  c.game_path = game_path;
+  return SaveConfig(c);
+}
+
 std::string ResolveAndPersist(const std::string& cli_game_path) {
   Config cfg = LoadConfig();
 
