@@ -22,6 +22,43 @@ index 6998a45..3c4fcec 100644
  
    uint32_t primary_buffer_ptr_ = 0;
    uint32_t primary_buffer_size_ = 0;
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index d1580fc..0856b16 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -228,6 +228,11 @@ class TextureCache {
+     }
+     void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
+ 
++    // [recomp fix: font-glyph striping — KB 65, ironclad pt3] If a base reload is pending to catch a
++    // settled CPU glyph memcpy (see base_recheck_frames_), consume one frame: re-mark the base
++    // outdated so it reloads this pass, and return true. Returns false when nothing is pending.
++    bool ConsumeBaseRecheckFrame(const std::unique_lock<std::recursive_mutex>& global_lock);
++
+     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+ 
+     // For LRU caching - updates the last usage frame and moves the texture to
+@@ -269,6 +274,20 @@ class TextureCache {
+     bool base_outdated_ = false;
+     // Whether the recent mip data needs reloading from the memory.
+     bool mips_outdated_ = false;
++    // [recomp fix: font-glyph striping — KB 65, ironclad pt3] The host write-watch is one-shot: the
++    // first guest write to a watched range fires the callback and cancels the watch, and the wide
++    // invalidation drops page protection so the REST of a multi-page CPU glyph memcpy does not
++    // re-fault. If the texture is loaded mid-memcpy (true even for the very FIRST/creation load of
++    // the in-match hint banner), its tail pages capture stale bytes and are never reloaded (loads=1)
++    // -> persistent, timing-dependent vertical-striped text. After any load triggered by a real
++    // reason (creation or a guest write), force a couple extra reloads on the following frames so the
++    // settled memcpy is captured. base_arm_recheck_on_load_ is set ONLY by creation and the write
++    // callback (NOT by these forced rechecks), so the recheck cannot loop.
++    bool base_arm_recheck_on_load_ = false;
++    uint8_t base_recheck_frames_ = 0;
++    // Gates recheck consumption to one per GPU submission so the extra reloads span real frames
++    // (giving a multi-page CPU glyph memcpy time to settle), not multiple draws within one frame.
++    uint64_t base_recheck_last_submission_ = 0;
+     std::atomic<uint32_t> outdated_mask_{0};
+     // Watch handles for the memory ranges.
+     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
 index b05df6a..00155f2 100644
 --- a/include/rex/graphics/shared_memory.h
@@ -751,10 +788,37 @@ index 3877b1a..b147398 100644
  
    // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
-index c7c824e..55641ac 100644
+index c7c824e..e17dd2f 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
 +++ b/src/graphics/pipeline/texture/cache.cpp
-@@ -569,8 +569,12 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+@@ -449,7 +449,25 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
+ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+   const auto& regs = register_file();
+ 
+-  if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
++  bool bindings_need_reset = texture_became_outdated_.exchange(false, std::memory_order_acquire);
++
++  // [recomp fix: font-glyph striping — KB 65, ironclad pt3] Re-mark recently CPU-written bound
++  // textures outdated for a couple of frames so a glyph memcpy that settled after the one-shot
++  // write-watch already fired (mid-write load -> striped tail, loads=1) is reloaded once complete.
++  // Cheap: only bound textures with a pending recheck, and the count is bounded per write event.
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    for (TextureBinding& binding : texture_bindings_) {
++      if (binding.texture && binding.texture->ConsumeBaseRecheckFrame(global_lock)) {
++        bindings_need_reset = true;
++      }
++      if (binding.texture_signed && binding.texture_signed->ConsumeBaseRecheckFrame(global_lock)) {
++        bindings_need_reset = true;
++      }
++    }
++  }
++
++  if (bindings_need_reset) {
+     // A texture has become outdated - make sure whether textures are outdated
+     // is rechecked in this draw and in subsequent ones to reload the new data
+     // if needed.
+@@ -569,8 +587,12 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
      for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
        pending_shared_memory_range_pairs.emplace_back(pending_range.start, pending_range.length);
      }
@@ -768,7 +832,65 @@ index c7c824e..55641ac 100644
    }
  
    if (batched_shared_memory_request_succeeded) {
-@@ -888,7 +892,10 @@ bool TextureCache::LoadTextureData(Texture& texture) {
+@@ -656,6 +678,10 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
+   outdated_mask_.store(
+       (base_outdated_ ? kOutdatedBitBase : 0) | (mips_outdated_ ? kOutdatedBitMips : 0),
+       std::memory_order_relaxed);
++  // [recomp fix: font-glyph striping — KB 65, ironclad pt3] Arm the settle-recheck for the initial
++  // base load: a CPU-rasterized texture (e.g. the in-match hint banner) is frequently created while
++  // the guest is still writing its glyph bytes, so the first load captures a stale tail.
++  base_arm_recheck_on_load_ = base_outdated_;
+ }
+ 
+ TextureCache::Texture::~Texture() {
+@@ -691,6 +717,17 @@ void TextureCache::Texture::MakeUpToDateAndWatch(
+     base_watch_handle_ = shared_memory.WatchMemoryRange(
+         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
+     outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
++    // [recomp fix: font-glyph striping — KB 65, ironclad pt3] If this load was triggered by a real
++    // reason (creation or a guest write) rather than by a forced recheck, schedule a couple of extra
++    // reloads. The one-shot write-watch + wide invalidation can let a multi-page glyph memcpy finish
++    // AFTER this upload read the pages but BEFORE protection was re-armed, with no further fault -> a
++    // stale striped tail that would otherwise never reload (loads=1). The forced rechecks don't set
++    // base_arm_recheck_on_load_, so this cannot loop.
++    if (base_arm_recheck_on_load_) {
++      base_arm_recheck_on_load_ = false;
++      base_recheck_frames_ = 3;
++      base_recheck_last_submission_ = texture_cache().current_submission_index_;
++    }
+   }
+   if (mips_outdated_) {
+     assert_not_zero(GetGuestMipsSize());
+@@ -740,7 +777,28 @@ void TextureCache::Texture::WatchCallback(
+     base_outdated_ = true;
+     base_watch_handle_ = nullptr;
+     outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
++    // [recomp fix: font-glyph striping — KB 65, ironclad pt3] Mark that this outdating came from a
++    // real guest CPU write so the next load arms the settle-recheck (see MakeUpToDateAndWatch).
++    base_arm_recheck_on_load_ = true;
++  }
++}
++
++bool TextureCache::Texture::ConsumeBaseRecheckFrame(
++    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock) {
++  if (base_recheck_frames_ == 0) {
++    return false;
++  }
++  // Only consume one recheck per GPU submission, so the forced reloads are spread across real
++  // frames rather than several draws within a single frame (which could all still race the memcpy).
++  uint64_t submission = texture_cache_.current_submission_index_;
++  if (submission == base_recheck_last_submission_) {
++    return false;
+   }
++  base_recheck_last_submission_ = submission;
++  --base_recheck_frames_;
++  base_outdated_ = true;
++  outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
++  return true;
+ }
+ 
+ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
+@@ -888,7 +946,10 @@ bool TextureCache::LoadTextureData(Texture& texture) {
    for (size_t i = 0; i < pending_range_count; ++i) {
      pending_range_pairs[i] = std::make_pair(pending_ranges[i].start, pending_ranges[i].length);
    }
