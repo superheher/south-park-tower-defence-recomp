@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <system_error>
 
@@ -43,6 +44,9 @@ REXCVAR_DEFINE_BOOL(no_setup, false, "Launcher",
 REXCVAR_DEFINE_BOOL(embedded, false, "Launcher", "Alias of --no_setup (for frontends)");
 REXCVAR_DEFINE_BOOL(auto_dlc, true, "Launcher",
                     "Auto-install DLC found alongside the game (set false to skip)");
+REXCVAR_DEFINE_BOOL(version, false, "Launcher", "Print the launcher version and exit");
+REXCVAR_DEFINE_BOOL(print_config, false, "Launcher",
+                    "Print the resolved game + settings + DLC as JSON and exit");
 
 namespace splaunch {
 
@@ -582,6 +586,49 @@ std::string AutoDetectGameNearExe() {
   return ResolveGameSource(dir);  // bounded recursive scan of the exe's folder
 }
 
+void OpenInFileManager(const std::filesystem::path& path) {
+  std::error_code ec;
+  if (path.empty() || !std::filesystem::exists(path, ec)) return;
+#if defined(_WIN32)
+  ShellExecuteW(nullptr, L"open", path.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+  std::system(("open '" + path.string() + "'").c_str());
+#else
+  std::system(("xdg-open '" + path.string() + "' &").c_str());
+#endif
+}
+
+std::string BackupSaves(const std::filesystem::path& user_data_root) {
+  std::error_code ec;
+  if (user_data_root.empty() || !std::filesystem::is_directory(user_data_root, ec)) return "";
+
+  std::time_t t = std::time(nullptr);
+  char ts[32] = {};
+  std::strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", std::localtime(&t));
+  auto dest = user_data_root / "backups" / ts;
+  std::filesystem::create_directories(dest, ec);
+  if (ec) return "";
+
+  bool any = false;
+  for (std::filesystem::directory_iterator it(user_data_root, ec), end; it != end;
+       it.increment(ec)) {
+    if (ec) break;
+    auto name = it->path().filename().string();
+    if (name == "cache" || name == "backups") continue;  // skip large / transient
+    std::error_code ec2;
+    std::filesystem::copy(it->path(), dest / name,
+                          std::filesystem::copy_options::recursive |
+                              std::filesystem::copy_options::overwrite_existing,
+                          ec2);
+    if (!ec2) any = true;
+  }
+  if (!any) {
+    std::filesystem::remove_all(dest, ec);
+    return "";
+  }
+  return dest.string();
+}
+
 bool IsDlcInstalled(const std::filesystem::path& user_data_root, uint32_t title_id,
                     const std::filesystem::path& dlc_package) {
   char tid[16];
@@ -661,9 +708,40 @@ BootstrapResult Bootstrap(const std::string& cli_game_path) {
     return res;
   }
 
+  // --version: print and exit.
+  if (rex::cvar::Query<bool>("version")) {
+    WriteStdoutLine("south_park_td launcher (config schema " + std::to_string(kSchemaVersion) + ")");
+    res.action = BootstrapAction::kExit;
+    res.exit_code = 0;
+    return res;
+  }
+
   // Resolve the game source + apply settings (CLI > config > none) and persist.
   std::string resolved = ResolveAndPersist(cli_game_path);
   res.game_path = resolved;
+
+  // --print-config: emit the resolved game + effective settings + DLC as JSON, exit.
+  if (rex::cvar::Query<bool>("print_config")) {
+    std::string j = "{\"game_path\":\"" + JsonEscape(resolved) + "\",\"settings\":{";
+    bool first = true;
+    for (const auto& def : ManagedSettings()) {
+      if (!first) j += ",";
+      first = false;
+      j += "\"" + std::string(def.name) + "\":\"" + JsonEscape(CvarValueAsString(def)) + "\"";
+    }
+    j += "},\"dlc\":[";
+    first = true;
+    for (const auto& n : CollectDlcNames(std::filesystem::path(resolved))) {
+      if (!first) j += ",";
+      first = false;
+      j += "\"" + JsonEscape(n) + "\"";
+    }
+    j += "]}";
+    WriteStdoutLine(j);
+    res.action = BootstrapAction::kExit;
+    res.exit_code = 0;
+    return res;
+  }
 
   const bool embedded = rex::cvar::Query<bool>("no_setup") ||
                         rex::cvar::Query<bool>("embedded") || CliHasFlag("no-setup");

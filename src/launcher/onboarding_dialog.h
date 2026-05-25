@@ -28,6 +28,7 @@ class OnboardingDialog : public rex::ui::ImGuiDialog {
   // on_play(game_path): user confirmed a valid game; persist + resume/launch.
   // on_quit(): user aborted; quit the app.
   OnboardingDialog(rex::ui::ImGuiDrawer* drawer, std::string initial_path,
+                   std::filesystem::path user_data_root,
                    std::function<void(std::string)> on_play, std::function<void()> on_quit);
 
   // Set the game-location path externally (e.g. from a window file-drop). The
@@ -47,6 +48,8 @@ class OnboardingDialog : public rex::ui::ImGuiDialog {
 
   std::function<void(std::string)> on_play_;
   std::function<void()> on_quit_;
+  std::filesystem::path user_data_root_;  // for the "open data folder" / backup buttons
+  std::string last_backup_msg_;           // transient status after a save backup
 
   char path_buf_[1024] = {};
   std::string validated_path_;       // path last passed to Validate()

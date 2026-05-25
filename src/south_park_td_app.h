@@ -70,7 +70,7 @@ class SouthParkTdApp : public rex::ReXApp {
     // raw pointer only to route window file-drops into it; both close paths null
     // it before it self-deletes.
     onboarding_ = new splaunch::OnboardingDialog(
-        imgui_drawer(), initial,
+        imgui_drawer(), initial, user_data_root(),
         [this, defaults, resume](std::string game_path) {
           onboarding_ = nullptr;
           // Persist the chosen game + the settings the user reviewed in the wizard.

@@ -8,6 +8,7 @@
 
 #include <imgui.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>  // GetExecutableFolder (logs folder button)
 
 #include <algorithm>
 #include <cstdint>
@@ -89,11 +90,13 @@ fs::path DefaultBrowseDir() {
 }  // namespace
 
 OnboardingDialog::OnboardingDialog(rex::ui::ImGuiDrawer* drawer, std::string initial_path,
+                                   std::filesystem::path user_data_root,
                                    std::function<void(std::string)> on_play,
                                    std::function<void()> on_quit)
     : rex::ui::ImGuiDialog(drawer),
       on_play_(std::move(on_play)),
-      on_quit_(std::move(on_quit)) {
+      on_quit_(std::move(on_quit)),
+      user_data_root_(std::move(user_data_root)) {
   std::snprintf(path_buf_, sizeof(path_buf_), "%s", initial_path.c_str());
 }
 
@@ -357,6 +360,24 @@ void OnboardingDialog::OnDraw(ImGuiIO& io) {
         ImGui::SetNextItemWidth(160);
         if (ImGui::InputInt("Window height", &h)) ApplyCvar("window_height", std::to_string(h));
         ImGui::TextDisabled("Window size / fullscreen take effect on the next launch.");
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Folders & saves");
+        if (ImGui::Button("Open data folder") && !user_data_root_.empty())
+          splaunch::OpenInFileManager(user_data_root_);
+        ImGui::SameLine();
+        if (ImGui::Button("Open logs folder"))
+          splaunch::OpenInFileManager(rex::filesystem::GetExecutableFolder() / "logs");
+        ImGui::SameLine();
+        if (ImGui::Button("Open game folder") && !result_resolved_.empty()) {
+          std::filesystem::path gp(result_resolved_);
+          splaunch::OpenInFileManager(std::filesystem::is_directory(gp) ? gp : gp.parent_path());
+        }
+        if (ImGui::Button("Backup saves now")) {
+          std::string dest = splaunch::BackupSaves(user_data_root_);
+          last_backup_msg_ = dest.empty() ? "Nothing to back up yet." : ("Backed up to: " + dest);
+        }
+        if (!last_backup_msg_.empty()) ImGui::TextDisabled("%s", last_backup_msg_.c_str());
         ImGui::TreePop();
       }
       ImGui::TextDisabled("Saved when you press Play. Re-run with --setup to change later.");

@@ -157,6 +157,19 @@ bool IsDlcInstalled(const std::filesystem::path& user_data_root, uint32_t title_
 // Human-readable display names of the DLC found alongside the game (for the UI).
 std::vector<std::string> CollectDlcNames(const std::filesystem::path& game_source);
 
+// ---------------------------------------------------------------------------
+// Small utilities for the UI
+// ---------------------------------------------------------------------------
+
+// Open a folder in the OS file manager (Explorer / Finder / xdg-open). No-op if
+// the path does not exist.
+void OpenInFileManager(const std::filesystem::path& path);
+
+// Copy the user's save/profile data (everything in user_data_root except the
+// large `cache` and prior `backups`) into user_data_root/backups/<timestamp>/.
+// Returns the backup folder path, or "" if there was nothing to back up.
+std::string BackupSaves(const std::filesystem::path& user_data_root);
+
 // Serialize a ValidateResult as one line of JSON: {"ok":...,"title":...,
 // "titleID":...,"reason":...}.
 std::string ValidateResultToJson(const ValidateResult& r);
