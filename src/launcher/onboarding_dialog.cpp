@@ -136,6 +136,9 @@ void OnboardingDialog::Revalidate() {
   result_title_id_ = r.title_id;
   result_reason_ = r.reason;
   result_resolved_ = r.resolved;
+  result_dlc_names_.clear();
+  if (result_ok_ && !result_resolved_.empty())
+    result_dlc_names_ = CollectDlcNames(fs::path(result_resolved_));
 }
 
 void OnboardingDialog::RefreshEntries() {
@@ -278,6 +281,21 @@ void OnboardingDialog::OnDraw(ImGuiIO& io) {
       // If we found the game inside the folder the user pointed at, show where.
       if (!result_resolved_.empty() && result_resolved_ != path_buf_)
         ImGui::TextDisabled("Found: %s", result_resolved_.c_str());
+      // Warn if this is a different game than this build expects.
+      constexpr const char* kExpectedTitleId = "58410931";  // South Park: Let's Go Tower Defense
+      if (!result_title_id_.empty() && result_title_id_ != kExpectedTitleId)
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                           "Warning: titleID %s is not South Park (58410931) - it may not run.",
+                           result_title_id_.c_str());
+      // Show the DLC that will be auto-installed alongside the game.
+      if (!result_dlc_names_.empty()) {
+        std::string joined;
+        for (const auto& n : result_dlc_names_) {
+          if (!joined.empty()) joined += ", ";
+          joined += n;
+        }
+        ImGui::TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "Add-ons: %s", joined.c_str());
+      }
     } else {
       ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Not a valid game: %s",
                          result_reason_.c_str());

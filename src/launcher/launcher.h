@@ -154,6 +154,9 @@ std::vector<std::string> CollectDlc(const std::filesystem::path& game_source);
 bool IsDlcInstalled(const std::filesystem::path& user_data_root, uint32_t title_id,
                     const std::filesystem::path& dlc_package);
 
+// Human-readable display names of the DLC found alongside the game (for the UI).
+std::vector<std::string> CollectDlcNames(const std::filesystem::path& game_source);
+
 // Serialize a ValidateResult as one line of JSON: {"ok":...,"title":...,
 // "titleID":...,"reason":...}.
 std::string ValidateResultToJson(const ValidateResult& r);

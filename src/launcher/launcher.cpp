@@ -562,6 +562,20 @@ std::vector<std::string> CollectDlc(const std::filesystem::path& game_source) {
   return dlc;
 }
 
+std::vector<std::string> CollectDlcNames(const std::filesystem::path& game_source) {
+  std::vector<std::string> names;
+  for (const auto& p : CollectDlc(game_source)) {
+    std::string name;
+    if (auto hdr = rex::filesystem::StfsContainerDevice::ReadPackageHeader(p)) {
+      name = Utf16ToUtf8(hdr->metadata.display_name(rex::system::XLanguage::kEnglish));
+      if (name.empty()) name = Utf16ToUtf8(hdr->metadata.title_name());
+    }
+    if (name.empty()) name = std::filesystem::path(p).filename().string();
+    names.push_back(name);
+  }
+  return names;
+}
+
 std::string AutoDetectGameNearExe() {
   auto dir = rex::filesystem::GetExecutableFolder();
   if (dir.empty()) return "";
