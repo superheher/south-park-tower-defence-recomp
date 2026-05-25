@@ -148,6 +148,14 @@ const std::vector<SettingDef>& ManagedSettings() {
       {"vsync", CvarType::Bool},          {"mnk_mode", CvarType::Bool},
       {"audio_mute", CvarType::Bool},     {"always_win", CvarType::Bool},
       {"skip_arcade_logo", CvarType::Bool}, {"window_icon", CvarType::Str},
+      // Graphics / presentation
+      {"resolution_scale", CvarType::Int},
+      {"present_effect", CvarType::Str},
+      {"present_cas_additional_sharpness", CvarType::Double},
+      {"present_letterbox", CvarType::Bool},
+      {"present_allow_overscan_cutoff", CvarType::Bool},
+      // Launcher behavior
+      {"auto_dlc", CvarType::Bool},
   };
   return kSettings;
 }
@@ -174,6 +182,8 @@ std::string CvarValueAsString(const SettingDef& def) {
       return std::to_string(rex::cvar::Query<int32_t>(def.name));
     case CvarType::UInt:
       return std::to_string(rex::cvar::Query<uint32_t>(def.name));
+    case CvarType::Double:
+      return std::to_string(rex::cvar::Query<double>(def.name));
     case CvarType::Str:
     default:
       return rex::cvar::Query<std::string>(def.name);

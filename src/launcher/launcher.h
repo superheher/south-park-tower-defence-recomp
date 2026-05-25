@@ -44,7 +44,7 @@ bool CliHasFlag(std::string_view name);
 // Settings the launcher manages (cvar name + value type for round-tripping)
 // ---------------------------------------------------------------------------
 
-enum class CvarType { Bool, Int, UInt, Str };
+enum class CvarType { Bool, Int, UInt, Str, Double };
 
 struct SettingDef {
   const char* name;

@@ -300,10 +300,38 @@ void OnboardingDialog::OnDraw(ImGuiIO& io) {
       BoolCvar("Use keyboard & mouse as a controller", "mnk_mode");
       BoolCvar("Mute audio", "audio_mute");
       BoolCvar("Invincibility (your base can't be destroyed)", "always_win");
+      BoolCvar("Auto-install DLC found next to the game", "auto_dlc");
+
+      ImGui::Separator();
+      ImGui::TextUnformatted("Graphics");
+      {
+        int rs = rex::cvar::Query<int32_t>("resolution_scale");
+        rs = rs < 1 ? 1 : (rs > 3 ? 3 : rs);
+        ImGui::SetNextItemWidth(220);
+        if (ImGui::SliderInt("Internal resolution", &rs, 1, 3, "%dx (sharper)"))
+          ApplyCvar("resolution_scale", std::to_string(rs));
+      }
+      {
+        static const char* kEffects[] = {"bilinear", "cas", "fsr"};
+        std::string cur = rex::cvar::Query<std::string>("present_effect");
+        int idx = 0;
+        for (int i = 0; i < 3; ++i)
+          if (cur == kEffects[i]) idx = i;
+        ImGui::SetNextItemWidth(220);
+        if (ImGui::Combo("Output filter", &idx, kEffects, 3)) ApplyCvar("present_effect", kEffects[idx]);
+        if (idx != 0) {
+          float sh = static_cast<float>(rex::cvar::Query<double>("present_cas_additional_sharpness"));
+          ImGui::SetNextItemWidth(220);
+          if (ImGui::SliderFloat("Sharpness", &sh, 0.0f, 1.0f, "%.2f"))
+            ApplyCvar("present_cas_additional_sharpness", std::to_string(sh));
+        }
+      }
 
       if (ImGui::TreeNode("Advanced")) {
         BoolCvar("Skip arcade logo", "skip_arcade_logo");
         BoolCvar("VSync", "vsync");
+        BoolCvar("Letterbox (keep aspect ratio)", "present_letterbox");
+        BoolCvar("Crop overscan", "present_allow_overscan_cutoff");
         int w = rex::cvar::Query<int32_t>("window_width");
         ImGui::SetNextItemWidth(160);
         if (ImGui::InputInt("Window width", &w)) ApplyCvar("window_width", std::to_string(w));
