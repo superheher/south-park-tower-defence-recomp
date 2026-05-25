@@ -10,7 +10,11 @@
 #include <optional>
 #include <string>
 
+#include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/rex_app.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xam/content_manager.h>
 
 #include "launcher/launcher.h"
 #include "launcher/onboarding_dialog.h"
@@ -69,6 +73,30 @@ class SouthParkTdApp : public rex::ReXApp {
         },
         [this]() { app_context().QuitFromUIThread(); });
     return std::nullopt;  // async: wizard drives the resume
+  }
+
+  // After the XEX is loaded (title_id known, content manager up) but before the
+  // game launches: auto-install any DLC that shipped alongside the game, so the
+  // title's content enumeration finds it. Uses the engine's own ContentManager.
+  void OnPostLoadXexImage() override {
+    if (!rex::cvar::Query<bool>("auto_dlc")) return;
+    auto* rt = runtime();
+    if (!rt || !rt->kernel_state()) return;
+    auto* cm = rt->kernel_state()->content_manager();
+    if (!cm) return;
+    const uint32_t title_id = rt->kernel_state()->title_id();
+    for (const auto& dlc : splaunch::CollectDlc(game_data_root())) {
+      std::filesystem::path dlc_path(dlc);
+      if (splaunch::IsDlcInstalled(user_data_root(), title_id, dlc_path)) {
+        REXLOG_INFO("[launcher] DLC already installed: {}", dlc);
+        continue;
+      }
+      rex::X_RESULT r = cm->InstallContent(dlc_path);
+      if (r == 0)  // X_ERROR_SUCCESS
+        REXLOG_INFO("[launcher] installed DLC: {}", dlc);
+      else
+        REXLOG_WARN("[launcher] DLC install failed (0x{:08X}): {}", static_cast<uint32_t>(r), dlc);
+    }
   }
 
   // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}  // M5 settings

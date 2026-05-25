@@ -41,6 +41,8 @@ REXCVAR_DEFINE_BOOL(setup, false, "Launcher",
 REXCVAR_DEFINE_BOOL(no_setup, false, "Launcher",
                     "Never show onboarding UI; exit 64 if no game is configured (embedded use)");
 REXCVAR_DEFINE_BOOL(embedded, false, "Launcher", "Alias of --no_setup (for frontends)");
+REXCVAR_DEFINE_BOOL(auto_dlc, true, "Launcher",
+                    "Auto-install DLC found alongside the game (set false to skip)");
 
 namespace splaunch {
 
@@ -507,6 +509,57 @@ std::string ResolveGameSource(const std::filesystem::path& input) {
     if (fallback.empty()) fallback = p.string();     // DLC/other: remember, keep looking
   }
   return fallback;
+}
+
+std::vector<std::string> CollectDlc(const std::filesystem::path& game_source) {
+  std::vector<std::string> dlc;
+  std::error_code ec;
+  if (game_source.empty() || !std::filesystem::exists(game_source, ec)) return dlc;
+
+  // For a dump file .../<titleID>/<type>/<file>, DLC lives in a sibling type
+  // folder .../<titleID>/00000002/<file>, so scan the title-id folder.
+  std::filesystem::path scan_root;
+  if (std::filesystem::is_directory(game_source, ec)) {
+    scan_root = game_source.parent_path();
+  } else {
+    auto type_dir = game_source.parent_path();
+    scan_root = type_dir.has_parent_path() ? type_dir.parent_path() : type_dir;
+  }
+  if (scan_root.empty() || !std::filesystem::is_directory(scan_root, ec)) return dlc;
+
+  constexpr int kMaxDepth = 5;
+  constexpr int kMaxExamined = 20000;
+  int examined = 0;
+  std::filesystem::recursive_directory_iterator it(
+      scan_root, std::filesystem::directory_options::skip_permission_denied, ec),
+      end;
+  for (; it != end; it.increment(ec)) {
+    if (ec) break;
+    if (++examined > kMaxExamined) break;
+    std::error_code ec2;
+    if (it->is_directory(ec2)) {
+      if (it.depth() >= kMaxDepth) it.disable_recursion_pending();
+      continue;
+    }
+    if (!it->is_regular_file(ec2)) continue;
+    const auto& p = it->path();
+    if (std::filesystem::equivalent(p, game_source, ec2)) continue;  // not the game
+    auto size = it->file_size(ec2);
+    if (ec2 || !WorthMagicCheck(p, size)) continue;
+    auto ct = StfsContentType(p);
+    if (ct && *ct == rex::system::XContentType::kMarketplaceContent) dlc.push_back(p.string());
+  }
+  return dlc;
+}
+
+bool IsDlcInstalled(const std::filesystem::path& user_data_root, uint32_t title_id,
+                    const std::filesystem::path& dlc_package) {
+  char tid[16];
+  std::snprintf(tid, sizeof tid, "%08X", title_id);
+  // Mirrors ContentManager: <root>/0000000000000000/<titleID>/00000002/<filename>/
+  auto dest = user_data_root / "0000000000000000" / tid / "00000002" / dlc_package.filename();
+  std::error_code ec;
+  return std::filesystem::exists(dest, ec);
 }
 
 ValidateResult Validate(const std::filesystem::path& path) {

@@ -79,8 +79,18 @@ arcade logo is skipped, keyboard works as a controller, and the bundled
 | `--validate=<path>` | Validate a game source, print JSON, and exit (see §2.5) |
 | `--setup` | Force the onboarding wizard even if a game is already configured |
 | `--no_setup` / `--embedded` | Never show any UI; if the game is unresolved, exit `64` |
+| `--auto_dlc` (default `true`) | Auto-install DLC found next to the game; `false` to skip |
 
 Online co-op is intentionally **not** exposed by the launcher (that feature is paused).
+
+### 2.2a DLC / add-ons (automatic)
+If your dump includes DLC (Xbox marketplace content, type `00000002`) alongside the
+game — e.g. `<titleID>/00000002/<hash>` next to the game's `<titleID>/000D0000/<hash>`
+— the launcher finds it and installs it into the engine's content store on launch,
+so the title sees it through its normal content enumeration. South Park LGTDP ships
+"Unlock Professor Chaos" and "Challenge Levels"; both are picked up automatically
+(verified: the title enumerates **2** content items and opens them). Re-installs are
+skipped if already present. Pass `--auto_dlc=false` to disable.
 
 ### 2.3 Resolution priority
 For the game source and every setting: **CLI flag > saved config > built-in default**

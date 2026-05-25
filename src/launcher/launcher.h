@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -132,6 +133,21 @@ std::string ResolveGameSource(const std::filesystem::path& input);
 // Validate a game source using the engine's OWN STFS reader (no mount, no
 // window). Resolves `path` first (see ResolveGameSource), so a folder is fine.
 ValidateResult Validate(const std::filesystem::path& path);
+
+// ---------------------------------------------------------------------------
+// DLC / add-on content
+// ---------------------------------------------------------------------------
+
+// Find DLC packages (STFS marketplace content) that sit alongside the resolved
+// game - e.g. a console dump's <titleID>/00000002/<hash> next to the game's
+// <titleID>/000D0000/<hash>. Returns their host paths (empty if none). The game
+// itself is excluded.
+std::vector<std::string> CollectDlc(const std::filesystem::path& game_source);
+
+// True if a DLC package is already extracted into the engine's content store
+// under user_data_root (so re-installing each launch can be skipped).
+bool IsDlcInstalled(const std::filesystem::path& user_data_root, uint32_t title_id,
+                    const std::filesystem::path& dlc_package);
 
 // Serialize a ValidateResult as one line of JSON: {"ok":...,"title":...,
 // "titleID":...,"reason":...}.
