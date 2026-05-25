@@ -862,7 +862,7 @@ index 333becb..1d288f9 100644
  
    upload_ranges_.clear();
 diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
-index b8eae3c..f06bb1e 100644
+index b8eae3c..82db32e 100644
 --- a/src/input/mnk/mnk_input_driver.cpp
 +++ b/src/input/mnk/mnk_input_driver.cpp
 @@ -19,6 +19,8 @@
@@ -874,7 +874,13 @@ index b8eae3c..f06bb1e 100644
  #include <cstring>
  
  #if REX_PLATFORM_WIN32
-@@ -30,6 +32,11 @@ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller
+@@ -27,9 +29,17 @@
+ #endif
+ 
+ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
++REXCVAR_DEFINE_BOOL(mnk_ignore_focus, false, "Input",
++                    "Read keyboard/mouse even when the window isn't focused "
++                    "(for remote desktop / headless, where focus events are unreliable)");
  REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
  REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
      .range(0.01, 10.0);
@@ -886,7 +892,7 @@ index b8eae3c..f06bb1e 100644
  
  REXCVAR_DEFINE_STRING(keybind_a, "Space", "Input/Keybinds/Controller", "A button");
  REXCVAR_DEFINE_STRING(keybind_b, "Shift", "Input/Keybinds/Controller", "B button");
-@@ -140,6 +147,88 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+@@ -140,9 +150,91 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
      return X_ERROR_DEVICE_NOT_CONNECTED;
    }
  
@@ -974,8 +980,44 @@ index b8eae3c..f06bb1e 100644
 +
    UpdateMouseCapture();
  
-   if (!is_active() || !has_focus_) {
-@@ -278,7 +367,11 @@ void MnkInputDriver::UpdateMouseCapture() {
+-  if (!is_active() || !has_focus_) {
++  if (!is_active() || (!has_focus_ && !REXCVAR_GET(mnk_ignore_focus))) {
+     if (out_state) {
+       std::memset(out_state, 0, sizeof(*out_state));
+       out_state->packet_number = packet_number_;
+@@ -209,6 +301,31 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
+   };
+ 
++  // [recomp-fix] Feed the keystroke queue from REAL keyboard/mouse button edges, so
++  // menus/title that poll XamInputGetKeystroke (not just GetState) respond to the
++  // keyboard. Previously only the focus-free inject paths did this, so real keyboard
++  // set the button state but never enqueued keystrokes (menus ignored it). We already
++  // hold state_mutex_ here, and EnqueueKeystroke does not self-lock.
++  {
++    static uint16_t s_last_kb_buttons = 0;
++    if (buttons != s_last_kb_buttons) {
++      auto vkfor = [](uint16_t m) -> uint16_t {
++        if (m & 0x0010) return 0x5814;  // START
++        if (m & 0x0020) return 0x5815;  // BACK
++        if (m & 0x1000) return 0x5800;  // A
++        if (m & 0x2000) return 0x5801;  // B
++        if (m & 0x0001) return 0x5810;  // DPAD_UP
++        if (m & 0x0002) return 0x5811;  // DPAD_DOWN
++        if (m & 0x0004) return 0x5812;  // DPAD_LEFT
++        if (m & 0x0008) return 0x5813;  // DPAD_RIGHT
++        return 0;
++      };
++      uint16_t v = vkfor(static_cast<uint16_t>(buttons | s_last_kb_buttons));
++      if (v) EnqueueKeystroke(v, buttons != 0);
++      s_last_kb_buttons = buttons;
++    }
++  }
++
+   packet_number_++;
+ 
+   if (out_state) {
+@@ -278,7 +395,11 @@ void MnkInputDriver::UpdateMouseCapture() {
    if (!attached_window_)
      return;
  
@@ -988,6 +1030,44 @@ index b8eae3c..f06bb1e 100644
  
    if (should_capture && !mouse_captured_) {
      mouse_captured_ = true;
+@@ -306,7 +427,18 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+ }
+ 
+ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  // [mnk-key-diag] Capped log to diagnose "keyboard not reaching the game": if these
++  // lines appear when you press keys, the key reached the mnk driver (check focus/
++  // active); if none appear, the key never reached mnk (consumed earlier / not
++  // delivered). Remove once keyboard input is confirmed.
++  static int s_mnk_diag = 0;
++  if (s_mnk_diag < 24) {
++    ++s_mnk_diag;
++    REXLOG_INFO("[mnk-key] vk=0x{:X} enabled={} focus={} active={} ignore_focus={}",
++                static_cast<int>(e.virtual_key()), IsEnabled(), has_focus_, is_active(),
++                static_cast<bool>(REXCVAR_GET(mnk_ignore_focus)));
++  }
++  if (!IsEnabled() || (!has_focus_ && !REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   std::lock_guard lock(state_mutex_);
+   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+@@ -322,7 +454,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || (!has_focus_ && !REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   std::lock_guard lock(state_mutex_);
+   switch (e.button()) {
+@@ -360,7 +492,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || (!has_focus_ && !REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   std::lock_guard lock(state_mutex_);
+   int32_t x = e.x();
 diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
 index 99ea636..6ca70a2 100644
 --- a/src/kernel/CMakeLists.txt

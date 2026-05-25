@@ -161,6 +161,7 @@ const std::vector<SettingDef>& ManagedSettings() {
       // Launcher behavior
       {"auto_dlc", CvarType::Bool},
       {"autofire", CvarType::Bool},
+      {"mnk_ignore_focus", CvarType::Bool},
   };
   return kSettings;
 }

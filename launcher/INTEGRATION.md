@@ -68,6 +68,7 @@ Pass as `--name=value` (or `--name value`). Booleans accept `true`/`false`/`1`/`
 | `fullscreen` | bool | `false` | Start fullscreen *(applies next launch)* |
 | `vsync` | bool | `true` | Vertical sync |
 | `mnk_mode` | bool | `true`¹ | Use keyboard & mouse as a controller |
+| `mnk_ignore_focus` | bool | `false` | Read keyboard/mouse even when the window isn't focused (remote desktop / headless, where focus events can be unreliable) |
 | `audio_mute` | bool | `false` | Mute audio |
 | `always_win` | bool | `false` | Invincibility — your base can't be destroyed |
 | `autofire` | bool | `false` | Auto-repeat (turbo) the snowball/throw button while held. Tunable: `autofire_rate` (presses/sec, default 12) and `autofire_buttons` (mask, default `0x1000` = A) |

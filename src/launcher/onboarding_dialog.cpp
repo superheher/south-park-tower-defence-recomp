@@ -244,6 +244,7 @@ void DrawSettingsControls(const std::filesystem::path& user_data_root, const std
   }
   BoolCvar("Fullscreen", "fullscreen");
   BoolCvar("Use keyboard & mouse as a controller", "mnk_mode");
+  BoolCvar("Keyboard works without window focus (remote desktop)", "mnk_ignore_focus");
   BoolCvar("Mute audio", "audio_mute");
   BoolCvar("Invincibility (your base can't be destroyed)", "always_win");
   BoolCvar("Auto-fire snowballs (hold the throw button)", "autofire");
