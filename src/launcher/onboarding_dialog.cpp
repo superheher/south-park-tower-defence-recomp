@@ -99,6 +99,11 @@ OnboardingDialog::OnboardingDialog(rex::ui::ImGuiDrawer* drawer, std::string ini
 
 void OnboardingDialog::OnShow() {}
 
+void OnboardingDialog::SetPath(const std::string& path) {
+  std::snprintf(path_buf_, sizeof(path_buf_), "%s", path.c_str());
+  browser_open_ = false;  // a path was provided; no need for the browser
+}
+
 unsigned OnboardingDialog::ReadPadEdges() {
   unsigned mask = ReadPadMask();
   ImGuiIO& io = GetIO();
@@ -236,11 +241,11 @@ void OnboardingDialog::OnDraw(ImGuiIO& io) {
                            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
   if (ImGui::Begin("Set up South Park: Let's Go Tower Defense", nullptr, flags)) {
     ImGui::TextWrapped(
-        "Welcome! Point the engine at YOUR own copy of the game. You can pick the "
-        "STFS package file (your Xbox 360 console dump), an extracted-files folder, "
-        "or just ANY folder that contains it - setup finds the game inside "
-        "automatically (and skips DLC). Nothing is downloaded; your copy never "
-        "leaves this machine.");
+        "Welcome! Point the engine at YOUR own copy of the game - or just "
+        "DRAG-AND-DROP it onto this window. You can give the STFS package file (your "
+        "Xbox 360 console dump), an extracted-files folder, or ANY folder that "
+        "contains it - setup finds the game inside automatically (and skips DLC). "
+        "Nothing is downloaded; your copy never leaves this machine.");
     ImGui::Spacing();
 
     ImGui::TextUnformatted("Game location:");

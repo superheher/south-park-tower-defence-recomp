@@ -15,6 +15,7 @@
 #include <rex/rex_app.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_manager.h>
+#include <rex/ui/ui_event.h>
 
 #include "launcher/launcher.h"
 #include "launcher/onboarding_dialog.h"
@@ -60,10 +61,13 @@ class SouthParkTdApp : public rex::ReXApp {
       return defaults;  // launch immediately
     }
 
-    // Show the onboarding wizard (self-owned; deletes itself on close).
-    new splaunch::OnboardingDialog(
+    // Show the onboarding wizard (self-owned; deletes itself on close). We keep a
+    // raw pointer only to route window file-drops into it; both close paths null
+    // it before it self-deletes.
+    onboarding_ = new splaunch::OnboardingDialog(
         imgui_drawer(), defaults.game_data_root.string(),
         [this, defaults, resume](std::string game_path) {
+          onboarding_ = nullptr;
           // Persist the chosen game + the settings the user reviewed in the wizard.
           splaunch::SaveGameAndSettings(game_path);
           rex::PathConfig pc = defaults;
@@ -71,8 +75,18 @@ class SouthParkTdApp : public rex::ReXApp {
           // Defer so ConstructRuntime does not run inside the ImGui draw loop.
           app_context().CallInUIThreadDeferred([resume, pc]() { resume(pc); });
         },
-        [this]() { app_context().QuitFromUIThread(); });
+        [this]() {
+          onboarding_ = nullptr;
+          app_context().QuitFromUIThread();
+        });
     return std::nullopt;  // async: wizard drives the resume
+  }
+
+  // Drag-and-drop: dropping a dump file/folder onto the window during onboarding
+  // fills the wizard's path (which then auto-validates). The engine already
+  // accepts drops (Win32 WM_DROPFILES -> OnFileDrop); we just consume it here.
+  void OnFileDrop(rex::ui::FileDropEvent& e) override {
+    if (onboarding_) onboarding_->SetPath(e.filename().string());
   }
 
   // After the XEX is loaded (title_id known, content manager up) but before the
@@ -102,5 +116,6 @@ class SouthParkTdApp : public rex::ReXApp {
   // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}  // M5 settings
 
  private:
-  splaunch::BootstrapResult bootstrap_;  // result of the early bootstrap
+  splaunch::BootstrapResult bootstrap_;          // result of the early bootstrap
+  splaunch::OnboardingDialog* onboarding_ = nullptr;  // open wizard (for file-drop), else null
 };

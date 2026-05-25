@@ -19,9 +19,11 @@ the *same* engine without the UI. "Combined by default, separable by contract."
 ## 1. For players (zero command line)
 
 1. Run `south_park_td.exe`.
-2. On first run, the onboarding wizard appears. Point it at your game:
-   - type/paste the path, **or** use **Browse…** (an in-engine file browser), and
-   - pick either the **STFS package file** or the **extracted folder**.
+2. On first run, the onboarding wizard appears. Point it at your game by any of:
+   - **drag-and-drop** the file or folder onto the window (Windows), **or**
+   - type/paste the path, **or** use **Browse…** (an in-engine file browser);
+   - you can give the **STFS package file**, an **extracted folder**, or **any
+     parent folder** that contains it (setup finds the game inside, and skips DLC).
 3. The wizard validates it (shows the title and title ID), tweak any settings, then
    **Play**. Your choice is remembered; next launch goes straight into the game.
 

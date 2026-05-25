@@ -30,6 +30,10 @@ class OnboardingDialog : public rex::ui::ImGuiDialog {
   OnboardingDialog(rex::ui::ImGuiDrawer* drawer, std::string initial_path,
                    std::function<void(std::string)> on_play, std::function<void()> on_quit);
 
+  // Set the game-location path externally (e.g. from a window file-drop). The
+  // next frame re-validates it. Closes the in-ImGui browser if open.
+  void SetPath(const std::string& path);
+
  protected:
   void OnShow() override;
   void OnDraw(ImGuiIO& io) override;
