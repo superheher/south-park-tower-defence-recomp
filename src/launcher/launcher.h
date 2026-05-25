@@ -1,0 +1,102 @@
+// south_park_td — in-engine launcher / onboarding (the "bootstrap brain")
+//
+// This module is the separable contract layer described in launcher/INTEGRATION.md:
+//   * cvars are the public API (game_data_root, license_mask, window_*, ... ).
+//   * a per-user config file (per-OS user dir) persists the last game + settings.
+//   * resolution priority is CLI > config > onboarding.
+//
+// It lives in the freely-editable app (NOT rexglue) and drives the engine purely
+// through public SDK seams (cvars + ReXApp hooks), so an external frontend can do
+// the exact same thing via flags + --validate without any of this code.
+
+#pragma once
+
+#include <filesystem>
+#include <map>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace splaunch {
+
+// ---------------------------------------------------------------------------
+// Per-OS user paths
+// ---------------------------------------------------------------------------
+
+// Directory for launcher config/state. Created on demand by SaveConfig().
+//   Windows : %LOCALAPPDATA%\SouthParkTD
+//   macOS   : ~/Library/Application Support/SouthParkTD
+//   Linux   : $XDG_CONFIG_HOME/SouthParkTD  (or ~/.config/SouthParkTD)
+std::filesystem::path ConfigDir();
+
+// The launcher config file: ConfigDir() / "launcher.toml".
+std::filesystem::path ConfigFile();
+
+// True if the process command line contains --<name> or --<name>=...
+// Used to honor CLI > config: a setting present on the CLI is never overwritten
+// by the saved config. Cross-platform (Win32 GetCommandLineW / Linux
+// /proc/self/cmdline / macOS _NSGetArgv); returns false if it cannot be read.
+bool CliHasFlag(std::string_view name);
+
+// ---------------------------------------------------------------------------
+// Settings the launcher manages (cvar name + value type for round-tripping)
+// ---------------------------------------------------------------------------
+
+enum class CvarType { Bool, Int, UInt, Str };
+
+struct SettingDef {
+  const char* name;
+  CvarType type;
+};
+
+// The canonical set of cvars the launcher persists and exposes in its UI.
+// (Online co-op cvars are intentionally excluded — that feature is paused.)
+const std::vector<SettingDef>& ManagedSettings();
+
+// Launcher-preferred default values (cvar name -> string value), applied as the
+// base layer beneath config and CLI. These are the "sensible defaults" so a
+// fresh config-driven launch is full-version, sensibly windowed, no arcade logo.
+const std::map<std::string, std::string>& LauncherDefaults();
+
+// Read the current value of a managed cvar as a string (type-aware).
+std::string CvarValueAsString(const SettingDef& def);
+
+// Apply a value to a cvar by name (thin wrapper over rex::cvar::SetFlagByName).
+bool ApplyCvar(std::string_view name, std::string_view value);
+
+// ---------------------------------------------------------------------------
+// Config model
+// ---------------------------------------------------------------------------
+
+constexpr int kSchemaVersion = 1;
+
+struct Config {
+  int schema_version = kSchemaVersion;
+  std::string game_path;                        // last selected game source (folder OR STFS file)
+  std::map<std::string, std::string> settings;  // cvar name -> value (strings)
+  bool exists = false;                          // a config file was found + parsed
+};
+
+// Load from ConfigFile(). exists=false (and defaults) if no file / parse error.
+Config LoadConfig();
+
+// Write atomically to ConfigFile() (creates ConfigDir()). Returns success.
+bool SaveConfig(const Config& cfg);
+
+// ---------------------------------------------------------------------------
+// Bootstrap resolution (the "brain")
+// ---------------------------------------------------------------------------
+
+// Resolve the game source + apply settings, with priority CLI > config > none:
+//   1. apply LauncherDefaults() to cvars (skipping any flag present on the CLI),
+//   2. apply the saved config's settings (also skipping CLI flags),
+//   3. pick the game source: `cli_game_path` if non-empty, else the saved game,
+//   4. if resolved, persist the game path + any settings explicitly set on the
+//      CLI this run (so one-off CLI overrides are remembered, defaults are not
+//      frozen).
+// Returns the resolved game source path (empty string if still unresolved, in
+// which case onboarding should run).
+std::string ResolveAndPersist(const std::string& cli_game_path);
+
+}  // namespace splaunch

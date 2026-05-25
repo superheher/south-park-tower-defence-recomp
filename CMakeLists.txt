@@ -14,6 +14,7 @@ include(generated/rexglue.cmake)
 set(SOUTHPARKTD_SOURCES
     src/main.cpp
     src/stubs.cpp
+    src/launcher/launcher.cpp
 )
 
 if(WIN32)
