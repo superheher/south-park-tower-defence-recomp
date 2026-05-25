@@ -19,7 +19,9 @@ the *same* engine without the UI. "Combined by default, separable by contract."
 ## 1. For players (zero command line)
 
 1. Run `south_park_td.exe`.
-2. On first run, the onboarding wizard appears. Point it at your game by any of:
+2. On first run, the onboarding wizard appears (it also **auto-scans the launcher's
+   own folder** — if your dump sits next to the exe or in a subfolder, it is
+   pre-filled for you). Otherwise point it at your game by any of:
    - **drag-and-drop** the file or folder onto the window (Windows), **or**
    - type/paste the path, **or** use **Browse…** (an in-engine file browser);
    - you can give the **STFS package file**, an **extracted folder**, or **any

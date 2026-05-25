@@ -134,6 +134,11 @@ std::string ResolveGameSource(const std::filesystem::path& input);
 // window). Resolves `path` first (see ResolveGameSource), so a folder is fine.
 ValidateResult Validate(const std::filesystem::path& path);
 
+// First-run convenience: scan the executable's own folder (recursively, bounded)
+// for a game and return the resolved source, or "" if none. Lets a user just
+// drop their dump next to the launcher and have onboarding pre-fill it.
+std::string AutoDetectGameNearExe();
+
 // ---------------------------------------------------------------------------
 // DLC / add-on content
 // ---------------------------------------------------------------------------

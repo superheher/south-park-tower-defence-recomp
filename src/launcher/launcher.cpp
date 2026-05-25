@@ -552,6 +552,12 @@ std::vector<std::string> CollectDlc(const std::filesystem::path& game_source) {
   return dlc;
 }
 
+std::string AutoDetectGameNearExe() {
+  auto dir = rex::filesystem::GetExecutableFolder();
+  if (dir.empty()) return "";
+  return ResolveGameSource(dir);  // bounded recursive scan of the exe's folder
+}
+
 bool IsDlcInstalled(const std::filesystem::path& user_data_root, uint32_t title_id,
                     const std::filesystem::path& dlc_package) {
   char tid[16];

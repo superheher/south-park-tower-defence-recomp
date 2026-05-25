@@ -61,11 +61,16 @@ class SouthParkTdApp : public rex::ReXApp {
       return defaults;  // launch immediately
     }
 
+    // First-run convenience: if we have no path yet, scan the launcher's own
+    // folder for a dump the user dropped next to it and pre-fill it.
+    std::string initial = defaults.game_data_root.string();
+    if (initial.empty()) initial = splaunch::AutoDetectGameNearExe();
+
     // Show the onboarding wizard (self-owned; deletes itself on close). We keep a
     // raw pointer only to route window file-drops into it; both close paths null
     // it before it self-deletes.
     onboarding_ = new splaunch::OnboardingDialog(
-        imgui_drawer(), defaults.game_data_root.string(),
+        imgui_drawer(), initial,
         [this, defaults, resume](std::string game_path) {
           onboarding_ = nullptr;
           // Persist the chosen game + the settings the user reviewed in the wizard.
