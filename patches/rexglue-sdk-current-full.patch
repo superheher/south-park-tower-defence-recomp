@@ -1868,7 +1868,7 @@ index 0000000..cc14019
 +}  // namespace system
 +}  // namespace rex
 diff --git a/src/kernel/xam/xam_input.cpp b/src/kernel/xam/xam_input.cpp
-index 80c3634..f7f1ddb 100644
+index 80c3634..1233ad5 100644
 --- a/src/kernel/xam/xam_input.cpp
 +++ b/src/kernel/xam/xam_input.cpp
 @@ -9,6 +9,7 @@
@@ -1892,7 +1892,7 @@ index 80c3634..f7f1ddb 100644
 +// repeated throws. Gated; default off (offline input unchanged).
 +REXCVAR_DEFINE_BOOL(autofire, false, "Input",
 +                    "Auto-repeat (turbo) the snowball/throw button while held");
-+REXCVAR_DEFINE_INT32(autofire_rate, 12, "Input", "Auto-fire presses per second")
++REXCVAR_DEFINE_INT32(autofire_rate, 20, "Input", "Auto-fire presses per second")
 +    .range(1, 30);
 +REXCVAR_DEFINE_UINT32(autofire_buttons, 0x1000, "Input",
 +                      "Button mask to auto-fire (default 0x1000 = A)");

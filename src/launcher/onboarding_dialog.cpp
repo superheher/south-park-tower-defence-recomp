@@ -248,6 +248,13 @@ void DrawSettingsControls(const std::filesystem::path& user_data_root, const std
   BoolCvar("Mute audio", "audio_mute");
   BoolCvar("Invincibility (your base can't be destroyed)", "always_win");
   BoolCvar("Auto-fire snowballs (hold the throw button)", "autofire");
+  if (rex::cvar::Query<bool>("autofire")) {
+    int ar = rex::cvar::Query<int32_t>("autofire_rate");
+    ar = ar < 4 ? 4 : (ar > 30 ? 30 : ar);
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::SliderInt("Auto-fire speed", &ar, 4, 30, "%d/sec"))
+      ApplyCvar("autofire_rate", std::to_string(ar));
+  }
   BoolCvar("Auto-install DLC found next to the game", "auto_dlc");
 
   ImGui::Separator();

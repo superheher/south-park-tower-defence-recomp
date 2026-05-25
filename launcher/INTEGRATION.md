@@ -71,7 +71,7 @@ Pass as `--name=value` (or `--name value`). Booleans accept `true`/`false`/`1`/`
 | `mnk_ignore_focus` | bool | `false` | Read keyboard/mouse even when the window isn't focused (remote desktop / headless, where focus events can be unreliable) |
 | `audio_mute` | bool | `false` | Mute audio |
 | `always_win` | bool | `false` | Invincibility — your base can't be destroyed |
-| `autofire` | bool | `false` | Auto-repeat (turbo) the snowball/throw button while held. Tunable: `autofire_rate` (presses/sec, default 12) and `autofire_buttons` (mask, default `0x1000` = A) |
+| `autofire` | bool | `false` | Auto-repeat (turbo) the snowball/throw button while held. Tunable: `autofire_rate` (presses/sec, default `20`, range 1–30 — a live slider appears in the settings UI when auto-fire is on) and `autofire_buttons` (mask, default `0x1000` = A) |
 | `skip_arcade_logo` | bool | `true`¹ | Skip the XBLA arcade splash |
 | `window_icon` | path | *bundled icon*¹ | `.ico` for the window/taskbar |
 
