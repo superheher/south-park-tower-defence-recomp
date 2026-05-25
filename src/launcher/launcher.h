@@ -88,6 +88,10 @@ bool SaveConfig(const Config& cfg);
 // Used by the onboarding wizard when the user confirms a game.
 bool SaveGamePath(const std::string& game_path);
 
+// Persist a chosen game source path AND the current values of every managed
+// setting (the user has reviewed them in the wizard, so their choices win).
+bool SaveGameAndSettings(const std::string& game_path);
+
 // ---------------------------------------------------------------------------
 // Bootstrap resolution (the "brain")
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 #include "launcher/launcher.h"
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>  // GetExecutableFolder
 #include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/filesystem/devices/stfs_xbox.h>
 
@@ -280,12 +281,27 @@ bool SaveGamePath(const std::string& game_path) {
   return SaveConfig(c);
 }
 
+bool SaveGameAndSettings(const std::string& game_path) {
+  Config c = LoadConfig();
+  c.schema_version = kSchemaVersion;
+  c.game_path = game_path;
+  for (const auto& def : ManagedSettings()) c.settings[def.name] = CvarValueAsString(def);
+  return SaveConfig(c);
+}
+
 std::string ResolveAndPersist(const std::string& cli_game_path) {
   Config cfg = LoadConfig();
 
   // Layer 1: launcher default values (beneath config and CLI).
   for (const auto& [name, value] : LauncherDefaults()) {
     if (!CliHasFlag(name)) ApplyCvar(name, value);
+  }
+  // Dynamic default: the bundled window icon next to the exe (if present and not
+  // overridden by CLI or config). Set before the config layer so config wins.
+  if (!CliHasFlag("window_icon") && rex::cvar::Query<std::string>("window_icon").empty()) {
+    std::error_code ec;
+    auto ico = rex::filesystem::GetExecutableFolder() / "SouthPark.ico";
+    if (std::filesystem::exists(ico, ec)) ApplyCvar("window_icon", ico.string());
   }
   // Layer 2: saved config settings (override defaults, lose to CLI).
   for (const auto& [name, value] : cfg.settings) {

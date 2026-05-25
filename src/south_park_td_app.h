@@ -60,7 +60,8 @@ class SouthParkTdApp : public rex::ReXApp {
     new splaunch::OnboardingDialog(
         imgui_drawer(), defaults.game_data_root.string(),
         [this, defaults, resume](std::string game_path) {
-          splaunch::SaveGamePath(game_path);
+          // Persist the chosen game + the settings the user reviewed in the wizard.
+          splaunch::SaveGameAndSettings(game_path);
           rex::PathConfig pc = defaults;
           pc.game_data_root = std::filesystem::path(game_path);
           // Defer so ConstructRuntime does not run inside the ImGui draw loop.

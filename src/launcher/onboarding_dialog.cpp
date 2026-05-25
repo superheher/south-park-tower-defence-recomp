@@ -7,11 +7,14 @@
 #include "launcher/onboarding_dialog.h"
 
 #include <imgui.h>
+#include <rex/cvar.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <system_error>
 
 #include "launcher/launcher.h"
@@ -267,6 +270,38 @@ void OnboardingDialog::OnDraw(ImGuiIO& io) {
     }
 
     if (browser_open_) DrawBrowser(io);
+
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader("Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+      auto BoolCvar = [](const char* label, const char* name) {
+        bool b = rex::cvar::Query<bool>(name);
+        if (ImGui::Checkbox(label, &b)) ApplyCvar(name, b ? "true" : "false");
+      };
+      {
+        bool full = rex::cvar::Query<uint32_t>("license_mask") != 0;
+        if (ImGui::Checkbox("Full version (unlock everything; saves progress)", &full))
+          ApplyCvar("license_mask", full ? "1" : "0");
+      }
+      BoolCvar("Fullscreen", "fullscreen");
+      BoolCvar("Use keyboard & mouse as a controller", "mnk_mode");
+      BoolCvar("Mute audio", "audio_mute");
+      BoolCvar("Invincibility (your base can't be destroyed)", "always_win");
+
+      if (ImGui::TreeNode("Advanced")) {
+        BoolCvar("Skip arcade logo", "skip_arcade_logo");
+        BoolCvar("VSync", "vsync");
+        int w = rex::cvar::Query<int32_t>("window_width");
+        ImGui::SetNextItemWidth(160);
+        if (ImGui::InputInt("Window width", &w)) ApplyCvar("window_width", std::to_string(w));
+        int h = rex::cvar::Query<int32_t>("window_height");
+        ImGui::SetNextItemWidth(160);
+        if (ImGui::InputInt("Window height", &h)) ApplyCvar("window_height", std::to_string(h));
+        ImGui::TextDisabled("Window size / fullscreen take effect on the next launch.");
+        ImGui::TreePop();
+      }
+      ImGui::TextDisabled("Saved when you press Play. Re-run with --setup to change later.");
+    }
+    // Online co-op is intentionally not exposed here (that feature is paused).
 
     ImGui::Separator();
     const bool can_play = result_ok_;
