@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <rex/rex_app.h>
 
 #include "launcher/launcher.h"
@@ -19,20 +21,24 @@ class SouthParkTdApp : public rex::ReXApp {
   }
 
  protected:
-  // Bootstrap brain: apply launcher defaults + saved per-user config (CLI wins),
-  // and resolve the game source by priority CLI > config > onboarding. Runs early
+  // Bootstrap brain: handle the CLI contract modes (--validate / --no_setup) and
+  // resolve the game source by priority CLI > config > onboarding. Runs early
   // (before the window) so settings cvars are in place when the window/runtime
-  // read them. If still unresolved here, the onboarding wizard (OnFinalizePaths)
-  // takes over.
+  // read them. The action is remembered for OnFinalizePaths (M4 onboarding).
   void OnConfigurePaths(rex::PathConfig& paths) override {
-    std::string cli_game = paths.game_data_root.string();
-    std::string resolved = splaunch::ResolveAndPersist(cli_game);
-    if (!resolved.empty()) {
-      paths.game_data_root = std::filesystem::path(resolved);
+    bootstrap_ = splaunch::Bootstrap(paths.game_data_root.string());
+    if (bootstrap_.action == splaunch::BootstrapAction::kExit) {
+      std::exit(bootstrap_.exit_code);  // --validate / --no_setup-unresolved
+    }
+    if (!bootstrap_.game_path.empty()) {
+      paths.game_data_root = std::filesystem::path(bootstrap_.game_path);
     }
   }
 
-  // Other hooks available for later milestones:
+  // Other hooks for later milestones:
   // std::optional<rex::PathConfig> OnFinalizePaths(...) override;  // M4 onboarding
   // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}  // M5 settings
+
+ private:
+  splaunch::BootstrapResult bootstrap_;  // result of the early bootstrap (for M4)
 };

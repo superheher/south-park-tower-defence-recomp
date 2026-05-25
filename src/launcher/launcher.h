@@ -99,4 +99,44 @@ bool SaveConfig(const Config& cfg);
 // which case onboarding should run).
 std::string ResolveAndPersist(const std::string& cli_game_path);
 
+// ---------------------------------------------------------------------------
+// Validation (the engine IS the contract — frontends reuse this via --validate)
+// ---------------------------------------------------------------------------
+
+struct ValidateResult {
+  bool ok = false;
+  std::string title;     // human-readable title (may be empty)
+  std::string title_id;  // 8 hex digits, e.g. "58410931" (empty for folders)
+  std::string reason;    // failure reason (empty on success)
+};
+
+// Validate a game source (STFS package file OR extracted folder) using the
+// engine's OWN StfsContainerDevice::ReadPackageHeader — no mount, no window.
+ValidateResult Validate(const std::filesystem::path& path);
+
+// Serialize a ValidateResult as one line of JSON: {"ok":...,"title":...,
+// "titleID":...,"reason":...}.
+std::string ValidateResultToJson(const ValidateResult& r);
+
+// ---------------------------------------------------------------------------
+// Bootstrap entry — called once, early (before window/runtime). Handles the
+// CLI contract modes and resolves the game source.
+// ---------------------------------------------------------------------------
+
+enum class BootstrapAction {
+  kLaunch,   // proceed; game_path is the resolved source ("" => run onboarding)
+  kShowUI,   // force the onboarding wizard (game_path may be a current guess)
+  kExit,     // stop now with exit_code (e.g. --validate, or --no_setup unresolved)
+};
+
+struct BootstrapResult {
+  BootstrapAction action = BootstrapAction::kLaunch;
+  int exit_code = 0;
+  std::string game_path;  // resolved source path (may be empty)
+};
+
+// Process --validate / --setup / --no_setup|--embedded and CLI>config>none game
+// resolution. `cli_game_path` is the game_data_root cvar value (CLI, may be "").
+BootstrapResult Bootstrap(const std::string& cli_game_path);
+
 }  // namespace splaunch

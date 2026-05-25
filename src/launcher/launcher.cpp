@@ -7,10 +7,13 @@
 #include "launcher/launcher.h"
 
 #include <rex/cvar.h>
+#include <rex/filesystem/devices/stfs_container_device.h>
+#include <rex/filesystem/devices/stfs_xbox.h>
 
 #include <toml++/toml.hpp>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <system_error>
@@ -25,6 +28,16 @@
 #elif defined(__APPLE__)
 #include <crt_externs.h>  // _NSGetArgv / _NSGetArgc
 #endif
+
+// Launcher contract cvars. Defined here (file scope) so their registrars run
+// before cvar::Init parses the command line — otherwise CLI11 rejects the flags.
+REXCVAR_DEFINE_STRING(validate, "", "Launcher",
+                      "Validate a game source path; print JSON {ok,title,titleID,reason} and exit");
+REXCVAR_DEFINE_BOOL(setup, false, "Launcher",
+                    "Force the onboarding wizard even if a game is already configured");
+REXCVAR_DEFINE_BOOL(no_setup, false, "Launcher",
+                    "Never show onboarding UI; exit 64 if no game is configured (embedded use)");
+REXCVAR_DEFINE_BOOL(embedded, false, "Launcher", "Alias of --no_setup (for frontends)");
 
 namespace splaunch {
 
@@ -287,6 +300,171 @@ std::string ResolveAndPersist(const std::string& cli_game_path) {
     SaveConfig(out);
   }
   return resolved;
+}
+
+namespace {
+
+std::string Utf16ToUtf8(const std::u16string& in) {
+  std::string out;
+  out.reserve(in.size());
+  for (size_t i = 0; i < in.size(); ++i) {
+    uint32_t cp = in[i];
+    if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < in.size()) {
+      uint32_t lo = in[i + 1];
+      if (lo >= 0xDC00 && lo <= 0xDFFF) {
+        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+        ++i;
+      }
+    }
+    if (cp == 0) break;  // stop at NUL (title_name field is NUL-padded)
+    if (cp < 0x80) {
+      out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+      out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+      out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+      out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+      out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+  }
+  return out;
+}
+
+std::string JsonEscape(const std::string& s) {
+  std::string o;
+  for (char c : s) {
+    switch (c) {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof buf, "\\u%04x", c & 0xFF);
+          o += buf;
+        } else {
+          o += c;
+        }
+    }
+  }
+  return o;
+}
+
+// Write one line to stdout in a way that works for a Windows GUI-subsystem exe:
+// honor an inherited/redirected handle (frontend pipe) and, failing that, attach
+// to the parent console (interactive terminal). POSIX: plain stdout.
+void WriteStdoutLine(const std::string& s) {
+  std::string line = s;
+  line.push_back('\n');
+#if defined(_WIN32)
+  HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (!h || h == INVALID_HANDLE_VALUE) {
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) h = GetStdHandle(STD_OUTPUT_HANDLE);
+  }
+  if (h && h != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+  }
+#else
+  std::fwrite(line.data(), 1, line.size(), stdout);
+  std::fflush(stdout);
+#endif
+}
+
+}  // namespace
+
+ValidateResult Validate(const std::filesystem::path& path) {
+  ValidateResult r;
+  std::error_code ec;
+  if (path.empty()) {
+    r.reason = "no path given";
+    return r;
+  }
+  if (!std::filesystem::exists(path, ec)) {
+    r.reason = "path does not exist";
+    return r;
+  }
+  if (std::filesystem::is_directory(path, ec)) {
+    // Extracted folder: valid iff it contains default.xex.
+    if (std::filesystem::is_regular_file(path / "default.xex", ec)) {
+      r.ok = true;
+      r.title = "(extracted folder)";
+    } else {
+      r.reason = "folder has no default.xex";
+    }
+    return r;
+  }
+  // A file: read it as an STFS/SVOD package via the engine's own device.
+  auto hdr = rex::filesystem::StfsContainerDevice::ReadPackageHeader(path);
+  if (!hdr) {
+    r.reason = "not a valid STFS/SVOD package";
+    return r;
+  }
+  // Prefer the fuller English display name; fall back to the short title_name.
+  r.title = Utf16ToUtf8(hdr->metadata.display_name(rex::system::XLanguage::kEnglish));
+  if (r.title.empty()) r.title = Utf16ToUtf8(hdr->metadata.title_name());
+  uint32_t tid = hdr->metadata.execution_info.title_id;
+  char buf[16];
+  std::snprintf(buf, sizeof buf, "%08X", tid);
+  r.title_id = buf;
+  r.ok = true;
+  return r;
+}
+
+std::string ValidateResultToJson(const ValidateResult& r) {
+  std::string j = "{";
+  j += "\"ok\":";
+  j += (r.ok ? "true" : "false");
+  j += ",\"title\":\"" + JsonEscape(r.title) + "\"";
+  j += ",\"titleID\":\"" + JsonEscape(r.title_id) + "\"";
+  j += ",\"reason\":\"" + JsonEscape(r.reason) + "\"";
+  j += "}";
+  return j;
+}
+
+BootstrapResult Bootstrap(const std::string& cli_game_path) {
+  BootstrapResult res;
+
+  // --validate <path>: headless validate, print JSON to stdout, exit.
+  std::string vpath = rex::cvar::Query<std::string>("validate");
+  if (!vpath.empty()) {
+    ValidateResult vr = Validate(vpath);
+    WriteStdoutLine(ValidateResultToJson(vr));
+    res.action = BootstrapAction::kExit;
+    res.exit_code = vr.ok ? 0 : 65;  // 0 = ok; 65 = EX_DATAERR (invalid input)
+    return res;
+  }
+
+  // Resolve the game source + apply settings (CLI > config > none) and persist.
+  std::string resolved = ResolveAndPersist(cli_game_path);
+  res.game_path = resolved;
+
+  const bool embedded = rex::cvar::Query<bool>("no_setup") ||
+                        rex::cvar::Query<bool>("embedded") || CliHasFlag("no-setup");
+  const bool force_setup = rex::cvar::Query<bool>("setup") || CliHasFlag("setup");
+
+  if (force_setup) {
+    res.action = BootstrapAction::kShowUI;  // onboarding even if already resolved (M4)
+    return res;
+  }
+  if (resolved.empty() && embedded) {
+    // Embedded/--no_setup with nothing to launch: fail with EX_USAGE.
+    std::fprintf(stderr, "south_park_td: no game configured and --no_setup set.\n");
+    res.action = BootstrapAction::kExit;
+    res.exit_code = 64;  // EX_USAGE
+    return res;
+  }
+  // resolved => launch; empty (interactive) => onboarding wizard runs (M4).
+  res.action = BootstrapAction::kLaunch;
+  return res;
 }
 
 }  // namespace splaunch
