@@ -1788,10 +1788,39 @@ index 0000000..cc14019
 +}  // namespace system
 +}  // namespace rex
 diff --git a/src/kernel/xam/xam_input.cpp b/src/kernel/xam/xam_input.cpp
-index 80c3634..92c179e 100644
+index 80c3634..f7f1ddb 100644
 --- a/src/kernel/xam/xam_input.cpp
 +++ b/src/kernel/xam/xam_input.cpp
-@@ -26,6 +26,10 @@ namespace kernel {
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/cvar.h>
+ #include <rex/input/input.h>
+ #include <rex/input/input_system.h>
+ #include <rex/kernel/xam/private.h>
+@@ -19,6 +20,20 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xtypes.h>
+ 
++#include <chrono>
++
++// [recomp: launcher autofire] Optional turbo/auto-repeat for the snowball/throw
++// button. The game throws once per A press (edge-triggered, no auto-repeat), so
++// holding A does nothing extra. With --autofire, while the masked button is held
++// we pulse it (press/release ~autofire_rate times/sec) so the game registers
++// repeated throws. Gated; default off (offline input unchanged).
++REXCVAR_DEFINE_BOOL(autofire, false, "Input",
++                    "Auto-repeat (turbo) the snowball/throw button while held");
++REXCVAR_DEFINE_INT32(autofire_rate, 12, "Input", "Auto-fire presses per second")
++    .range(1, 30);
++REXCVAR_DEFINE_UINT32(autofire_buttons, 0x1000, "Input",
++                      "Button mask to auto-fire (default 0x1000 = A)");
++
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
+ namespace rex {
+@@ -26,6 +41,10 @@ namespace kernel {
  namespace xam {
  using namespace rex::system;
  
@@ -1802,9 +1831,30 @@ index 80c3634..92c179e 100644
  using rex::input::X_INPUT_CAPABILITIES;
  using rex::input::X_INPUT_KEYSTROKE;
  using rex::input::X_INPUT_STATE;
-@@ -93,6 +97,10 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
+@@ -92,7 +111,31 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
+ }
  
  // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetstate(v=vs.85).aspx
++// While the masked button is held, blank it for the second half of each
++// 1/rate-second window so the guest sees repeated press edges (turbo).
++static void ApplyAutofire(X_INPUT_STATE* st) {
++  if (!st) return;
++  const uint16_t mask = static_cast<uint16_t>(REXCVAR_GET(autofire_buttons));
++  const uint16_t held = static_cast<uint16_t>(st->gamepad.buttons) & mask;
++  if (!held) return;
++  int rate = REXCVAR_GET(autofire_rate);
++  if (rate < 1) rate = 1;
++  const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                         std::chrono::steady_clock::now().time_since_epoch())
++                         .count();
++  const int64_t period = 1000 / rate;
++  const bool off_phase = period > 1 && (ms % period) >= (period / 2);
++  if (off_phase) {
++    st->gamepad.buttons =
++        static_cast<uint16_t>(static_cast<uint16_t>(st->gamepad.buttons) & ~held);
++  }
++}
++
  u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> input_state) {
 +  // [recomp-fix: cross-restart continue] Per-frame: keep g_slots's campaign unlock flags
 +  // at least the saved set, so the level-select shows unlocked levels after a restart.
@@ -1813,6 +1863,19 @@ index 80c3634..92c179e 100644
    // Games call this with a NULL state ptr, probably as a query.
    static int call_count = 0;
    if (++call_count <= 5) {
+@@ -112,7 +155,11 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
+   }
+ 
+   auto* is = input_system();
+-  return is->GetState(actual_user_index, input_state);
++  X_RESULT result = is->GetState(actual_user_index, input_state);
++  if (result == X_ERROR_SUCCESS && REXCVAR_GET(autofire)) {
++    ApplyAutofire(input_state);
++  }
++  return result;
+ }
+ 
+ // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
 diff --git a/src/kernel/xam/xam_msg.cpp b/src/kernel/xam/xam_msg.cpp
 index 704eb0c..292e475 100644
 --- a/src/kernel/xam/xam_msg.cpp

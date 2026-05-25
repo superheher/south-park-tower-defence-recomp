@@ -321,6 +321,7 @@ void OnboardingDialog::OnDraw(ImGuiIO& io) {
       BoolCvar("Use keyboard & mouse as a controller", "mnk_mode");
       BoolCvar("Mute audio", "audio_mute");
       BoolCvar("Invincibility (your base can't be destroyed)", "always_win");
+      BoolCvar("Auto-fire snowballs (hold the throw button)", "autofire");
       BoolCvar("Auto-install DLC found next to the game", "auto_dlc");
 
       ImGui::Separator();

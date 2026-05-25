@@ -160,6 +160,7 @@ const std::vector<SettingDef>& ManagedSettings() {
       {"present_allow_overscan_cutoff", CvarType::Bool},
       // Launcher behavior
       {"auto_dlc", CvarType::Bool},
+      {"autofire", CvarType::Bool},
   };
   return kSettings;
 }
