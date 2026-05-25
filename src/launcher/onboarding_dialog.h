@@ -50,6 +50,7 @@ class OnboardingDialog : public rex::ui::ImGuiDialog {
   std::string result_title_;
   std::string result_title_id_;
   std::string result_reason_;
+  std::string result_resolved_;      // concrete source found (may differ from input)
 
   bool browser_open_ = false;
   std::filesystem::path browse_dir_;

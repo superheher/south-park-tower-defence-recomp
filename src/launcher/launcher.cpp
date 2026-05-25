@@ -10,12 +10,14 @@
 #include <rex/filesystem.h>  // GetExecutableFolder
 #include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/filesystem/devices/stfs_xbox.h>
+#include <rex/system/xcontent.h>  // XContentType
 
 #include <toml++/toml.hpp>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <system_error>
 
@@ -308,8 +310,10 @@ std::string ResolveAndPersist(const std::string& cli_game_path) {
     if (!CliHasFlag(name)) ApplyCvar(name, value);
   }
 
-  // Resolve the game source: CLI wins, else the saved config.
-  std::string resolved = !cli_game_path.empty() ? cli_game_path : cfg.game_path;
+  // Resolve the game source: CLI wins, else the saved config; then resolve a
+  // folder/parent down to the concrete source the engine can mount in place.
+  std::string raw = !cli_game_path.empty() ? cli_game_path : cfg.game_path;
+  std::string resolved = raw.empty() ? std::string() : ResolveGameSource(raw);
 
   // Persist: remember the game + only the settings explicitly set on the CLI
   // this run (existing saved settings are preserved; defaults are NOT frozen).
@@ -402,7 +406,108 @@ void WriteStdoutLine(const std::string& s) {
 #endif
 }
 
+// True if the file starts with an STFS/SVOD package magic (CON /LIVE/PIRS).
+// Cheap (reads 4 bytes) so it is safe to call while scanning a folder.
+bool HasStfsMagic(const std::filesystem::path& p) {
+  std::ifstream f(p, std::ios::binary);
+  if (!f) return false;
+  char m[4] = {};
+  f.read(m, 4);
+  if (f.gcount() < 4) return false;
+  return std::memcmp(m, "CON ", 4) == 0 || std::memcmp(m, "LIVE", 4) == 0 ||
+         std::memcmp(m, "PIRS", 4) == 0;
+}
+
+// Read the STFS content type if `p` is a valid package (magic + header), else
+// nullopt. A folder dump can hold several packages (the game, DLC, ...), so we
+// use this to prefer the bootable game over add-ons.
+std::optional<rex::system::XContentType> StfsContentType(const std::filesystem::path& p) {
+  if (!HasStfsMagic(p)) return std::nullopt;
+  auto hdr = rex::filesystem::StfsContainerDevice::ReadPackageHeader(p);
+  if (!hdr) return std::nullopt;
+  rex::system::XContentType ct = hdr->metadata.content_type;  // be<XContentType> -> enum
+  return ct;
+}
+
+// Confirm a file really is a mountable STFS/SVOD package (magic + valid header).
+bool IsStfsPackage(const std::filesystem::path& p) { return StfsContentType(p).has_value(); }
+
+// True for content types that contain a bootable title (vs DLC / saved games /
+// avatars / themes / videos). South Park LGTDP is an XBLA kArcadeTitle.
+bool IsTitleContentType(rex::system::XContentType ct) {
+  using CT = rex::system::XContentType;
+  switch (ct) {
+    case CT::kXbox360Title:
+    case CT::kInstalledGame:
+    case CT::kXboxTitle:
+    case CT::kGamesOnDemand:
+    case CT::kGameDemo:
+    case CT::kGameTitle:
+    case CT::kArcadeTitle:
+    case CT::kCommunityGame:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// During a folder scan, only bother magic-checking files that plausibly are a
+// package: extension-less files (console dumps) or large files. Avoids reading
+// the head of every small asset.
+bool WorthMagicCheck(const std::filesystem::path& p, std::uintmax_t size) {
+  if (!p.has_extension()) return true;
+  return size >= (std::uintmax_t(8) << 20);  // >= 8 MiB
+}
+
 }  // namespace
+
+std::string ResolveGameSource(const std::filesystem::path& input) {
+  std::error_code ec;
+  if (input.empty() || !std::filesystem::exists(input, ec)) return "";
+
+  // A file: an STFS package (any name), or a default.xex (use its folder).
+  if (std::filesystem::is_regular_file(input, ec)) {
+    if (input.filename() == "default.xex") return input.parent_path().string();
+    if (IsStfsPackage(input)) return input.string();
+    return "";
+  }
+
+  if (!std::filesystem::is_directory(input, ec)) return "";
+
+  // Fast path: an extracted folder with default.xex at its root.
+  if (std::filesystem::is_regular_file(input / "default.xex", ec)) return input.string();
+
+  // Otherwise search shallowly for a default.xex or an STFS package (any name) -
+  // so pointing at a parent of a raw dump (<titleID>/000D0000/<hash>) just works.
+  // A title folder may hold several packages (game + DLC); prefer the bootable
+  // game (a title content type) and only fall back to anything else.
+  constexpr int kMaxDepth = 6;
+  constexpr int kMaxExamined = 20000;
+  int examined = 0;
+  std::string fallback;  // a non-title package (DLC, etc.): used only if no game found
+  std::filesystem::recursive_directory_iterator it(
+      input, std::filesystem::directory_options::skip_permission_denied, ec),
+      end;
+  for (; it != end; it.increment(ec)) {
+    if (ec) break;
+    if (++examined > kMaxExamined) break;
+    std::error_code ec2;
+    if (it->is_directory(ec2)) {
+      if (it.depth() >= kMaxDepth) it.disable_recursion_pending();
+      continue;
+    }
+    if (!it->is_regular_file(ec2)) continue;
+    const auto& p = it->path();
+    if (p.filename() == "default.xex") return p.parent_path().string();  // extracted game
+    auto size = it->file_size(ec2);
+    if (ec2 || !WorthMagicCheck(p, size)) continue;
+    auto ct = StfsContentType(p);
+    if (!ct) continue;
+    if (IsTitleContentType(*ct)) return p.string();  // the bootable game
+    if (fallback.empty()) fallback = p.string();     // DLC/other: remember, keep looking
+  }
+  return fallback;
+}
 
 ValidateResult Validate(const std::filesystem::path& path) {
   ValidateResult r;
@@ -415,18 +520,24 @@ ValidateResult Validate(const std::filesystem::path& path) {
     r.reason = "path does not exist";
     return r;
   }
-  if (std::filesystem::is_directory(path, ec)) {
-    // Extracted folder: valid iff it contains default.xex.
-    if (std::filesystem::is_regular_file(path / "default.xex", ec)) {
-      r.ok = true;
-      r.title = "(extracted folder)";
-    } else {
-      r.reason = "folder has no default.xex";
-    }
+  // Resolve a folder/parent down to the concrete game source it contains.
+  std::string resolved = ResolveGameSource(path);
+  if (resolved.empty()) {
+    r.reason = std::filesystem::is_directory(path, ec)
+                   ? "no game here (need default.xex or an STFS package inside)"
+                   : "not a valid game (STFS package or default.xex)";
     return r;
   }
-  // A file: read it as an STFS/SVOD package via the engine's own device.
-  auto hdr = rex::filesystem::StfsContainerDevice::ReadPackageHeader(path);
+  r.resolved = resolved;
+  std::filesystem::path rp(resolved);
+  if (std::filesystem::is_directory(rp, ec)) {
+    // Extracted folder (contains default.xex at its root).
+    r.ok = true;
+    r.title = "(extracted folder)";
+    return r;
+  }
+  // A package file: read title/titleID via the engine's own device.
+  auto hdr = rex::filesystem::StfsContainerDevice::ReadPackageHeader(rp);
   if (!hdr) {
     r.reason = "not a valid STFS/SVOD package";
     return r;
@@ -448,6 +559,7 @@ std::string ValidateResultToJson(const ValidateResult& r) {
   j += (r.ok ? "true" : "false");
   j += ",\"title\":\"" + JsonEscape(r.title) + "\"";
   j += ",\"titleID\":\"" + JsonEscape(r.title_id) + "\"";
+  j += ",\"path\":\"" + JsonEscape(r.resolved) + "\"";
   j += ",\"reason\":\"" + JsonEscape(r.reason) + "\"";
   j += "}";
   return j;

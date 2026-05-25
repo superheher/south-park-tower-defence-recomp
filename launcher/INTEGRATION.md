@@ -34,11 +34,20 @@ couch). To change your game or settings later, run with `--setup`.
 ## 2. The contract (for frontends)
 
 ### 2.1 Game source
-`--game_data_root` accepts **either**:
-- a **directory** of extracted game files (containing `default.xex`), **or**
-- a single **STFS package file** (the raw console dump).
+`--game_data_root` accepts any of these and auto-detects which (no extraction step):
+- a single **STFS package file** (the raw console dump) — **any filename**; it is
+  identified by content (the `CON `/`LIVE`/`PIRS` magic), not by name;
+- a **`default.xex`** file (its containing folder is used);
+- an **extracted folder** containing `default.xex` at its root; **or**
+- **any parent folder** of either. The launcher searches it with bounded recursion
+  (depth ≤ 6) and resolves to the game inside — so a raw dump laid out as
+  `<titleID>/000D0000/<hash>` works when you point at the title-ID folder, the
+  game's display-name folder, etc.
 
-The engine auto-detects which and mounts it in place — no extraction step.
+When a folder holds several packages (e.g. the game **and** DLC), the launcher
+prefers the **bootable title** (content types `kArcadeTitle`, `kGamesOnDemand`,
+`kInstalledGame`, …) and ignores add-ons / saved games / avatars. The concrete
+resolved path is what gets persisted and mounted (see the `path` field in §2.5).
 
 ### 2.2 cvars = the public API
 Pass as `--name=value` (or `--name value`). Booleans accept `true`/`false`/`1`/`0`.
@@ -103,14 +112,18 @@ A frontend may write this file directly instead of (or in addition to) passing f
 ```
 south_park_td --validate="/path/to/game"
 ```
-Reads the source with the engine's own STFS reader (no window, no mount) and prints
-**one line of JSON** to stdout, then exits:
+Resolves the source (a folder/parent is searched — see §2.1), reads it with the
+engine's own STFS reader (no window, no mount) and prints **one line of JSON** to
+stdout, then exits:
 ```json
-{"ok":true,"title":"South Park","titleID":"58410931","reason":""}
+{"ok":true,"title":"South Park","titleID":"58410931","path":"…/000D0000/A760…","reason":""}
 ```
+- `path` is the **concrete** source the launcher resolved to (the actual package
+  file or extracted folder) — useful when you pointed `--validate` at a parent
+  folder and want to know/record what it found.
 - For an STFS package: `title` and `titleID` come from the package metadata.
-- For an extracted folder: `ok` is true iff it contains `default.xex`.
-- On failure: `{"ok":false,"title":"","titleID":"","reason":"<why>"}`.
+- For an extracted folder: `title` is `"(extracted folder)"`, `titleID` empty.
+- On failure: `{"ok":false,"title":"","titleID":"","path":"","reason":"<why>"}`.
 
 ### 2.6 Exit codes
 | code | meaning |

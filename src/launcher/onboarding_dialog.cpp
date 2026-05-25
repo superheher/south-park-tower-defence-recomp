@@ -122,6 +122,7 @@ void OnboardingDialog::Revalidate() {
     result_title_.clear();
     result_title_id_.clear();
     result_reason_.clear();
+    result_resolved_.clear();
     return;
   }
   ValidateResult r = Validate(fs::path(validated_path_));
@@ -129,6 +130,7 @@ void OnboardingDialog::Revalidate() {
   result_title_ = r.title;
   result_title_id_ = r.title_id;
   result_reason_ = r.reason;
+  result_resolved_ = r.resolved;
 }
 
 void OnboardingDialog::RefreshEntries() {
@@ -154,7 +156,9 @@ void OnboardingDialog::RefreshEntries() {
 
 void OnboardingDialog::Confirm() {
   if (!result_ok_) return;
-  std::string chosen = path_buf_;
+  // Launch the concrete source we resolved (which may be a package found inside
+  // the folder the user pointed at), not the raw input.
+  std::string chosen = result_resolved_.empty() ? std::string(path_buf_) : result_resolved_;
   auto cb = on_play_;  // copy: Close() deletes `this` after OnDraw returns
   Close();
   if (cb) cb(chosen);
@@ -232,9 +236,11 @@ void OnboardingDialog::OnDraw(ImGuiIO& io) {
                            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
   if (ImGui::Begin("Set up South Park: Let's Go Tower Defense", nullptr, flags)) {
     ImGui::TextWrapped(
-        "Welcome! Point the engine at YOUR own copy of the game - either a single "
-        "STFS package file (your Xbox 360 console dump) or a folder of extracted "
-        "game files. Nothing is downloaded; your copy never leaves this machine.");
+        "Welcome! Point the engine at YOUR own copy of the game. You can pick the "
+        "STFS package file (your Xbox 360 console dump), an extracted-files folder, "
+        "or just ANY folder that contains it - setup finds the game inside "
+        "automatically (and skips DLC). Nothing is downloaded; your copy never "
+        "leaves this machine.");
     ImGui::Spacing();
 
     ImGui::TextUnformatted("Game location:");
@@ -264,6 +270,9 @@ void OnboardingDialog::OnDraw(ImGuiIO& io) {
       std::string label = result_title_.empty() ? std::string("valid game") : result_title_;
       if (!result_title_id_.empty()) label += "  (titleID " + result_title_id_ + ")";
       ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.35f, 1.0f), "OK: %s", label.c_str());
+      // If we found the game inside the folder the user pointed at, show where.
+      if (!result_resolved_.empty() && result_resolved_ != path_buf_)
+        ImGui::TextDisabled("Found: %s", result_resolved_.c_str());
     } else {
       ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Not a valid game: %s",
                          result_reason_.c_str());

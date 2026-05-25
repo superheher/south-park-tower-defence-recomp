@@ -116,10 +116,21 @@ struct ValidateResult {
   std::string title;     // human-readable title (may be empty)
   std::string title_id;  // 8 hex digits, e.g. "58410931" (empty for folders)
   std::string reason;    // failure reason (empty on success)
+  std::string resolved;  // the concrete game source actually found (file or folder)
 };
 
-// Validate a game source (STFS package file OR extracted folder) using the
-// engine's OWN StfsContainerDevice::ReadPackageHeader — no mount, no window.
+// Resolve a user-supplied path to the concrete game source the engine can mount,
+// or "" if none is found. Accepts, in order of convenience:
+//   * an STFS/SVOD package file (any filename — detected by content), or
+//   * a `default.xex` file (uses its containing folder), or
+//   * an extracted folder containing default.xex at its root, or
+//   * ANY parent folder of either: searched with bounded recursion for a
+//     default.xex or an STFS package (so a raw console dump laid out as
+//     <titleID>/000D0000/<hash> just works when you point at any ancestor).
+std::string ResolveGameSource(const std::filesystem::path& input);
+
+// Validate a game source using the engine's OWN STFS reader (no mount, no
+// window). Resolves `path` first (see ResolveGameSource), so a folder is fine.
 ValidateResult Validate(const std::filesystem::path& path);
 
 // Serialize a ValidateResult as one line of JSON: {"ok":...,"title":...,
