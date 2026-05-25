@@ -1,0 +1,78 @@
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index f9eac23..fbd27ad 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -13,6 +13,7 @@
+ #include <rex/cvar.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/null_device.h>
++#include <rex/filesystem/devices/stfs_container_device.h>
+ #include <rex/filesystem/vfs.h>
+ #include <rex/logging.h>
+ #include <rex/perf/counter.h>
+@@ -264,19 +265,30 @@ bool Runtime::SetupVfs() {
+     return false;
+   }
+ 
+-  // Mount game_data_root as \Device\Harddisk0\Partition1
++  // Mount game_data_root as \Device\Harddisk0\Partition1. The game source may be
++  // EITHER a directory of extracted files (HostPathDevice) OR a single STFS package
++  // file straight from the user's own console dump (StfsContainerDevice). Auto-detect
++  // by file-vs-directory so no extraction step is required.
+   auto mount_path = "\\Device\\Harddisk0\\Partition1";
+-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(
+-      mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
++  std::unique_ptr<rex::filesystem::Device> device;
++  if (std::filesystem::is_directory(abs_game_root)) {
++    device = std::make_unique<rex::filesystem::HostPathDevice>(
++        mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
++  } else {
++    // A regular file: mount it as an STFS/SVOD container in place.
++    device = std::make_unique<rex::filesystem::StfsContainerDevice>(mount_path, abs_game_root);
++  }
+   if (!device->Initialize()) {
+-    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
++    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize game device for {}",
++                 abs_game_root.string());
+     return false;
+   }
+   if (!file_system_->RegisterDevice(std::move(device))) {
+-    REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");
++    REXSYS_ERROR("Runtime::SetupVfs: Failed to register game device");
+     return false;
+   }
+-  REXSYS_INFO("  Mounted {} at {}", abs_game_root.string(), mount_path);
++  REXSYS_INFO("  Mounted {} at {} ({})", abs_game_root.string(), mount_path,
++              std::filesystem::is_directory(abs_game_root) ? "host folder" : "STFS package");
+ 
+   // Register symbolic links for game: and D:
+   file_system_->RegisterSymbolicLink("game:", mount_path);
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 8abe75e..4506941 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -169,7 +169,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+     return false;
+   }
+-  if (!std::filesystem::is_directory(paths.game_data_root)) {
++  // game_data_root may be a directory of extracted files OR a single packaged
++  // container file (STFS) mounted in place by Runtime::SetupVfs. Accept either.
++  if (!std::filesystem::exists(paths.game_data_root)) {
+     auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
+     REXLOG_ERROR("{}", msg);
+     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+@@ -217,8 +219,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+   std::string xex_image = "game:\\default.xex";
+   OnLoadXexImage(xex_image);
+ 
+-  // Mirrors the game:\ / d:\ -> game_data_root mapping in Runtime::SetupVfs.
+-  {
++  // Pre-flight the entrypoint XEX as a host file ONLY when game_data_root is an
++  // extracted directory. For a packaged container (STFS) the XEX lives inside the
++  // package, not on the host filesystem, so let Runtime::LoadXexImage validate it
++  // through the VFS instead. Mirrors the game:\ / d:\ mapping in Runtime::SetupVfs.
++  if (std::filesystem::is_directory(paths.game_data_root)) {
+     constexpr std::string_view kGameDevice = "game:\\";
+     constexpr std::string_view kDDevice = "d:\\";
+     std::string_view tail = xex_image;
