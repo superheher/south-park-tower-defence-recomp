@@ -88,20 +88,50 @@ SDL_VIDEODRIVER=x11 LD_LIBRARY_PATH=. REX_INPUT_FILE=$PWD/live_input.txt \
 
 ## Autonomous testing (`tools/gamectl.sh`)
 
-Drives the game with no window focus needed. Set `REX_GAME_DIR` to the build dir
-if it differs from the default.
+Drives the game with no window focus needed (writes the `REX_INPUT_FILE`).
+
+### One command: boot straight into live gameplay
+
+```bash
+tools/gamectl.sh play        # kill stragglers, boot, drive into the first level
+                             # (Stan's House), un-paused, ~60-70 s, hands-off
+tools/gamectl.sh bench 20    # then profile: min/avg/max swaps/s from [pacing-diag]
+```
+
+`play` is the fast path for benchmarking/profiling: run it, walk away, ~1 min later
+you are in live tower-defense gameplay. It handles the rough edges automatically
+(see `knowledge-base/titles/south-park-lgtdp/68-autonomous-boot-to-gameplay.md`):
+
+- **Boot intermittently hangs** before the first present (frame-1 vsync/fence deadlock,
+  KB doc 60). `play` detects it (no `[pacing-diag]` within 15 s) and relaunches.
+- **The title honours only START, and only on a *fresh* process.** A stale instance that
+  has idled ~28 s loops its attract demo and goes input-dead, so `play` always starts fresh.
+  Only **one** instance may run (all instances share `live_input.txt`).
+- After START an **unskippable ~30 s intro** plays before the menu (no skip cvar exists).
+- **Nav recipe:** alternate A/START until the CAMPAIGN LEVEL SELECT renders (its
+  `camp_diagram` asset hits the log — a reliable checkpoint), then press **only A** to
+  select Stan's House, confirm, start, and skip the level-intro dialogue into live play.
+- `[pacing-diag] loading=true` is **not** a reliable level-entry signal — it only flips on a
+  shader *compile*, which is cached away on a warm machine, so the first level loads with
+  `loading=false`. The level loads silently; confirm via the on-screen HUD or the verify shot.
+- In-gameplay framerate **oscillates ~25–60 swaps/s** under load — that is what `bench` measures.
+
+Warm boot to the title is ~4 s (shaders cached); the first cold boot is ~1–3 min.
+
+### Low-level building blocks
 
 ```bash
 tools/gamectl.sh shot title          # capture -> /tmp/sp/title.png
-tools/gamectl.sh press 0010          # tap START
-tools/gamectl.sh press 1000          # tap A
+tools/gamectl.sh press 0010          # tap START (1000=A, 2000=B, 0001=DPAD up ...)
 tools/gamectl.sh move -30000 0 1.5   # hold left stick left 1.5 s (move the player char)
+tools/gamectl.sh kill | boot | fps   # kill all instances / boot+wait / latest swaps-per-sec
 ```
 
-Title → match nav: `press 0010` (start), `press 1000` (LOCAL GAME), `press 0010`
-(lobby start), `press 1000` (CAMPAIGN), `press 0001` (up→CASUAL), `press 1000`,
-`press 1000` (first level). With `--always_win` you then just wait out the waves
-and `press 1000` (CONTINUE) between levels.
+Manual title → match nav (if not using `play`): `press 0010` (start), `press 1000`
+(LOCAL GAME), `press 0010` (lobby), `press 1000` (CAMPAIGN), `press 0001` (up→CASUAL),
+`press 1000`, `press 1000` (first level) — pressed *promptly* on a fresh boot (before the
+attract timer). With `--always_win` you then wait out the waves and `press 1000` (CONTINUE)
+between levels.
 
 ## Linux-specific notes
 
