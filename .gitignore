@@ -6,8 +6,11 @@
 default.xex
 assets/
 
-# Generated recompiler output (reproducible from XEX + config)
-/generated/
+# Generated recompiler output (reproducible from XEX + config) — but keep the
+# small static rexglue.cmake glue (SDK find + codegen target), which `rexglue init`
+# cannot regenerate without clobbering the committed CMakeLists/manifest/presets.
+/generated/*
+!/generated/rexglue.cmake
 /ppc/
 /out/
 *.gen.cpp

@@ -4,6 +4,21 @@ The port was originally brought up on Windows + D3D12. It now also builds and ru
 **playable** on Linux via the SDK's Vulkan backend (verified on Fedora 43, Clang 21,
 AMD Radeon / RADV: boot → menus → match → win, driven autonomously).
 
+## Quick start (one command)
+
+After installing the prerequisites below and cloning with submodules, the whole
+build is one script (bring your own dump):
+
+```bash
+git clone --recursive <repo-url> && cd rexglue-recomps
+south-park-recomp/tools/build-linux.sh "<dump>/58410931/000D0000/<hash>"
+```
+
+It applies the SDK patch, builds+installs the SDK, extracts the dump, runs codegen
++ fixup, builds the app, and stages the runtime libs. Re-runnable. The manual
+steps below explain what it does. (`generated/rexglue.cmake` is committed, so no
+`rexglue init` is needed.)
+
 ## Prerequisites (Fedora; adjust for your distro)
 
 ```bash
@@ -40,9 +55,8 @@ python3 south-park-recomp/tools/stfs_extract.py -o south-park-recomp/private/ext
 ( cd south-park-recomp && "$SDK_INSTALL/bin/rexglue" codegen south_park_td_manifest.toml \
   && python3 tools/fix_recomp_labels.py generated/default )
 
-# NOTE: generated/rexglue.cmake is produced by `rexglue init` on Windows; it is
-# git-ignored. On a fresh tree, create it (it just find_package()s the SDK, wires
-# the codegen target, and defines rexglue_setup_target) before configuring.
+# NOTE: generated/rexglue.cmake (SDK find + codegen target + rexglue_setup_target)
+# is committed (the rest of generated/ is git-ignored), so no `rexglue init` step.
 
 # configure + build the app
 cmake --preset linux-amd64-release -S south-park-recomp -DCMAKE_PREFIX_PATH="$SDK_INSTALL"
