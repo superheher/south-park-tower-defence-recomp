@@ -20,6 +20,21 @@ cmake --build --preset win-amd64-release --target install   # in third_party/rex
 | `0004-rexglue-entry-point-override-envvar.patch` | **Bring-up experiment.** South Park's XEX entry is a do-nothing stub (see `35-entry-forensics.md`); to empirically test starting at the real `mainCRTStartup`, this reads `REX_ENTRY_OVERRIDE=0x82xxxxxx` (env var) right after the loader caches `XEX_HEADER_ENTRY_POINT` and overrides `entry_point_`. No per-address rebuild needed. Used to brute-force candidate entries (`tools/find_zeroref_roots.py` + the brute-force scripts). General technique in `knowledge-base/general/80`. |
 | `0009-rexglue-stfs-direct-mount.patch` | **Launcher M1.** Lets `--game_data_root` point at a single STFS package file (the user's own console dump) instead of a pre-extracted folder — no extraction step. `Runtime::SetupVfs` auto-detects file-vs-directory and mounts `StfsContainerDevice` for a file / `HostPathDevice` for a folder. `ReXApp::ConstructRuntime` accepts a file (relaxes `is_directory`) and skips the host `default.xex` pre-flight for packages (the VFS validates the in-package XEX at load). Generic + upstreamable; offline folder boot is byte-for-byte unchanged. Verified by running: boots the title from both an STFS package and an extracted folder. |
 
+## Linux bring-up fixes (folded into the full patch)
+
+The port was first brought up on Windows + D3D12; these additional fixes make the SDK
+build and run on Linux via the Vulkan backend. All are small/additive and are folded
+into `rexglue-sdk-current-full.patch`. Full build/run/automation guide:
+`../docs/RUN-linux.md`.
+
+| Area | Fix |
+|------|-----|
+| **SEH unwind (decisive)** | `include/rex/platform/exceptions.h`: POSIX `SEH_CATCH_ALL` was `catch(...)`, which swallowed glibc's `pthread_exit` forced-unwind when a guest thread exited → `__libc_fatal("FATAL: exception not rethrown")` abort. Changed to `catch(const ::rex::SehException&)` so forced unwinds propagate, matching the selective Windows `__except(seh_filter)`. |
+| **Missing POSIX symbol** | `src/core/seh_posix.cpp`: add `seh_raise_guest_unwind()` (Linux counterpart of the seh_win.cpp impl; throws `SehException` so the nearest generated catch handles the guest RtlUnwind). Without it `librexruntime.so` had an undefined reference and the toolchain failed to link. |
+| **Win32-ism in shared code** | `src/input/mnk/mnk_input_driver.cpp`: `GetTickCount64()` → `std::chrono::steady_clock` (in the env-gated REX_INJECT test path). |
+| **Winsock in shared code** | `src/kernel/xam/xam_net.cpp`: add `using SOCKET = int` to the Linux include branch. `src/kernel/xam/netplay.cpp`: add an `#else` with `<arpa/inet.h>`/`<netinet/in.h>` so `htons`/`inet_addr` resolve (the `SOCKET`-using paths were already `_WIN32`-only). |
+| **Analog test input** | `src/input/mnk/mnk_input_driver.cpp`: `REX_INPUT_FILE` now also parses an optional left-stick suffix `"<btnhex> <lx> <ly>"` and sets `gamepad.thumb_lx/ly`, so autonomous tests can move the player character (digital masks alone cannot). Paired with `tools/gamectl.sh`. |
+
 **`rexglue-sdk-current-full.patch`** is the rolling, self-contained snapshot of the
 *entire* rexglue-sdk working tree (all the bring-up fixes above plus the larger
 boot/font/save/SEH/audio/locale fixes and the paused, cvar-gated netplay code incl. the

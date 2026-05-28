@@ -99,7 +99,7 @@ index b05df6a..00155f2 100644
    std::atomic<bool> gpu_written_data_dirty_{false};
    std::atomic<uint32_t> dirty_blocks_{0};
 diff --git a/include/rex/platform/exceptions.h b/include/rex/platform/exceptions.h
-index 1614b4d..2c45cf0 100644
+index 1614b4d..5f7b1e4 100644
 --- a/include/rex/platform/exceptions.h
 +++ b/include/rex/platform/exceptions.h
 @@ -22,6 +22,9 @@
@@ -112,6 +112,22 @@ index 1614b4d..2c45cf0 100644
  
  #include <rex/platform.h>
  #include <rex/platform/seh.h>
+@@ -140,7 +143,14 @@ class SehGuard {
+ 
+ #define SEH_CATCH catch (const ::rex::SehException&)
+ 
+-#define SEH_CATCH_ALL catch (...)
++// Must NOT be catch(...): on Windows this maps to __except(seh_filter), which is
++// selective (handles only hardware faults + the guest-unwind code, CONTINUE_SEARCH
++// otherwise). A literal catch(...) here also swallows glibc's *forced unwind* (used
++// by pthread_exit/pthread_cancel); when a guest thread exits, that unwind passes
++// through this handler, isn't rethrown, and glibc aborts with
++// "FATAL: exception not rethrown". Catching only SehException lets forced unwinds
++// propagate, matching the Windows filter.
++#define SEH_CATCH_ALL catch (const ::rex::SehException&)
+ 
+ #define SEH_RETHROW throw
+ 
 diff --git a/include/rex/platform/seh.h b/include/rex/platform/seh.h
 index 3b8f739..e4bfa97 100644
 --- a/include/rex/platform/seh.h
@@ -417,6 +433,26 @@ index 40ae269..279b10d 100644
        {PPC_INST_LWBRX, build_lwbrx},
        {PPC_INST_LD, build_ld},
        {PPC_INST_LDU, build_ldu},
+diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
+index 5e0a932..c9b7706 100644
+--- a/src/core/seh_posix.cpp
++++ b/src/core/seh_posix.cpp
+@@ -100,6 +100,15 @@ static void signal_handler(int sig, siginfo_t* info, void* /*ucontext*/) {
+   abort();  // Should not reach here
+ }
+ 
++[[noreturn]] void seh_raise_guest_unwind() {
++  // Mirror seh_win.cpp: a guest SEH unwind (e.g. RtlUnwind) is raised as a host
++  // exception so the nearest generated SEH_CATCH_ALL handles it. On POSIX the SEH
++  // layer is built on C++ exceptions (SEH_CATCH_ALL == catch(...)), so throw the
++  // SehException directly rather than RaiseException().
++  tls_seh_state.code = kGuestSehUnwindCode;
++  throw rex::SehException(static_cast<rex::SehException::Code>(kGuestSehUnwindCode));
++}
++
+ void seh_initialize() {
+   if (g_seh_initialized.exchange(true)) {
+     return;  // Already initialized
 diff --git a/src/core/seh_win.cpp b/src/core/seh_win.cpp
 index 9fc4763..42d55da 100644
 --- a/src/core/seh_win.cpp
@@ -1135,19 +1171,21 @@ index 333becb..e06de3d 100644
    }
    gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
 diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
-index b8eae3c..82db32e 100644
+index b8eae3c..eea619e 100644
 --- a/src/input/mnk/mnk_input_driver.cpp
 +++ b/src/input/mnk/mnk_input_driver.cpp
-@@ -19,6 +19,8 @@
+@@ -18,7 +18,10 @@
+ #include <rex/ui/window.h>
  
  #include <algorithm>
++#include <chrono>
  #include <cmath>
 +#include <cstdio>
 +#include <cstdlib>
  #include <cstring>
  
  #if REX_PLATFORM_WIN32
-@@ -27,9 +29,17 @@
+@@ -27,9 +30,17 @@
  #endif
  
  REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
@@ -1165,7 +1203,7 @@ index b8eae3c..82db32e 100644
  
  REXCVAR_DEFINE_STRING(keybind_a, "Space", "Input/Keybinds/Controller", "A button");
  REXCVAR_DEFINE_STRING(keybind_b, "Shift", "Input/Keybinds/Controller", "B button");
-@@ -140,9 +150,91 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+@@ -140,9 +151,112 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
      return X_ERROR_DEVICE_NOT_CONNECTED;
    }
  
@@ -1177,8 +1215,14 @@ index b8eae3c..82db32e 100644
 +  static const char* s_script = std::getenv("REX_INJECT_SCRIPT");
 +  if (s_script && out_state) {
 +    static const double dur = std::getenv("REX_INJECT_DUR") ? std::atof(std::getenv("REX_INJECT_DUR")) : 0.5;
-+    static const unsigned long long t0 = GetTickCount64();
-+    double el = (GetTickCount64() - t0) / 1000.0;
++    auto rex_tick_ms = []() -> unsigned long long {
++      return static_cast<unsigned long long>(
++          std::chrono::duration_cast<std::chrono::milliseconds>(
++              std::chrono::steady_clock::now().time_since_epoch())
++              .count());
++    };
++    static const unsigned long long t0 = rex_tick_ms();
++    double el = (rex_tick_ms() - t0) / 1000.0;
 +    uint16_t btn = 0;
 +    for (const char* p = s_script; *p;) {
 +      double t = std::atof(p);
@@ -1223,11 +1267,24 @@ index b8eae3c..82db32e 100644
 +  static const char* s_input_file = std::getenv("REX_INPUT_FILE");
 +  if (s_input_file && out_state) {
 +    uint16_t btn = 0;
++    int16_t lx = 0, ly = 0;
 +    if (FILE* f = std::fopen(s_input_file, "rb")) {
-+      char buf[32] = {0};
++      char buf[64] = {0};
 +      size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
 +      std::fclose(f);
-+      if (n) btn = static_cast<uint16_t>(std::strtoul(buf, nullptr, 16));
++      if (n) {
++        char* end = nullptr;
++        btn = static_cast<uint16_t>(std::strtoul(buf, &end, 16));
++        // Optional left-stick analog: "<btnhex> <lx> <ly>" with lx/ly in
++        // [-32768,32767] (e.g. "0 -28000 0" pushes the stick left). Digital button
++        // masks alone can't move the player character; autonomous tests need this.
++        if (end && *end) {
++          long vx = std::strtol(end, &end, 10);
++          long vy = (end && *end) ? std::strtol(end, &end, 10) : 0;
++          lx = static_cast<int16_t>(std::clamp<long>(vx, -32768, 32767));
++          ly = static_cast<int16_t>(std::clamp<long>(vy, -32768, 32767));
++        }
++      }
 +    }
 +    static uint16_t s_lastf = 0;
 +    if (btn != s_lastf) {
@@ -1248,6 +1305,8 @@ index b8eae3c..82db32e 100644
 +    std::memset(out_state, 0, sizeof(*out_state));
 +    out_state->packet_number = ++packet_number_;
 +    out_state->gamepad.buttons = btn;
++    out_state->gamepad.thumb_lx = lx;
++    out_state->gamepad.thumb_ly = ly;
 +    return X_ERROR_SUCCESS;
 +  }
 +
@@ -1258,7 +1317,7 @@ index b8eae3c..82db32e 100644
      if (out_state) {
        std::memset(out_state, 0, sizeof(*out_state));
        out_state->packet_number = packet_number_;
-@@ -209,6 +301,31 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+@@ -209,6 +323,31 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
      return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
    };
  
@@ -1290,7 +1349,7 @@ index b8eae3c..82db32e 100644
    packet_number_++;
  
    if (out_state) {
-@@ -278,7 +395,11 @@ void MnkInputDriver::UpdateMouseCapture() {
+@@ -278,7 +417,11 @@ void MnkInputDriver::UpdateMouseCapture() {
    if (!attached_window_)
      return;
  
@@ -1303,7 +1362,7 @@ index b8eae3c..82db32e 100644
  
    if (should_capture && !mouse_captured_) {
      mouse_captured_ = true;
-@@ -306,7 +427,18 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+@@ -306,7 +449,18 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
  }
  
  void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
@@ -1323,7 +1382,7 @@ index b8eae3c..82db32e 100644
      return;
    std::lock_guard lock(state_mutex_);
    uint16_t vk = static_cast<uint16_t>(e.virtual_key());
-@@ -322,7 +454,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+@@ -322,7 +476,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
  }
  
  void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
@@ -1332,7 +1391,7 @@ index b8eae3c..82db32e 100644
      return;
    std::lock_guard lock(state_mutex_);
    switch (e.button()) {
-@@ -360,7 +492,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+@@ -360,7 +514,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
  }
  
  void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
@@ -1697,10 +1756,10 @@ index 7fd57ec..496b4e2 100644
      case 0x000B0071: {
 diff --git a/src/kernel/xam/netplay.cpp b/src/kernel/xam/netplay.cpp
 new file mode 100644
-index 0000000..cc14019
+index 0000000..fffe4d7
 --- /dev/null
 +++ b/src/kernel/xam/netplay.cpp
-@@ -0,0 +1,439 @@
+@@ -0,0 +1,442 @@
 +/**
 + ******************************************************************************
 + * ReXGlue runtime — South Park: Let's Go Tower Defense online co-op
@@ -1737,6 +1796,9 @@ index 0000000..cc14019
 +#include <winsock2.h>
 +#include <ws2tcpip.h>
 +#pragma comment(lib, "ws2_32.lib")
++#else
++#include <arpa/inet.h>
++#include <netinet/in.h>
 +#endif
 +
 +// --- cvars (online co-op is entirely behind these) -------------------------
@@ -2271,7 +2333,7 @@ index 704eb0c..292e475 100644
  }
  
 diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
-index 12cec94..2ec99b2 100644
+index 12cec94..f31d240 100644
 --- a/src/kernel/xam/xam_net.cpp
 +++ b/src/kernel/xam/xam_net.cpp
 @@ -24,6 +24,7 @@
@@ -2282,7 +2344,15 @@ index 12cec94..2ec99b2 100644
  #include <rex/system/xevent.h>
  #include <rex/system/xsocket.h>
  #include <rex/system/xthread.h>
-@@ -296,6 +297,62 @@ u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket, ppc_ptr_t<XWSABUF> buffers_
+@@ -38,6 +39,7 @@
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
+ #include <sys/socket.h>
++using SOCKET = int;
+ #endif
+ 
+ namespace rex {
+@@ -296,6 +298,62 @@ u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket, ppc_ptr_t<XWSABUF> buffers_
                               ppc_ptr_t<XSOCKADDR_IN> from_addr,
                               ppc_ptr_t<XWSAOVERLAPPED> overlapped_ptr,
                               mapped_void completion_routine_ptr) {
@@ -2345,7 +2415,7 @@ index 12cec94..2ec99b2 100644
    if (overlapped_ptr) {
      // auto evt = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(
      //    overlapped_ptr->event_handle);
-@@ -342,6 +399,12 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
+@@ -342,6 +400,12 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
    }
  
    N_XSOCKADDR_IN native_to(to_ptr);
@@ -2358,7 +2428,7 @@ index 12cec94..2ec99b2 100644
    socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags, &native_to, to_len);
  
    // TODO: Instantly complete overlapped
-@@ -432,6 +495,35 @@ struct XnAddrStatus {
+@@ -432,6 +496,35 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -2394,7 +2464,7 @@ index 12cec94..2ec99b2 100644
    // Just return a loopback address atm.
    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
    addr_ptr->inaOnline.s_addr = 0;
-@@ -476,6 +568,23 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
+@@ -476,6 +569,23 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
  // subsequent socket calls (like a handle to a XNet address)
  u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                      mapped_void in_addr) {
@@ -2418,7 +2488,7 @@ index 12cec94..2ec99b2 100644
    return 1;
  }
  
-@@ -555,6 +664,13 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
+@@ -555,6 +665,13 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
  
  u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                 u32 flags) {
@@ -2432,7 +2502,7 @@ index 12cec94..2ec99b2 100644
    return X_ERROR_FUNCTION_FAILED;
  }
  
-@@ -666,6 +782,24 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
+@@ -666,6 +783,24 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
    }
  
    N_XSOCKADDR_IN native_name(name);
