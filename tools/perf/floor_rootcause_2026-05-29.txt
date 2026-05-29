@@ -1,0 +1,53 @@
+== boot ==
+PID=3242461  [play] profile with: /home/h/src/recomp/rexglue-recomps/south-park-recomp/tools/gamectl.sh bench 20
+Main_tid=3242493 GPU_tid=3242481
+fps_before=swaps 42.3/s
+
+############ (1) MAIN THREAD: CPU-BOUND or WAITING? (task-clock utilization, 15s) ############
+  if 'CPUs utilized' ~1.0 -> Main is pegged (CPU/cache bound). if <<1.0 -> Main WAITS (pacing/sync).
+               276      context-switches                 #     18.4 cs/sec  cs_per_second     
+                22      cpu-migrations                   #      1.5 migrations/sec  migrations_per_second
+         14,989.75 msec task-clock                       #      1.0 CPUs  CPUs_utilized       
+  --- per-thread run-state snapshot (R=run R+=runnable, S/D=sleeping/wait) over 3s ---
+GPU:Commands GPU:VSync Main:XThread Main:XThread  fps=swaps 43.5/s
+GPU:Commands GPU:VSync Main:XThread Main:XThread  fps=swaps 20.2/s
+GPU:Commands GPU:VSync Main:XThread Main:XThread  fps=swaps 20.2/s
+GPU:Commands GPU:VSync Main:XThread Main:XThread  fps=swaps 20.2/s
+GPU:Commands GPU:VSync Main:XThread Main:XThread  fps=swaps 38.0/s
+GPU:Commands GPU:VSync Main:XThread Main:XThread  fps=swaps 38.0/s
+
+############ (2) FRONT-END: CAPACITY (icache/itlb) vs MISPREDICT (resteers) vs DSB ############
+  --- TMA L3 fetch-latency breakdown (whole proc, 12s) ---
+     1,853,559,104      BACLEARS.ANY                     #     39.3 %  tma_branch_resteers      (10.55%)
+       204,040,918      cpu/ICACHE_16B.IFDATA_STALL,cmask=1,edge/ #      3.6 %  tma_icache_misses        (13.22%)
+       626,603,719      IDQ.MS_SWITCHES                  #      2.3 %  tma_ms_switches          (13.23%)
+        13,622,710      DECODE.LCP                       #      0.0 %  tma_lcp                  (10.53%)
+       611,306,690      DSB2MITE_SWITCHES.PENALTY_CYCLES #      1.1 %  tma_dsb_switches         (13.02%)
+     1,846,323,023      ICACHE_TAG.STALLS                #      3.4 %  tma_itlb_misses          (13.16%)
+  --- raw branch + icache to size the two (8s) ---
+    34,737,374,385      instructions                                                          
+     4,932,540,907      branches                                                              
+       612,841,959      branch-misses                                                         
+       521,133,252      L1-icache-load-misses                                                 
+         3,295,457      iTLB-load-misses                                                      
+
+############ (3) DO THE HOTTEST FUNCTIONS FIT L1i(32K)/L2(256K)? ############
+  L1i=32768 B/core, L2=262144 B/core. Sizes of the profile's top self-time symbols:
+    sub_821B9270       = 464 B (0.4 KB)
+    sub_8244CE40       = 31 B (0.0 KB)
+    sub_821C6E58       = 669 B (0.6 KB)
+    __savegprlr_29     = 66 B (0.0 KB)
+    __restgprlr_29     = 74 B (0.0 KB)
+  --- sum of top-20 self-time functions' .text (do they collectively bust L1i/L2?) ---
+
+############ (4) GPU BUSY% during the window (idle => not GPU-bound) ############
+gpu 17.50%
+gpu 17.50%
+gpu 21.67%
+gpu 26.67%
+
+############ (5) WORK PER FRAME (whole proc) ############
+  instructions in 6s = 27499347297;  current swaps/s = 25.8
+  (native Xbox360 budget ~2-3B useful insn/s/core; recompiler expands ~4-7x/guest-insn)
+fps_after=swaps 25.8/s
+FLOOR_ROOTCAUSE_DONE

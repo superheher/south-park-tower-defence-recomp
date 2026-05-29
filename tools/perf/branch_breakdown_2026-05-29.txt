@@ -1,0 +1,37 @@
+== boot ==
+PID=3258441  [play] profile with: /home/h/src/recomp/rexglue-recomps/south-park-recomp/tools/gamectl.sh bench 20
+fps_before=swaps 18.5/s
+
+############ BRANCH COUNTS by type (10s) ############
+    31,387,506,985      instructions                                                            (83.30%)
+     4,435,063,846      br_inst_retired.all_branches                                            (83.30%)
+     2,707,146,627      br_inst_retired.conditional                                             (83.37%)
+       635,629,974      br_inst_retired.near_call                                               (83.32%)
+       636,008,694      br_inst_retired.near_return                                             (83.45%)
+     2,947,838,969      br_inst_retired.near_taken                                              (66.60%)
+
+############ BRANCH MISPREDICTS by type (10s) ############
+  (indirect+return mispred ~= all_misp - conditional_misp - near_call_misp)
+       531,583,802      br_misp_retired.all_branches                                          
+        14,179,254      br_misp_retired.conditional                                           
+       371,501,843      br_misp_retired.near_call                                             
+       524,142,114      br_misp_retired.near_taken                                            
+
+############ try indirect-specific events (may be unsupported on this uarch) ############
+event syntax error: 'br_inst_retired.indirect,br_misp_retired.indirect,br_mis..'
+Unable to find event on a PMU of 'br_inst_retired.indirect'
+
+############ how does a guest CALL / RETURN get emitted? (codegen evidence) ############
+  --- indirect-call / return dispatch in the generated header ---
+3:// REX_LOOKUP_FUNC indexes into the per-module dispatch table at
+7:// unregistered slots fall back to rex::runtime::ResolveIndirectFunction,
+18:#define REX_LOOKUP_FUNC(x, y) \
+24:    uint32_t rex_indirect_target_ = (uint32_t)(x);                                         \
+25:    PPCFunc* rex_indirect_func_;                                                           \
+26:    if ((uint32_t)(rex_indirect_target_ - REX_CODE_BASE) <                                 \
+28:      rex_indirect_func_ = REX_LOOKUP_FUNC(base, rex_indirect_target_);                    \
+30:      rex_indirect_func_ = nullptr;                                                        \
+32:    if (!rex_indirect_func_) [[unlikely]] {                                                \
+33:      ctx.last_indirect_target = rex_indirect_target_;                                     \
+fps_after=swaps 28.0/s
+BRANCH_BREAKDOWN_DONE
