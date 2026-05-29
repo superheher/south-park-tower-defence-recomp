@@ -27,14 +27,19 @@ LOG="$GAME_DIR/run.log"
 SHOTDIR="${REX_SHOT_DIR:-/tmp/sp}"
 mkdir -p "$SHOTDIR"
 
-wid()      { xdotool search --classname south_park_td 2>/dev/null | tail -1; }
+wid()      { timeout 4 xdotool search --classname south_park_td 2>/dev/null | tail -1; }  # timeout: X can glitch; never hang play
 fps_line() { grep 'pacing-diag' "$LOG" 2>/dev/null | tail -1 | grep -oE 'swaps [0-9.]+/s loading=(true|false)'; }
 press()    { printf '%s 0 0' "${1:?mask}" >"$LIVE"; sleep "${2:-0.4}"; printf '0 0 0' >"$LIVE"; }
 
 kill_all() {            # exact-name match only -- never `pkill -f south_park_td` (matches this shell!)
   pkill -x south_park_td 2>/dev/null
-  for _ in $(seq 1 10); do pgrep -x south_park_td >/dev/null || return 0; sleep 0.3; done
-  pkill -9 -x south_park_td 2>/dev/null; sleep 0.5
+  for _ in $(seq 1 10); do pgrep -x south_park_td >/dev/null || break; sleep 0.3; done
+  pgrep -x south_park_td >/dev/null && { pkill -9 -x south_park_td 2>/dev/null; sleep 0.5; }
+  # Reclaim leaked guest-RAM shm: the game maps a 4.5G xenia_memory_* per launch and does
+  # NOT remove it on crash/kill. They accumulate in /dev/shm (16G tmpfs); once full, the
+  # next launch SIGBUSes faulting in guest RAM. Safe here: no instance is alive at this point.
+  rm -f /dev/shm/xenia_memory_* 2>/dev/null
+  return 0
 }
 
 launch_detached() {     # one fresh instance, fully detached so it survives this script exiting
@@ -93,7 +98,7 @@ case "${1:-}" in
     boot_until_title || { echo "[play] boot failed"; exit 1; }
     if nav_to_level; then
       sleep 2; id=$(wid); out="$SHOTDIR/play_result.png"
-      [ -n "$id" ] && import -window "$id" "$out" 2>/dev/null
+      [ -n "$id" ] && timeout 6 import -window "$id" "$out" 2>/dev/null  # timeout: screenshot is non-essential, must not hang play
       echo "[play] IN LEVEL (Stan's House). $(fps_line)"
       echo "[play] window=$id  log=$LOG  verify-shot=$out"
       echo "[play] profile with: $0 bench 20"
