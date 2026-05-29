@@ -1,0 +1,92 @@
+diff --git a/resources/templates/codegen/init_h.inja b/resources/templates/codegen/init_h.inja
+index 8449a0b..4d3fa22 100644
+--- a/resources/templates/codegen/init_h.inja
++++ b/resources/templates/codegen/init_h.inja
+@@ -9,14 +9,19 @@
+ #define REX_CONFIG_H_INCLUDED
+ 
+ {% if config_flags.skip_lr %}#define REX_CONFIG_SKIP_LR
+-{% endif %}{% if config_flags.ctr_as_local %}#define REX_CONFIG_CTR_AS_LOCAL
+-{% endif %}{% if config_flags.xer_as_local %}#define REX_CONFIG_XER_AS_LOCAL
+-{% endif %}{% if config_flags.reserved_as_local %}#define REX_CONFIG_RESERVED_AS_LOCAL
+ {% endif %}{% if config_flags.skip_msr %}#define REX_CONFIG_SKIP_MSR
+-{% endif %}{% if config_flags.cr_as_local %}#define REX_CONFIG_CR_AS_LOCAL
+-{% endif %}{% if config_flags.non_argument_as_local %}#define REX_CONFIG_NON_ARGUMENT_AS_LOCAL
+-{% endif %}{% if config_flags.non_volatile_as_local %}#define REX_CONFIG_NON_VOLATILE_AS_LOCAL
+ {% endif %}
++// [CODEGEN-ASLOCAL] DECOUPLE: the REX_CONFIG_*_AS_LOCAL macros are intentionally NOT
++// emitted here. In rex/ppc/context.h they are guarded around PPCContext members, so
++// defining them SHRINKS the struct -- but the prebuilt librexruntime.so is compiled
++// WITHOUT them (port<->.so layout mismatch: cr0-7/xer/ctr/nonvol GPRs removed, shifting
++// fpscr/f*/v*), and this title's setjmp (env=ctx / ctx=env) + SEH snapshot the WHOLE ctx.
++// Instead we keep the PPCContext layout FULL (struct unchanged => .so matches, and env=ctx
++// still has a ctx.cr/ctx.r* to snapshot) while the codegen STILL emits the registers as
++// per-function C++ locals (the clang-DCE + register-allocation .text win). The promoted
++// locals are synced <-> ctx only at the snapshot boundaries: setjmp (builders/context.cpp)
++// and SEH (function_graph.cpp, for GPRs). The *_as_local config flags still drive the
++// accessor + local-declaration emission in the codegen tool. See docs/CODEGEN-ASLOCAL-PLAN.md.
+ #define REX_IMAGE_BASE {{ image_base }}ull
+ #define REX_IMAGE_SIZE {{ image_size }}ull
+ #define REX_CODE_BASE {{ code_base }}ull
+@@ -36,6 +41,7 @@
+ #include <rex/perf/counter.h>
+ #include <rex/thread/mutex.h>
+ #include <rex/system/mmio_handler.h>
++#include <rex/platform/exceptions.h>  // SEH_TRY/SEH_CATCH_ALL for generate_exception_handlers
+ 
+ #include <atomic>
+ #include <cassert>
+diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
+index 6eae29d..437b982 100644
+--- a/src/codegen/builders/context.cpp
++++ b/src/codegen/builders/context.cpp
+@@ -177,12 +177,45 @@ void BuilderContext::emit_function_call(uint32_t address) {
+   }
+ 
+   if (address == cfg.setJmpAddress) {
+-    // Save PPCContext for restoration after longjmp
++    // [CODEGEN-ASLOCAL] setjmp/longjmp ctx-snapshot sync.
++    // When registers/flags are promoted to C++ locals (cr/xer/ctr/reserved/GPR-as-local),
++    // the LIVE values are NOT in ctx. setjmp snapshots the whole ctx (env = ctx) and a
++    // longjmp restores it (ctx = env); without help, the longjmp would resurrect STALE
++    // ctx register state. We keep PPCContext full (see the init_h.inja DECOUPLE note) and
++    // sync the promoted set around the snapshot: save locals -> ctx before env=ctx, then
++    // reload locals <- ctx after ctx=env. The promoted set is enumerated from the config
++    // flags; we sync the whole register class (not only regs used so far) for
++    // unconditional correctness -- clang DCEs any that are dead. setjmp sites are rare
++    // (image-format detection) so the extra stores are negligible.
++    const int kNonArgGpr[] = {0, 2, 11, 12};
++    auto forEachPromoted = [&](auto&& fn) {
++      if (cfg.crRegistersAsLocalVariables)
++        for (int i = 0; i < 8; ++i) { locals.cr[i] = true; fn(fmt::format("cr{}", i), fmt::format("ctx.cr{}", i)); }
++      if (cfg.xerAsLocalVariable)              { locals.xer = true;      fn("xer", "ctx.xer"); }
++      if (cfg.ctrAsLocalVariable)              { locals.ctr = true;      fn("ctr", "ctx.ctr"); }
++      if (cfg.reservedRegisterAsLocalVariable) { locals.reserved = true; fn("reserved", "ctx.reserved"); }
++      if (cfg.nonVolatileRegistersAsLocalVariables) {
++        for (int i = 14; i <= 31; ++i)  { locals.r[i] = true; fn(fmt::format("r{}", i), fmt::format("ctx.r{}", i)); }
++        for (int i = 14; i <= 31; ++i)  { locals.f[i] = true; fn(fmt::format("f{}", i), fmt::format("ctx.f{}", i)); }
++        for (int i = 14; i <= 31; ++i)  { locals.v[i] = true; fn(fmt::format("v{}", i), fmt::format("ctx.v{}", i)); }
++        for (int i = 64; i <= 127; ++i) { locals.v[i] = true; fn(fmt::format("v{}", i), fmt::format("ctx.v{}", i)); }
++      }
++      if (cfg.nonArgumentRegistersAsLocalVariables) {
++        for (int i : kNonArgGpr)        { locals.r[i] = true; fn(fmt::format("r{}", i), fmt::format("ctx.r{}", i)); }
++        locals.f[0] = true; fn("f0", "ctx.f0");
++        for (int i = 32; i <= 63; ++i)  { locals.v[i] = true; fn(fmt::format("v{}", i), fmt::format("ctx.v{}", i)); }
++      }
++    };
++    // 1) save promoted locals -> ctx, then snapshot the (now-coherent) ctx
++    forEachPromoted([&](const std::string& reg, const std::string& cx) { println("\t{} = {};", cx, reg); });
+     println("\t{} = ctx;", env());
+-    // Use custom ppc_setjmp that uses guest address as key
++    // 2) custom ppc_setjmp keyed by guest address
+     println("\t{}.s64 = ppc_setjmp({}.u32);", temp(), r(3));
+-    // Restore PPCContext if returning from longjmp
+-    println("\tif ({}.s64 != 0) ctx = {};", temp(), env());
++    // 3) on longjmp return (!=0): restore whole ctx, then reload promoted locals <- ctx
++    println("\tif ({}.s64 != 0) {{", temp());
++    println("\t\tctx = {};", env());
++    forEachPromoted([&](const std::string& reg, const std::string& cx) { println("\t\t{} = {};", reg, cx); });
++    println("\t}}");
+     println("\t{} = {};", r(3), temp());
+     return;
+   }

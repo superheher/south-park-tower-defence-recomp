@@ -14,6 +14,16 @@ out_directory_path = "generated/default"
 # seh.h/seh_win.cpp). First-cut: an unwind returns to the nearest wrapped caller as
 # failure (r3=0) instead of corrupting the stack. See KB 35 + patches/0007-seh-*.
 generate_exception_handlers = true
+# [CODEGEN-SIZE] *_as_local DEAD END (kept OFF). cr_as_local alone = -3.41MB .text (-14.6%),
+# the dominant footprint lever -- but it is FUNDAMENTALLY incompatible with this title:
+# `cr_as_local` defines REX_CONFIG_CR_AS_LOCAL which REMOVES cr0-7 from the PPCContext struct,
+# yet the title's setjmp uses `env=ctx`/`ctx=env` (snapshot/restore the WHOLE ctx) and SEH
+# captures ctx.{r13-31} at entry -- both assume every guest register lives in ctx. With state
+# moved to C++ locals there is no ctx.cr to snapshot, so a longjmp/unwind resurrects stale
+# state and the game bails ("Execution complete" via SEH unwind during image-format detection
+# in early init). A sync-locals<->ctx-at-setjmp fix can't even compile (ctx.cr0-7 don't exist
+# under the macro). Properly enabling AS_LOCAL needs the setjmp/SEH state-save redesigned to
+# enumerate+preserve every promoted register -- out of scope. See docs/CODEGEN-SIZE-REPORT.md.
 # CUSTOM setjmp/longjmp EH for image-format detection (root-caused 2026-05-24 via LIVE
 # instrumentation; supersedes the earlier failed attempt). The image loader (sub_82459B00)
 # iterates a format table and tries each decoder; "try JPEG" (sub_82458010) does
@@ -27,6 +37,44 @@ generate_exception_handlers = true
 # setjmp is the EH-hook dispatcher sub_8242EEA0. See KB 40-seh-implementation-plan.md.
 setjmp_address = 0x8242EEA0
 longjmp_address = 0x8242EA70
+# [CODEGEN-ASLOCAL 2026-05-29] cr_as_local RE-ENABLED via the DECOUPLE fix (supersedes the
+# CODEGEN-SIZE dead-end above). The codegen now emits CR0-7 as per-function C++ locals (the
+# -14.6% .text lever: clang DCEs the eager record-form CR0 updates + keeps live CR in host
+# regs) WITHOUT shrinking PPCContext: init_h.inja no longer emits REX_CONFIG_*_AS_LOCAL, so
+# the struct stays full (port<->.so layout matches; the prebuilt librexruntime.so is unchanged)
+# and env=ctx still has ctx.cr0-7 to snapshot. The promoted CR locals are synced <-> ctx at the
+# setjmp snapshot boundary (builders/context.cpp). SEH only touches r1/lr/r13-31 (not CR), so
+# CR needs no SEH sync. Gated by tools/perf/detdiff.sh. See docs/CODEGEN-ASLOCAL-{PLAN,LOG}.md.
+cr_as_local = true
+# [CODEGEN-ASLOCAL Phase C] xer/ctr/reserved promoted to C++ locals too. All volatile/scratch
+# (not preserved across calls, not touched by the SEH catch), so like CR they need only the
+# setjmp cr<->ctx sync (builders/context.cpp handles them generically). Stacked on cr; gated.
+xer_as_local = true
+ctr_as_local = true
+reserved_as_local = true
+# [CODEGEN-ASLOCAL Phase D] non_volatile (GPR r14-31 + f/v) as local — REFUTED by the gate (kept OFF).
+# This is the BIG lever (the 2.82M ctx round-trips) but it BREAKS this title even with the decouple
+# + setjmp sync: full non_volatile crashed during combat; a GPR-only bisect (r14-31 only, f/v in ctx)
+# failed even harder — at BOOT. Root cause (confirmed): the SEH entry-capture emits
+# `__seh_rN = ctx.rN` for r14-31, but under GPR-as-local the INCOMING non-volatiles live in the
+# CALLER's C++ locals, not ctx — so there is nothing correct to capture at entry, and the catch
+# restores garbage into ctx.r14-31. Unlike CR/XER/CTR (volatile, SEH-untouched, fixed by the setjmp
+# sync alone), GPR-as-local needs the SEH state-save REDESIGNED to enumerate+preserve the promoted
+# GPRs explicitly across the unwind boundary (and to thread incoming non-volatiles through). Out of
+# scope for the decouple approach. See docs/CODEGEN-ASLOCAL-{LOG,REPORT}.md.
+# [CODEGEN-ASLOCAL Phase D] GPR/FPR/VR-as-local — BOTH REFUTED by the gate (kept OFF):
+#   non_volatile_as_local  (r14-31,f14-31,v14-31,v64-127): crashes (combat / GPR-only bisect: boot).
+#   non_argument_as_local  (r0,r2,r11,r12,f0,v32-63):       crashes at boot.
+# Clean dichotomy vs cr/xer/ctr/reserved (which WORK): the special-purpose flag registers are
+# accessed only via dedicated accessors, are volatile, write-before-read within a function, and are
+# untouched by SEH/RtlCaptureContext — so the decouple + setjmp sync fully fixes them. The general
+# r/f/v registers instead carry values ACROSS calls (args/returns), through the .so boundary, and are
+# captured/restored by SEH (ctx.r13-31) and RtlCaptureContext (ctx.r14-31/f14-31) — and their INCOMING
+# non-volatiles live in the CALLER's C++ locals, not ctx, so the SEH entry-capture has nothing correct
+# to snapshot. Enabling them needs the SEH/ABI state-save redesigned to enumerate+preserve promoted
+# r/f/v across the unwind + thread incoming values — out of scope for the decouple. See docs/CODEGEN-ASLOCAL-REPORT.md.
+# non_volatile_as_local = true   # REFUTED
+# non_argument_as_local = true   # REFUTED
 # config/sp_functions.toml: functions rexglue's analyzer misses (vtable methods +
 # computed-jump/adjustor-thunk targets) — registered as CONFIG entry points so indirect
 # calls resolve. Generated by tools/gen_missing_funcs.py. See KB 35-entry-forensics.md.
