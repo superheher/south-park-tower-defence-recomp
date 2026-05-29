@@ -28,38 +28,41 @@ The Main/guest-sim thread during heavy combat (topdown.sh): **Frontend 39 % + Re
 (back-end has spare capacity). `perf annotate` of the #1 hot fn `sub_821B9270` (12–16 %): cycles
 **smeared ~evenly across ~35 instructions** incl. trivial ones & branches = the front-end-starvation
 signature; **~21 % of it is ctx-struct loads/stores** (`%r14`-relative guest-register traffic).
-**Why the prior session's front-end levers (mcmodel/leaf-inline/PGO) were neutral:** they change
-layout/prediction, not the front-end's real problem. The hot working set doesn't fit the DSB (→MITE),
-and clang -O3 **already** minimizes the per-guest-instruction host code, so you can't shrink the hot
-path one instruction at a time. The only reducible bulk is the **ctx-register traffic**, which clang
-can't remove (forced by the `(ctx,base)`-by-ref ABI + spill-at-every-call).
+The 39 % front-end decomposes (resteer.sh, current BKG) into **three Coffee-Lake CAPACITY walls**, none
+codegen-reducible: **(a) BTB capacity** — BACLEARS 3.56 B fetch-resteers (4 K-entry BTB can't cover
+~157 K branch sites); **(b) RSB capacity** — returns mispredict **~22 %** (448 M of 598 M total
+mispredicts; conditional only 2 %, near_call 6 % post-mcmodel) because the 16-entry return-stack-buffer
+overflows on combat's deep guest call chains (guest `blr` IS a clean host `ret`, tail-calls ARE TCO'd —
+this is *not* a codegen defect); **(c) DSB capacity** — 87 % MITE (1.5 K-µop uop-cache too small).
+**Why every lever (this + prior session) is neutral:** all attack code size / layout / per-insn count,
+but the binding limits are the *count* of branches/calls/stack-depth the hot path touches, which exceeds
+this CPU's front-end structures — and you can't reduce that without deleting guest control flow. clang -O3
+already minimizes per-insn codegen; the only reducible *retiring* bulk is ctx-register traffic (~21 %),
+which is SEH/ABI-blocked AND wouldn't touch the BTB/RSB walls.
 
 ## Goal
 Move the combat-floor p10. **Keep-bar: detdiff gate PASSES, boots, median p10 > +1.0 swaps/s on
-`ab.sh` (≥5 reps).** Per the measured diagnosis, the lever must **shrink the hot path's host
-instruction/uop count** (helps both Frontend-delivery and Retiring) — and the only place with headroom
-is the **architectural ctx-traffic**, because per-instruction codegen is already optimal.
+`ab.sh` (≥5 reps).** The honest assessment after 6 sessions: on THIS i9-8950HK the floor (~15 p10) is at
+the front-end **capacity** limit for this recompilation approach; no codegen/layout/flag/LTO lever moves
+it. The two remaining moves, in priority:
 
-## P1 — GPR-as-local with an SEH state-save redesign (THE remaining lever; large but matched to the data)
-Keep guest registers in host **locals** instead of the ctx struct. This cuts the ~21 % ctx
-load/store traffic (Retiring↓) **and** shrinks the recompiled functions enough to start fitting the
-DSB (Frontend↓) — it attacks **both** binding components. It is currently refuted by a **boot crash**:
-the setjmp/longjmp SEH unwinder restores guest state from the ctx struct, and the `(ctx,base)` ABI uses
-ctx fields as the inter-function argument channel.
-- **Redesign:** sync host locals ↔ ctx only at the rare points that need it (setjmp save points,
-  exception landing pads, and guest call boundaries for the argument regs), keeping the *hot straight-line
-  path* on locals. See `sp_aslocal_plan` / `sp_gpr_aslocal_nogo` for the prior attempt's crash mode.
-- **Validate hard:** this touches correctness foundation — `detdiff.sh gate` (40s) + a long playable
-  soak + `ab.sh 90 5`. Measure with `tools/perf/topdown.sh` (Frontend % and uops/insn must DROP) and
-  `uops.sh` (Main-thread uops↓), not just fps.
-- This is real, multi-step recompiler engineering. If you don't have budget to complete+validate it,
-  do NOT leave the tree half-changed — it boot-crashes when partial.
+## P1 (DO FIRST) — Cross-CPU check (cheap, decisive, no code change)
+Run the SAME `bef1b65c`+`47323bf2` binary's `ab.sh 90 5` + `resteer.sh` on a Zen4 / recent-Core desktop
+(far larger BTB, deeper RSB, bigger op-cache). If it floors **materially higher** → the floor is
+this-CPU-front-end-capacity-bound, **not a recompiler defect** (the "it's an i9, absurd" intuition —
+answer is "newer CPU"), and further in-tree codegen work is pointless. If it floors the **same** → the
+bound is guest-work volume and only P2 can help. This host can't self-test; needs a second machine.
 
-## P2 — Cross-CPU confirmation (cheap, decisive for "is this approach/CPU-bound?")
-Run the SAME `bef1b65c`+`47323bf2` on a wider-issue desktop (Zen4 / recent Core, bigger DSB+BTB+issue
-width). If it floors materially higher, the front-end-delivery bound is this-CPU-specific (Coffee Lake
-MITE/DSB limits) and the recompiler approach is fine; if it floors the same, the host-instruction
-volume is the wall (→P1 is the only path). This host can't self-test; needs a second machine.
+## P2 (large, partial, blocked) — GPR-as-local + SEH state-save redesign
+Keep guest GPRs in host **locals** instead of the ctx struct → cuts the ~21 % ctx *retiring* traffic +
+shrinks code. CAVEAT: it attacks the **Retiring** half, NOT the BTB/RSB capacity walls (branch/call
+*count*), so it's **partial** — and the prior cr/xer/ctr-as-local (−16 % .text) was already floor-neutral,
+cautioning that even a big size/retiring cut may not move this capacity-bound floor. Also refuted by a
+**boot crash** (setjmp/longjmp SEH restores guest state from ctx; `(ctx,base)` ABI passes args via ctx) →
+needs locals↔ctx sync only at setjmp/landing-pad/call-arg points. Real multi-session engineering; only
+worth it if the cross-CPU check shows the i9 is the outlier AND retiring is confirmed to matter. If you
+attempt it, do NOT leave the tree half-changed — it boot-crashes when partial. Measure with `topdown.sh`
+(Frontend % + uops/insn must DROP) + `uops.sh`, not just fps. See `sp_aslocal_plan`/`sp_gpr_aslocal_nogo`.
 
 ## DEAD ENDS — do NOT re-try (MEASURED this session + prior)
 - **Arch flags `-mmovbe -mbmi -mbmi2 -mlzcnt -mpopcnt` on the exe:** RAISES Main-thread uops +10 %

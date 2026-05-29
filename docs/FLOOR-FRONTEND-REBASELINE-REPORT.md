@@ -42,9 +42,33 @@ back-end has spare capacity. `perf annotate` of the #1 hot fn (`sub_821B9270`, 1
 | **non-volatile guest RAM** (drop `volatile` from REX_LOAD/STORE) | unblock CSE/reorder/hoist of guest loads | **neutral perf + FAILS detdiff gate** | guest loads have distinct un-provable-alias addresses ⇒ little CSE; the optimizer's added scheduling freedom *grew* hot-fn instruction count (sub_821B9270 117→134). And `sync/lwsync/eieio` are **no-ops** (no compiler barrier) — `volatile` is the *only* thing preventing the compiler hoisting polling loads across barriers, so removal broke boot/nav (`session_failed_no_in_level`). |
 | **ThinLTO on the exe** (`-flto=thin`) | cross-TU inline the hot mid-size call chain (sub_821B9270→sub_8244CE40→…, in separate recomp.N.cpp TUs) to remove call/return taken-branches | **floor NEUTRAL (+0.3, within noise); gate-pass** | cross-TU inlining DID happen (hot fn's callees inlined away) and avg is marginally smoother, but median p10 13×8reps = 14.9 vs base 14.6 (+0.3, overlapping 13.8–15.5; first 5-rep run's +0.6 was noise). +5.2 % .text. Same trade as leaf-inline: branch-removal ≈ code-growth ⇒ net wash on a front-end-bound floor. Not kept (under +1.0 bar, grows .text, slower build). |
 
+## §2.5 — What the 39 % front-end actually IS: three Coffee-Lake CAPACITY walls (resteer.sh, current BKG)
+`tools/perf/resteer.sh` on the current BKG decomposes the front-end stall into three **hardware-capacity**
+limits, none codegen-reducible:
+- **BTB capacity → BACLEARS.ANY = 3.56 B** (32 M / 1e9 insn). Front-end fetch re-steers because the
+  ~4 K-entry BTB can't hold the ~157 K branch sites the combat working set touches → it doesn't know a
+  taken branch is coming until decode → fetch bubble. This is the bulk of the 39 %.
+- **RSB capacity → return mispredicts ≈ 22 %.** Mispredicts by type: all 598.6 M − conditional 30.9 M
+  (2 % rate, well-predicted) − near_call 119.7 M (6.1 %, mcmodel already fixed the direct-call storm) =
+  **~448 M returns ≈ 22 % of ~1.97 B returns.** Guest `blr` IS a clean host `ret` and indirect tail-calls
+  are TCO'd to `jmp` (1,424 `jmp *reg` vs 48 un-TCO'd `call*;ret`), so this is **not** a codegen defect —
+  it's the 16-entry RSB overflowing on combat's deep guest call chains. The prior session's "24 % return
+  mispredict (RSB)" was real and is **still live** post-mcmodel. Inlining is the only depth-reducer and it
+  grows code → neutral (leaf-inline & LTO both confirmed).
+- **DSB capacity → DSB_MISS 7.95 B → 87 % MITE.** The ~1.5 K-µop uop-cache can't hold the hot working set,
+  so the legacy MITE decoder (lower bandwidth) feeds the back-end.
+
+**All three are capacity walls of *this* CPU's front-end** (4 K BTB / 16-entry RSB / 1.5 K-µop DSB) that
+the recompiled code's branch+call+code density exceeds. You cannot reduce the density without removing
+guest branches/calls/stack-depth (impossible), and the one thing that *would* (inlining) grows code and
+nets neutral. **⇒ The decisive next step is the CROSS-CPU CHECK (P2):** the SAME `bef1b65c` binary on a
+Zen4 / recent-Core desktop (far larger BTB, deeper RSB, bigger op-cache) should floor *materially higher*.
+That confirms the floor is Coffee-Lake-front-end-capacity-bound, not a recompiler defect — vindicating the
+"it's an i9, this is absurd" intuition (this *specific older* i9's front-end is undersized for the workload).
+
 ## §3 — Why front-end levers (this session + prior) are neutral, mechanistically
-The front-end stall is **fetch-latency dominated** (resteers + MITE delivery), and it is **not fixable by
-layout or per-instruction codegen**:
+The front-end stall is **fetch-latency dominated** (BTB/RSB-capacity resteers + MITE delivery), and it is
+**not fixable by layout or per-instruction codegen**:
 - **clang already minimizes** the per-guest-instruction host code (proven by rlwinm, and by the workflow
   analysis confirming CR-fusion / width / addressing levers are all optimizer-redundant). So you cannot
   shrink the hot path one instruction at a time.
@@ -57,15 +81,30 @@ layout or per-instruction codegen**:
   exactly what **GPR-as-local** would eliminate — and it would *also* shrink the code enough to start
   fitting the DSB, attacking **both** binding components (frontend + retiring) at once.
 
-## The one real lever (blocked) + recommendation for next session
-**GPR-as-local** (keep guest registers in host locals instead of the ctx struct) is the lever that
-matches the measured bottleneck — but it is refuted by a **boot crash** because the setjmp/longjmp SEH
-unwinder restores guest state from the ctx struct, and the `(ctx,base)` ABI uses ctx fields as the
-inter-function argument channel. Making it work needs an **SEH state-save redesign**: sync host locals
-↔ ctx only at the (rare) setjmp save points and exception landing pads, keeping the hot path local.
-This is real recompiler engineering (the "open lever" from `sp_aslocal_plan`), and it is now
-**the only lever with measured headroom** (theoretical ceiling ≈ 2× if frontend+backend stalls were
-eliminated; realistically a chunk of the 39 % frontend + the ~21 % ctx-traffic retiring).
+## Recommendation for next session — in priority order
+**1. CROSS-CPU CHECK (do this first — cheap, decisive, no code change).** Run the SAME `bef1b65c` +
+`47323bf2` binary's `ab.sh 90 5` + `resteer.sh` on a Zen4 / recent-Core desktop. The 39 % front-end is
+three Coffee-Lake capacity walls (BTB 4 K / RSB 16 / DSB 1.5 K-µop, §2.5); a modern CPU's far larger
+structures should floor *materially higher* with the identical binary. If it does → the floor is
+**this-CPU-front-end-capacity-bound, not a recompiler defect**, and the answer is "run it on a newer CPU"
+(the "it's an i9, absurd" intuition). If it floors the same → the bound is guest-work volume and only the
+big architectural lever below can help. Either way it tells you whether ANY further in-tree work is worth it.
+
+**2. GPR-as-local + SEH redesign (large, partial, blocked).** Keeping guest GPRs in host locals would cut
+the ~21 % ctx-register *retiring* traffic and shrink code somewhat — but note it attacks the **retiring**
+half, NOT the BTB/RSB capacity walls (those are branch/call *count*, not code size), so it's a *partial*
+lever, and the prior cr/xer/ctr-as-local (−16 % .text) was already floor-neutral, cautioning that even a
+big retiring/size cut may not move this front-end-capacity-bound floor. It is also refuted by a boot crash
+(setjmp/longjmp SEH restores guest state from the ctx struct; the `(ctx,base)` ABI passes args via ctx),
+needing an SEH state-save redesign (sync locals↔ctx only at setjmp/landing-pad/call-arg points). Real
+multi-session recompiler engineering — only worth it if the cross-CPU check shows the i9 is the outlier
+AND the retiring half is confirmed to matter.
+
+**Honest bottom line:** on THIS i9-8950HK the combat floor (~15 p10) appears to be at the front-end
+*capacity* limit for this recompilation approach; 6 sessions of codegen/layout/flag/LTO levers (this
+session added arch-flags, rlwinm, non-volatile, ThinLTO; prior added mcmodel-kept, leaf-inline, PGO,
+BOLT, ICF, AS_LOCAL, outliner) have not moved it because none reduce the BTB/RSB/DSB *capacity* demand,
+and the one that could (removing guest branches/calls) is impossible. The next real signal is a bigger CPU.
 
 ### HT-contention hypothesis — TESTED and REJECTED
 The profile shows **`TimerThreadMain` ~17 % of total CPU** and Audio-worker mutex spin ~11 %. On a
