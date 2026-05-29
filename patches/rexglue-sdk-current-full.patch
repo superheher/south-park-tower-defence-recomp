@@ -49,6 +49,64 @@ index 4bd6694..0bff908 100644
          elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
              target_compile_options(${target_name} PRIVATE -march=armv8-a)
          endif()
+diff --git a/include/rex/codegen/function_graph.h b/include/rex/codegen/function_graph.h
+index 171eb67..141ac71 100644
+--- a/include/rex/codegen/function_graph.h
++++ b/include/rex/codegen/function_graph.h
+@@ -95,6 +95,14 @@ class FunctionGraph {
+   // Get all SEALED functions
+   std::vector<FunctionNode*> getSealedFunctions();
+ 
++  // P2 leaf-inlining: mark tiny straight-line leaves as inline-eligible (sets FunctionNode::
++  // isInlineLeaf()). Must run after sealing and rexcrt renaming, before codegen emission, so that
++  // call-site emission can route eligible callees to the always_inline variant. Excludes imports,
++  // rexcrt CRT replacements (passed in rexcrtAddrs), functions with calls/tailcalls/jumptables,
++  // SEH/EH, an LR data-read (mflr/mfspr-LR), a mid-asm hook in their body, or size > maxBytes.
++  void markInlineLeaves(const RecompilerConfig& cfg,
++                        const std::unordered_set<uint32_t>& rexcrtAddrs, uint32_t maxBytes);
++
+   // Statistics
+   size_t functionCount() const { return functions_.size(); }
+   size_t pendingCount() const;
+diff --git a/include/rex/codegen/function_node.h b/include/rex/codegen/function_node.h
+index a335b37..8a537f1 100644
+--- a/include/rex/codegen/function_node.h
++++ b/include/rex/codegen/function_node.h
+@@ -139,6 +139,14 @@ class FunctionNode {
+   const std::optional<ExceptionInfo>& exceptionInfo() const { return exceptionInfo_; }
+   bool hasExceptionInfo() const { return exceptionInfo_.has_value() && exceptionInfo_->hasInfo(); }
+ 
++  // Inline-leaf eligibility (set by FunctionGraph::markInlineLeaves before codegen). True for a tiny
++  // straight-line leaf (no calls/tailcalls/jumptables, no SEH/EH, no LR-data-read, no mid-asm hook,
++  // size <= threshold). Such a function is emitted as an always_inline header body + an out-of-line
++  // thunk (so the dispatch table/weak alias still work), and its direct callsites are routed to the
++  // inline variant -- cutting the static branch-site count (the BTB-capacity floor lever). See
++  // docs/P2-LEAF-INLINE-DESIGN.md.
++  bool isInlineLeaf() const { return inlineLeaf_; }
++
+   void setName(std::string name) { name_ = std::move(name); }
+ 
+  private:
+@@ -182,6 +190,7 @@ class FunctionNode {
+   FunctionAuthority authority_;
+   FunctionState state_ = FunctionState::kRegistered;
+   bool hasExceptionHandler_ = false;
++  bool inlineLeaf_ = false;  // set by FunctionGraph::markInlineLeaves (P2 leaf-inlining)
+ 
+   // Populated at discover()
+   std::vector<Block> blocks_;
+diff --git a/include/rex/codegen/function_types.h b/include/rex/codegen/function_types.h
+index ef36b6a..babd005 100644
+--- a/include/rex/codegen/function_types.h
++++ b/include/rex/codegen/function_types.h
+@@ -51,6 +51,7 @@ struct EmitContext {
+   const FunctionGraph& graph;
+   uint32_t entryPoint = 0;                      ///< For "xstart" naming
+   runtime::ExportResolver* resolver = nullptr;  ///< For import ordinal resolution (nullable)
++  std::string* inlinesOut = nullptr;            ///< P2: sink for always_inline leaf bodies ({project}_inlines.h); nullable
+ };
+ 
+ //=============================================================================
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
 index 6998a45..af1546f 100644
 --- a/include/rex/graphics/command_processor.h
@@ -215,7 +273,7 @@ index 3b8f739..e4bfa97 100644
  void seh_initialize();
  
 diff --git a/resources/templates/codegen/init_h.inja b/resources/templates/codegen/init_h.inja
-index 8449a0b..4d3fa22 100644
+index 8449a0b..1eeeaec 100644
 --- a/resources/templates/codegen/init_h.inja
 +++ b/resources/templates/codegen/init_h.inja
 @@ -9,14 +9,19 @@
@@ -252,6 +310,30 @@ index 8449a0b..4d3fa22 100644
  
  #include <atomic>
  #include <cassert>
+@@ -64,6 +70,13 @@ extern PPCFuncMapping PPCFuncMappings[];
+   __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name); \
+   REX_EXTERN(__imp__##name)
+ 
++// P2 leaf-inlining: an inline-eligible leaf gets an always_inline body `name##_inl` here (in the
++// shared {project}_inlines.h, included at the end of this file) in addition to the normal out-of-line
++// DEFINE_REX_FUNC(name) thunk + weak alias. Eligible call sites call `name##_inl(ctx, base)` so the
++// body inlines; dispatch table + overrides still use the out-of-line `name`/`__imp__name`.
++#define STATIC_INLINE_REX_FUNC(name) \
++  [[gnu::always_inline, maybe_unused]] static inline REX_FUNC(name##_inl)
++
+ //=============================================================================
+ // Function Prologue
+ //=============================================================================
+@@ -318,3 +331,9 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
+ 
+ {% for fn in functions %}DECLARE_REX_FUNC({{ fn.name }});
+ {% endfor %}
++
++//=============================================================================
++// Inline-eligible leaf bodies (P2). Included LAST: needs the macros/types above + the __imp__
++// declarations, and must be visible in every recomp TU so the always_inline leaves inline.
++//=============================================================================
++#include "{{ project }}_inlines.h"
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
 index 46719f3..defa535 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
@@ -336,7 +418,7 @@ index 24894f2..56e0a88 100644
  bool build_lwzux(BuilderContext& ctx);
  bool build_lwzx(BuilderContext& ctx);
 diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
-index 6eae29d..437b982 100644
+index 6eae29d..276ba01 100644
 --- a/src/codegen/builders/context.cpp
 +++ b/src/codegen/builders/context.cpp
 @@ -177,12 +177,45 @@ void BuilderContext::emit_function_call(uint32_t address) {
@@ -389,6 +471,37 @@ index 6eae29d..437b982 100644
      println("\t{} = {};", r(3), temp());
      return;
    }
+@@ -200,6 +233,14 @@ void BuilderContext::emit_function_call(uint32_t address) {
+         return;
+       }
+ 
++      // P2: route a call to an inline-eligible leaf to its always_inline variant (defined in
++      // {project}_inlines.h). The out-of-line thunk + weak alias `name` still exist (dispatch/
++      // overrides unaffected); this is what actually inlines the leaf and drops the call site.
++      if (targetFn->isInlineLeaf()) {
++        println("\t{}_inl(ctx, base);", name);
++        return;
++      }
++
+       println("\t{}(ctx, base);", name);
+       return;
+     }
+diff --git a/src/codegen/builders/control_flow.cpp b/src/codegen/builders/control_flow.cpp
+index 102a538..734df3b 100644
+--- a/src/codegen/builders/control_flow.cpp
++++ b/src/codegen/builders/control_flow.cpp
+@@ -146,7 +146,10 @@ bool build_bctr(BuilderContext& ctx) {
+         case TargetKind::Function:
+         case TargetKind::Import:
+           if (auto* targetFn = ctx.graph().getFunction(label)) {
+-            ctx.println("\t\t{}(ctx, base);", targetFn->name());
++            if (targetFn->isInlineLeaf())  // P2: inline-eligible leaf -> always_inline variant
++              ctx.println("\t\t{}_inl(ctx, base);", targetFn->name());
++            else
++              ctx.println("\t\t{}(ctx, base);", targetFn->name());
+           } else {
+             REXCODEGEN_ERROR(
+                 "Jump target 0x{:08X} classified as function but not in graph at bctr 0x{:08X}",
 diff --git a/src/codegen/builders/memory.cpp b/src/codegen/builders/memory.cpp
 index 3dd7fa5..915eb6b 100644
 --- a/src/codegen/builders/memory.cpp
@@ -419,11 +532,92 @@ index 3dd7fa5..915eb6b 100644
  bool build_stwbrx(BuilderContext& ctx) {
    ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
    if (ctx.insn.operands[1] != 0)
+diff --git a/src/codegen/codegen_writer.cpp b/src/codegen/codegen_writer.cpp
+index 69e4793..a367686 100644
+--- a/src/codegen/codegen_writer.cpp
++++ b/src/codegen/codegen_writer.cpp
+@@ -16,6 +16,7 @@
+ #include <filesystem>
+ #include <string>
+ #include <unordered_map>
++#include <unordered_set>
+ 
+ #include <fmt/format.h>
+ #include <inja/inja.hpp>
+@@ -190,6 +191,23 @@ bool CodegenWriter::write(bool force) {
+ 
+   const std::string& projectName = config().projectName;
+ 
++  // P2 leaf-inlining: mark tiny straight-line leaves inline-eligible (after rexcrt rename, before
++  // emission) so call-site emission can route eligible callees to the always_inline variant.
++  // GATED OFF BY DEFAULT (maxBytes=0 => nothing marked). Measured 2026-05-29: at maxBytes=64 this
++  // inlined 1,679 leaves / 17,448 sites (mostly the __save/__restgprlr millicode) and cut front-end
++  // stalls hard (BACLEARS -23%, DSB-miss -57%), but the combat FLOOR was NEUTRAL (the floor is
++  // back-end/raw-work-bound, not front-end-bound) at +7.4% .text -- so it fails the floor keep-bar
++  // and is not shipped. The capability is correct + gate-passing and preserved for a front-end-bound
++  // target (smaller-BTB/-DSB CPU, or a less execution-heavy guest): raise maxBytes (e.g. 64) to enable.
++  // See docs/FLOOR-LEAF-INLINE-REPORT.md + docs/P2-LEAF-INLINE-DESIGN.md.
++  {
++    std::unordered_set<uint32_t> rexcrtAddrs;
++    rexcrtAddrs.reserve(rexcrtByAddr.size());
++    for (const auto& [addr, crtName] : rexcrtByAddr)
++      rexcrtAddrs.insert(addr);
++    graph().markInlineLeaves(config(), rexcrtAddrs, /*maxBytes=*/0);
++  }
++
+   TemplateRegistry registry;
+   if (!config().templateDir.empty())
+     registry.loadOverrides(config().templateDir);
+@@ -220,9 +238,13 @@ bool CodegenWriter::write(bool force) {
+     return rexcrtByAddr.contains(static_cast<uint32_t>(fn->base()));
+   });
+ 
+-  // Build EmitContext -- resolver is now properly connected
++  // Build EmitContext -- resolver is now properly connected.
++  // inlinesHeader collects the always_inline bodies of inline-eligible leaves (P2); written below.
++  std::string inlinesHeader;
++  inlinesHeader.reserve(1 * 1024 * 1024);
+   EmitContext emitCtx{binary(), config(), graph(),
+                       static_cast<uint32_t>(analysisState().entryPoint), nullptr};
++  emitCtx.inlinesOut = &inlinesHeader;
+   if (runtime_)
+     emitCtx.resolver = runtime_->export_resolver();
+ 
+@@ -252,6 +274,21 @@ bool CodegenWriter::write(bool force) {
+   SaveCurrentOutData();
+   REXCODEGEN_TRACE("Recompilation complete.");
+ 
++  // Generate {project}_inlines.h: the always_inline bodies of inline-eligible leaves (P2). Included
++  // at the END of {project}_init.h (after the type/macro setup + DECLARE_REX_FUNC declarations), so
++  // the bodies see everything they need and every recomp TU can inline them. Always written (even if
++  // empty) so the #include in init.h resolves.
++  {
++    std::string hdr;
++    hdr.reserve(inlinesHeader.size() + 256);
++    hdr += "// Auto-generated by rexglue (P2 leaf-inlining). Always-inline bodies of inline-eligible\n";
++    hdr += fmt::format("// leaf functions. Included at the END of {}_init.h. Do not edit.\n", projectName);
++    hdr += "#pragma once\n\n";
++    hdr += inlinesHeader;
++    out = std::move(hdr);
++    SaveCurrentOutData(fmt::format("{}_inlines.h", projectName));
++  }
++
+   // Generate sources.cmake
+   REXCODEGEN_TRACE("Recompile: generating sources.cmake");
+   {
 diff --git a/src/codegen/function_graph.cpp b/src/codegen/function_graph.cpp
-index 0c0d1be..9f01133 100644
+index 0c0d1be..c3c3d20 100644
 --- a/src/codegen/function_graph.cpp
 +++ b/src/codegen/function_graph.cpp
-@@ -607,28 +607,16 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+@@ -21,6 +21,7 @@
+ 
+ #include <rex/codegen/binary_view.h>
+ #include <rex/codegen/code_emitter.h>
++#include <rex/codegen/config.h>
+ #include <rex/codegen/function_graph.h>
+ #include <rex/codegen/function_scanner.h>
+ #include <rex/logging.h>
+@@ -607,28 +608,16 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
    bool generateSeh = sehInfo && !sehInfo->scopes.empty() && ctx.config.generateExceptionHandlers;
    if (generateSeh) {
      emit_println(body, "\t\t}} SEH_CATCH_ALL {{");
@@ -462,7 +656,7 @@ index 0c0d1be..9f01133 100644
      emit_println(body, "\t\t}} SEH_END");
      emit_println(body, "\t}}\n");
    } else {
-@@ -674,6 +662,13 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+@@ -674,6 +663,13 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
  
    // If SEH, emit SEH_TRY and indent body
    if (generateSeh) {
@@ -476,6 +670,94 @@ index 0c0d1be..9f01133 100644
      emit_println(out, "\tSEH_TRY {{");
      std::string indentedBody;
      indentedBody.reserve(body.size() + body.size() / 20);
+@@ -688,9 +684,87 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+     out += body;
+   }
+ 
++  // --- P2: selective leaf-inlining ---
++  // An inline-eligible leaf is emitted as an always_inline body in the shared {project}_inlines.h
++  // (visible to every TU so its direct callsites inline) plus a thin out-of-line thunk here (so the
++  // weak alias + __imp__ + dispatch table are unchanged -- overrides/dispatch keep working). The body
++  // is emitted exactly ONCE (the header inline); the TU keeps only the thunk. markInlineLeaves()
++  // guarantees such a function has NO mid-asm-hook externs and NO SEH, so `out` begins exactly with
++  // the DEFINE_REX_FUNC opener -- the substr split below is therefore safe. See P2-LEAF-INLINE-DESIGN.
++  if (isInlineLeaf() && ctx.inlinesOut) {
++    const std::string opener = fmt::format("DEFINE_REX_FUNC({}) {{\n", name);
++    if (out.compare(0, opener.size(), opener) == 0) {
++      // inner = everything after the opener line (REX_FUNC_PROLOGUE + local decls + body + close)
++      const std::string inner = out.substr(opener.size());
++      *ctx.inlinesOut += fmt::format("STATIC_INLINE_REX_FUNC({}) {{\n", name);
++      *ctx.inlinesOut += inner;
++      // The TU contribution becomes a thunk whose single statement is the (always-inlined) leaf.
++      out = fmt::format("DEFINE_REX_FUNC({}) {{\n\t{}_inl(ctx, base);\n}}\n\n", name, name);
++    } else {
++      REXCODEGEN_WARN("inline-leaf {} did not start with expected DEFINE opener; emitting normally",
++                      name);
++    }
++  }
++
+   return out;
+ }
+ 
++void FunctionGraph::markInlineLeaves(const RecompilerConfig& cfg,
++                                     const std::unordered_set<uint32_t>& rexcrtAddrs,
++                                     uint32_t maxBytes) {
++  size_t n = 0;
++  for (auto& [addr, nodeptr] : functions_) {
++    FunctionNode* fn = nodeptr.get();
++    fn->inlineLeaf_ = false;
++    if (!fn->isSealed())
++      continue;
++    if (fn->authority() == FunctionAuthority::IMPORT)
++      continue;
++    if (rexcrtAddrs.contains(fn->base()))  // rexcrt CRT replacements are emitted separately
++      continue;
++    if (fn->blocks().empty())  // stub
++      continue;
++    if (!fn->calls().empty() || !fn->tailCalls().empty())  // not a leaf (no bl/bctrl/blrl out)
++      continue;
++    if (!fn->jumpTables().empty())  // indirect dispatch (bctr switch)
++      continue;
++    if (fn->hasExceptionInfo() || fn->hasExceptionHandler())  // no SEH/C++ EH/setjmp frame
++      continue;
++    if (fn->size() == 0 || fn->size() > maxBytes)
++      continue;
++
++    bool ok = true;
++    // Exclude an LR DATA read (mflr / mfspr SPR_LR): inlining would capture the CALLER's return
++    // address, not the leaf's. A terminal/return blr also "reads_lr" but is_return/is_branch -- it
++    // just becomes fallthrough when inlined, which is correct, so it is allowed.
++    for (auto* insn : fn->instructions()) {
++      auto sem = insn->get_semantics();
++      if (sem.reads_lr && !sem.is_return && !sem.is_branch) {
++        ok = false;
++        break;
++      }
++    }
++    if (!ok)
++      continue;
++    // Exclude any function whose body contains a mid-asm hook address: a hook must fire at one fixed
++    // address, not at N inlined copies.
++    if (!cfg.midAsmHooks.empty()) {
++      for (uint32_t a = fn->base(); a < fn->end(); a += 4) {
++        if (cfg.midAsmHooks.contains(a)) {
++          ok = false;
++          break;
++        }
++      }
++    }
++    if (!ok)
++      continue;
++
++    fn->inlineLeaf_ = true;
++    ++n;
++  }
++  REXCODEGEN_TRACE("markInlineLeaves: {} inline-eligible leaves (maxBytes={})", n, maxBytes);
++}
++
+ void FunctionGraph::addCodeBuffer(uint32_t baseAddress, const uint8_t* data, size_t size) {
+   assert_always("FunctionGraph::addCodeBuffer not implemented. Use Recompiler with builders");
+   return;
 diff --git a/src/codegen/instruction_dispatch.cpp b/src/codegen/instruction_dispatch.cpp
 index 40ae269..279b10d 100644
 --- a/src/codegen/instruction_dispatch.cpp

@@ -38,8 +38,11 @@ if [ "$MODE" = "full" ]; then
   # NO rule to refresh that copy from the freshly-installed .so -- so an SDK/.so change (e.g. the
   # -mcmodel flip) would silently NOT reach the game. Copy the install .so (correct RUNPATH/SONAME)
   # into the port dir here. Caller guarantees no live game (build-only), so the mmap'd .so is free.
-  INSTALL_SO="$(ls "$SDK_INSTALL"/lib64/librexruntime.so "$SDK_INSTALL"/lib/librexruntime.so 2>/dev/null | head -1)"
-  if [ -n "$INSTALL_SO" ] && [ -f "$INSTALL_SO" ]; then
+  INSTALL_SO=""
+  for d in lib64 lib; do
+    if [ -f "$SDK_INSTALL/$d/librexruntime.so" ]; then INSTALL_SO="$SDK_INSTALL/$d/librexruntime.so"; break; fi
+  done
+  if [ -n "$INSTALL_SO" ]; then
     cp -f "$INSTALL_SO" "$PORT_BUILD/librexruntime.so"
     echo "  [build] refreshed port librexruntime.so from $INSTALL_SO"
   fi
