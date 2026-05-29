@@ -72,6 +72,9 @@ volume is the wall (→P1 is the only path). This host can't self-test; needs a 
   count *rose*; guest loads rarely provably-alias so little CSE) AND **fails the gate** (sync/lwsync/
   eieio are no-ops, so volatile is the only barrier; removal hoists polling loads → boot/nav hang).
   The proper non-volatile+`atomic_signal_fence`-at-sync version would boot but perf is still neutral.
+- **ThinLTO on the exe** (`-flto=thin`): cross-TU inlining of the hot mid-size call chain works +
+  gate-passes, but floor-neutral (+0.3 over 8 reps = within noise) at +5.2 % .text + slower build.
+  Same branch-removal-vs-code-growth wash as leaf-inline. Only useful for avg-smoothness, not the floor.
 - **HT contention:** REJECTED — `affinity_test.sh` no-HT (6 physical cores) vs default (12 logical) is
   neutral-to-worse (−0.8). The 39 % front-end is the code's own MITE starvation, not a stolen sibling
   front-end. TimerThread's 17 % CPU is wasteful but runs on spare cores; doesn't gate the floor.

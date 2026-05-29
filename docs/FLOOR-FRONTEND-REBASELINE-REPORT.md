@@ -40,6 +40,7 @@ back-end has spare capacity. `perf annotate` of the #1 hot fn (`sub_821B9270`, 1
 | **arch flags** `-mmovbe -mbmi -mbmi2 -mlzcnt -mpopcnt` (exe) | fuse load+bswap→movbe, flagless shifts, lzcnt | **Main-thread uops +10 %** (87.7B→96.6B, uops/insn 1.056→1.188); .text +6.5 % | `movbe` *forces* byteswaps clang had **elided** (eq-compares / store-back of loaded values) AND defeats load-folding into ALU ops (a `movbe` can't be a memory operand). Wrong direction. |
 | **rlwinm/rlwnm/rlwimi special-casing** | replace `rotl64(dup)&mask` with `shl`/`shr`/`and` for slwi/srwi/extract | **zero headroom** | clang -O3 **already** canonicalizes the idiom — `cur_slwi`/`cur_srwi`/`cur_gen` emit byte-identical asm to the hand-written `shl/shr/and`. The rotate/dup exists only in the C++ source. |
 | **non-volatile guest RAM** (drop `volatile` from REX_LOAD/STORE) | unblock CSE/reorder/hoist of guest loads | **neutral perf + FAILS detdiff gate** | guest loads have distinct un-provable-alias addresses ⇒ little CSE; the optimizer's added scheduling freedom *grew* hot-fn instruction count (sub_821B9270 117→134). And `sync/lwsync/eieio` are **no-ops** (no compiler barrier) — `volatile` is the *only* thing preventing the compiler hoisting polling loads across barriers, so removal broke boot/nav (`session_failed_no_in_level`). |
+| **ThinLTO on the exe** (`-flto=thin`) | cross-TU inline the hot mid-size call chain (sub_821B9270→sub_8244CE40→…, in separate recomp.N.cpp TUs) to remove call/return taken-branches | **floor NEUTRAL (+0.3, within noise); gate-pass** | cross-TU inlining DID happen (hot fn's callees inlined away) and avg is marginally smoother, but median p10 13×8reps = 14.9 vs base 14.6 (+0.3, overlapping 13.8–15.5; first 5-rep run's +0.6 was noise). +5.2 % .text. Same trade as leaf-inline: branch-removal ≈ code-growth ⇒ net wash on a front-end-bound floor. Not kept (under +1.0 bar, grows .text, slower build). |
 
 ## §3 — Why front-end levers (this session + prior) are neutral, mechanistically
 The front-end stall is **fetch-latency dominated** (resteers + MITE delivery), and it is **not fixable by
@@ -94,4 +95,7 @@ load drifts between sessions; the *internal* A/B is what's valid.)
 - Non-volatile guest RAM (naive): neutral perf + breaks correctness (no sync barriers). The *proper*
   version (non-volatile + `atomic_signal_fence` at sync/lwsync/eieio) would boot but perf is neutral
   (instruction count rises, not falls) — not worth it for this front-end-bound floor.
+- **ThinLTO on the exe** (`-flto=thin -fuse-ld=lld`): floor-neutral (+0.3 over 8 reps, within noise),
+  +5.2 % .text, slower build. Cross-TU inlining works + gate-passes but doesn't move the floor — same
+  branch-removal-vs-code-growth wash as leaf-inline. Don't re-add unless the goal is avg-smoothness.
 - All per-instruction "emit better C++" codegen levers generally: clang -O3 already minimizes.
