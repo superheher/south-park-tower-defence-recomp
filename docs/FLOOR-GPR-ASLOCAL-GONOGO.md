@@ -156,6 +156,37 @@ gate to revisit: a CP-thread profile showing those bulk-SIMD functions sum to >3
 
 ---
 
+## 3b. Pivot — compile-level "exotic" levers (movbe fusion + Machine Outliner): floor-neutral
+
+(Scoped when asked whether any "ancient-wizard" lever remained. The build was using **default
+`-march`** — so clang emitted 264,539 `mov`+`bswap` pairs for guest byte-swaps and **0 `movbe`**,
+despite this i9-8950HK supporting MOVBE — and the **LLVM Machine Outliner was OFF**. Both are the
+canonical "dedupe the repeated PPC→x86 idiom / fuse the load-swap" levers prior reports named as the
+*only* path to the floor. So they were built and **measured** — the first time these compile-level
+levers were tested here.)
+
+| variant (stacked on Phase C) | `.text` | vs Phase C | vs 12 MB L3 | bswap | movbe | gate | floor p10 |
+|---|---|---|---|---|---|---|---|
+| Phase C (live baseline) | 19,610,528 | — | 1.63× | 264,539 | 0 | — | **14.6** |
+| `-march=native` | 19,218,637 | −2.00 % | 1.53× | 40,358 | 254,114 | **pass** | 14.3 (Δ −0.3) |
+| `-march=native` + Machine Outliner | **17,870,591** | **−8.87 %** | **1.42×** | 15,146 | 147,935 | **pass** | 14.0 (Δ −0.6) |
+
+(Outliner flags: `-mllvm -enable-machine-outliner=always -mllvm -outliner-leaf-descendants`.
+Floor A/B = `ab.sh 90 3`, interleaved, median p10 of heavy windows. From the original 23.36 MB
+baseline the outliner build is **−23.5 %** total.)
+
+**Both pass detdiff (behaviour-safe) but are floor-neutral — and this is the *strongest* proof of
+the capacity wall yet.** The Machine Outliner is the maximal *automatic* idiom-dedup tool — exactly
+the "codegen-level absolute `.text` reduction" every prior report named as the one path to the floor.
+It really cut −8.87 % (fusing 250 k byte-swaps + outlining repeated prologue/epilogue idiom), and the
+floor **still did not move** (in fact −0.6: the outlined code adds calls/taken-branches that slightly
+hurt I-cache locality). Reason: 17.87 MB is **still 1.42× L3** — it does not fit. This closes the
+last loophole in the "maybe the *hot per-frame working set* is smaller than total `.text` and could be
+squeezed under L3" reasoning: even −23.5 % absolute + MOVBE fusion does not approach cache-fit or
+move the floor. **(Value elsewhere: movbe+outliner are a legitimate win for distribution size /
+average-frame density / power — they are correct and gate-passing — just not for the floor. Could be
+shipped alongside PGO if a smaller/cooler build is wanted.)**
+
 ## 4. The floor is at the hardware limit (capstone)
 
 Every avenue to the **floor** is now closed with measurement:
@@ -165,7 +196,18 @@ Every avenue to the **floor** is now closed with measurement:
 - **Codegen footprint** (`*_as_local`): the correct, shippable subset (cr/xer/ctr/reserved,
   −16.06 %) is floor-neutral (`CODEGEN-ASLOCAL-REPORT.md`); the full GPR set is **(a)** correctness-
   blocked at boot **and (b)** — proven here — projects to 17.84 MB ≈ 1.49× L3, still no cache-fit.
+- **Compile-level idiom levers** (§3b): `-march=native` (movbe fusion) + LLVM Machine Outliner —
+  −8.87 % `.text` (−23.5 % from the original baseline), gate-passing, and **floor-neutral** (the
+  maximal auto-dedup tool can't reach cache-fit; 17.87 MB still 1.42× L3).
 - **GPU offload** (§3): wrong thread, the bulk-SIMD work is already on GPU, residue is single-digit %.
+
+**Exotic levers that don't apply on this hardware (checked, not just assumed):** Intel CAT/L3
+cache-partitioning (would pin the hot code into reserved L3 ways) — **this i9-8950HK has no CAT**
+(`cat_l3` absent in `/proc/cpuinfo`, `resctrl` won't mount); hugepages for `.text` — **iTLB is not
+the bottleneck** (0.055 % miss); MSR prefetcher tweaks (`/dev/cpu/*/msr` present) — prefetch adds no
+L3 *capacity*. The one lever big enough in principle is an **AOT+interpreter hybrid** (don't compile
+cold functions — interpret them compactly — to cut the bulk of the 17.9 MB), but that is weeks of
+SDK redesign and effectively a different recompiler, not an in-tree knob.
 
 **Mechanism:** the combat floor is **I-cache *capacity*-bound**. The recompiled `.text` (≥17.84 MB
 even in the unreachable best case; 19.61 MB shipped) is 1.5-1.6× the **12 MB L3** of this 2018
