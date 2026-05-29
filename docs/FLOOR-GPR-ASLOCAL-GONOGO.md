@@ -11,14 +11,22 @@ and the memory `sp_combat_perf_frontend_bound`.
 
 ## 1. TL;DR — **NO-GO** (decided on *measured* numbers, no redesign needed)
 
-> **Headline correction (see §3c):** the combat floor is **L2 + DSB-µop-cache bound, not L3-bound.**
-> A per-cache-level combat profile shows the hot working set *fits* the 12 MB L3 (only 9 % of code
-> reads reach DRAM) but overflows L2 (256 KB/core) and swamps the µop-cache (87 % MITE). So every
-> **megabyte-scale** lever in this report (AS_LOCAL, movbe+outliner, BOLT, and even the AOT+interpreter
-> hybrid) is floor-neutral *by mechanism*: the real target is ~256 KB / KB, ~5× below even the hot
-> core, and unreachable without making hot code ~5× denser (impossible without slower-per-instruction
-> abstraction). The "≫ 12 MB L3" framing below is kept as written for the original AS_LOCAL argument,
-> but read it as "far above the true 256 KB L2 target" — the conclusion is unchanged and strengthened.
+> ## ⚠ MAJOR CORRECTION (2026-05-29, supersedes the whole "capacity-bound" thesis below — see §7)
+> **The floor is NOT i-cache / L2 / DSB *capacity*-bound. It is BRANCH-MISPREDICTION-bound.** A
+> direct TMA-L3 front-end breakdown during combat shows the fetch stall is **39.3 % branch-resteers
+> vs only 3.6 % i-cache-miss and 3.4 % iTLB.** Corroborated: the hottest functions are **464–669
+> *bytes*** (fit L1i thousands of times over — capacity was never their problem); the **conditional
+> branch mispredict rate is 22 %** and the **return mispredict rate is 21 %** (healthy is <2–5 %);
+> branch density is **1 conditional branch per 27 instructions**. The Main (guest-sim) thread runs at
+> **1.0 CPU** (genuinely CPU-bound, not pacing-waiting) and the GPU is **17–27 % idle**.
+> **This means everything below — and the L3/L2/DSB "capacity wall" framing in §3b/§3c/§4 — diagnosed
+> the wrong bottleneck.** Size-reduction levers (AS_LOCAL, movbe+outliner, BOLT, the hybrid) were all
+> neutral *because they attack code size, not branch prediction.* The NO-GO verdicts on GPR-as-local
+> and GPU-offload still stand (they were never going to help), but the *reason* the floor doesn't move
+> is misprediction, and **misprediction is at least partly a fixable codegen problem, not a hardware
+> wall** (it would also improve on machines with better predictors). Read §7 for the corrected
+> mechanism + the candidate fixable levers. The text below is kept verbatim for provenance but its
+> "capacity-bound / hardware-bound" conclusion is **retracted**.
 
 The full GPR/FPR/VR-as-local set — the **maximum** AS_LOCAL footprint reduction physically
 available — was **already built and its `.text` measured** in the prior session (Phase D.1/D.2).
@@ -334,3 +342,85 @@ These help **avg/max** and power, not the capacity-bound floor:
 - **Decision recorded:** GPR-as-local floor lever = **CLOSED (NO-GO, measured)**. GPU-offload pivot
   = **CLOSED (NO-GO)**. The floor is hardware-bound. Orthogonal avg/max work (PGO, dead-work
   micro-opts) is the only remaining in-tree perf headroom.
+
+---
+
+## 7. CORRECTED ROOT CAUSE — the floor is branch-misprediction-bound (2026-05-29)
+
+This section **supersedes** the "I-cache / L2 / DSB capacity wall" mechanism asserted in §3b, §3c,
+§4 and in the earlier reports (`PERF-OVERNIGHT-REPORT.md`, `CODEGEN-*-REPORT.md`). Those reports
+correctly observed *front-end-bound* and correctly found every size-reduction lever neutral — but
+they mis-attributed the cause to instruction-fetch **capacity**. A direct front-end breakdown shows
+it is **branch misprediction**.
+
+### 7.1 The decisive measurement (`tools/perf/floor_rootcause.sh`, live Stan's House combat)
+
+**TMA front-end (level-3) breakdown — where the fetch stall actually comes from:**
+
+| cause | share of stall |
+|---|---|
+| **branch resteers (BACLEARS.ANY = 1.85 B)** | **39.3 %** ← dominant |
+| i-cache misses (ICACHE_16B.IFDATA_STALL) | 3.6 % |
+| iTLB (ICACHE_TAG.STALLS) | 3.4 % |
+| MS switches (microcode) | 2.3 % |
+| DSB↔MITE switches | 1.1 % |
+| LCP (length-changing prefix) | 0.0 % |
+
+The stall is **~11× more branch-resteer than i-cache.** The "capacity" levers were neutral because
+i-cache was never more than ~4 % of the problem.
+
+**Corroborating facts (all from the same run):**
+- **Hot functions are tiny** — `sub_821B9270` (12.6 % of all self-time) = **464 B**; `sub_821C6E58`
+  = 669 B; `sub_8244CE40` = 31 B; the GPR helpers 66/74 B. Each fits L1i (32 KB) hundreds–thousands
+  of times over. A 464 B hot function cannot be "i-cache capacity"-bound; it stalls on *mispredicts*.
+- **Main thread = 1.0 CPU utilized** → genuinely CPU-bound, NOT blocked on pacing/sync. (Rules out
+  the "it's just the present-pacing bug" hypothesis for the floor — that bug causes the *sinusoid*,
+  a separate issue.)
+- **GPU 17–27 % busy** → not GPU-bound (confirms prior).
+- **~178 M instructions per rendered frame** at the ~25 fps dips (121 B insn / 20 s ÷ ~34 fps avg) —
+  enormous over-execution for a 2010 tower-defense title (the recompiler expands ~4–7× per guest insn).
+
+### 7.2 Mispredict breakdown by branch TYPE (`tools/perf/branch_breakdown.sh`, per 10 s combat)
+
+| branch type | mispredicts | share | mispredict rate |
+|---|---|---|---|
+| **conditional** | 148.5 M | **69.2 %** | **22.1 %** (672 M conditional br) |
+| **return** | 51.9 M | **24.6 %** | **20.6 %** (252 M returns) |
+| indirect | 9.5 M | 4.5 % | — |
+| call | 1.1 M | 0.5 % | — |
+
+Branch **density: 1 conditional branch every 27 instructions**; 1 call/94; 1 return/73. Healthy
+native code mispredicts <2–5 %; here conditionals miss at **22 %** and returns at **21 %** — both
+pathological.
+
+### 7.3 What this means — and what is plausibly FIXABLE (hypotheses, not yet tested)
+
+The floor is **not a hardware capacity wall** — a 22 % conditional + 21 % return mispredict rate is a
+**codegen pathology**, and it would also be less severe on a CPU with a bigger BTB / better predictor
+(so the user's "it's a Core i9, this is absurd" intuition is right — and a *different* desktop CPU
+will likely floor higher). Two candidate levers, in priority order, each to be **measured** (detdiff
+gate + `ab.sh` floor A/B) before believing:
+
+1. **Return mispredicts (24.6 %, RSB).** Returns missing at 20.6 % means the CPU's Return-Stack-Buffer
+   is desynced — typical when a recompiler's guest call/return doesn't map to host `call`/`ret` pairs
+   (tail-call threading, indirect `blr` dispatch, or call-depth > 16-entry RSB). *Investigate how
+   `blr` is emitted* (`builders/branch.cpp` / `REX_CALL_INDIRECT` in `generated/.../*_init.h`): if a
+   guest return goes through the indirect function-table call rather than a real `ret`, the RSB can't
+   work. Making returns real `ret`s (or adding an RSB-friendly thunk) could recover a chunk of the
+   24.6 %. **This helps on every CPU.**
+2. **Conditional mispredicts (69 %, 22 % rate).** Harder — partly the guest's own data-dependent
+   logic (tower targeting/AI), partly possibly the recompiler emitting CR-flag-derived branches that
+   alias in the predictor. PGO *should* help branch layout but was floor-neutral — worth re-checking
+   *why* (does PGO actually feed branch-weight to the recompiled conditionals, or only to the C++
+   wrapper?). Lower-confidence; needs a focused look at how guest `bc`/CR comparisons are emitted.
+
+### 7.4 Honest status of this correction
+
+This overturns the headline conclusion of three prior reports. What is **certain** (measured,
+reproducible): the floor is misprediction-bound (39 % resteers vs 4 % i-cache), conditional+return
+dominated, on tiny hot functions, CPU-bound, GPU-idle. What is **hypothesis** (not yet built/tested):
+that the return/RSB path is fixable in codegen for a real floor gain. The NO-GO verdicts on
+GPR-as-local and GPU-offload are unaffected (both were size/throughput levers that never addressed
+misprediction). Next concrete step if the floor is to be pursued: read the `blr`/return emission,
+prototype an RSB-friendly return, gate + floor-A/B it. Tooling for this section:
+`tools/perf/floor_rootcause.sh`, `tools/perf/branch_breakdown.sh`.
