@@ -1,0 +1,30 @@
+== boot ==
+PID=3116173  [play] profile with: /home/h/src/recomp/rexglue-recomps/south-park-recomp/tools/gamectl.sh bench 20
+fps_before=swaps 51.1/s
+
+================ CACHE-LEVEL BREAKDOWN (20s, whole process) ================
+   152,700,614,374      cycles                                                                  (71.44%)
+   121,038,101,751      instructions                                                            (85.74%)
+     1,560,921,650      L1-icache-load-misses                                                   (85.62%)
+     1,148,275,822      l2_rqsts.code_rd_hit                                                    (85.74%)
+       380,513,934      l2_rqsts.code_rd_miss                                                   (85.71%)
+     1,531,948,303      l2_rqsts.all_code_rd                                                    (85.79%)
+        12,913,753      iTLB-load-misses                                                        (57.14%)
+
+---- LLC (L3) overall + offcore code demand to DRAM ----
+        44,013,555      LLC-loads                                                               (80.01%)
+         4,065,500      LLC-load-misses                                                         (79.96%)
+        13,493,569      LLC-stores                                                              (40.04%)
+       575,552,539      cache-references                                                        (59.99%)
+        76,210,648      cache-misses                                                            (79.96%)
+
+---- front-end uop source (DSB uop-cache vs MITE legacy decode) ----
+     5,955,414,365      idq_dsb_uops                                                          
+    40,519,017,829      idq_mite_uops                                                         
+     2,833,300,201      idq_ms_uops                                                           
+
+---- fetch-latency vs fetch-bandwidth (TMA L2 frontend) ----
+       413,808,049      CPU_CLK_UNHALTED.REF_XCLK        #     35.9 %  tma_fetch_latency      
+                                                         #     14.7 %  tma_fetch_bandwidth    
+fps_after=swaps 50.5/s
+CACHE_LEVELS_DONE

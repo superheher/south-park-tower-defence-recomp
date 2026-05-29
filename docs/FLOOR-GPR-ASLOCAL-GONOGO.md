@@ -11,6 +11,15 @@ and the memory `sp_combat_perf_frontend_bound`.
 
 ## 1. TL;DR — **NO-GO** (decided on *measured* numbers, no redesign needed)
 
+> **Headline correction (see §3c):** the combat floor is **L2 + DSB-µop-cache bound, not L3-bound.**
+> A per-cache-level combat profile shows the hot working set *fits* the 12 MB L3 (only 9 % of code
+> reads reach DRAM) but overflows L2 (256 KB/core) and swamps the µop-cache (87 % MITE). So every
+> **megabyte-scale** lever in this report (AS_LOCAL, movbe+outliner, BOLT, and even the AOT+interpreter
+> hybrid) is floor-neutral *by mechanism*: the real target is ~256 KB / KB, ~5× below even the hot
+> core, and unreachable without making hot code ~5× denser (impossible without slower-per-instruction
+> abstraction). The "≫ 12 MB L3" framing below is kept as written for the original AS_LOCAL argument,
+> but read it as "far above the true 256 KB L2 target" — the conclusion is unchanged and strengthened.
+
 The full GPR/FPR/VR-as-local set — the **maximum** AS_LOCAL footprint reduction physically
 available — was **already built and its `.text` measured** in the prior session (Phase D.1/D.2).
 Reading those numbers as what they are (cumulative *on top of* the shipped Phase C cut) gives the
@@ -186,6 +195,82 @@ squeezed under L3" reasoning: even −23.5 % absolute + MOVBE fusion does not ap
 move the floor. **(Value elsewhere: movbe+outliner are a legitimate win for distribution size /
 average-frame density / power — they are correct and gate-passing — just not for the floor. Could be
 shipped alongside PGO if a smaller/cooler build is wanted.)**
+
+## 3c. AOT+interpreter hybrid — staged feasibility + the decisive cache-level test (NO-GO for floor; corrects the mechanism)
+
+The one "big enough in principle" lever (§4) is a hybrid: don't recompile cold guest functions to
+native `.text` — interpret them compactly — to slash the recompiled footprint. Two questions were
+asked: **(a) can it be done incrementally with diagnosable milestones?** and **(b) would it actually
+move the floor?** Both were answered without writing an interpreter.
+
+**(a) Yes — it is the most stageable lever we have. The infrastructure already exists** (probed in
+the runtime, read-only):
+- `FunctionDispatcher` holds `std::unordered_map<uint32_t, PPCFunc*> function_table_`
+  (`include/rex/system/function_dispatcher.h:127`) with a public `SetFunction(guest_addr, func)`
+  (`function_dispatcher.cpp:240`) — **any of the 15,617 guest functions can be swapped, per-function,
+  at runtime.**
+- Uniform ABI: every function is a `PPCFunc*(PPCContext&, uint8_t* base)` → one interpreter trampoline
+  fits every address.
+- The unresolved-address fallback path **already exists**: `south_park_td_init.h:236` —
+  *"unregistered slots fall back to `rex::runtime::ResolveIndirectFunction`"* — the exact hook point.
+- The native↔interpreted call boundary is already uniform (a `bl` looks the target up in the same
+  table), so mixed execution needs no special-casing.
+- **Milestones:** M0 = PGO projection (done, below); M1 = interpreter opcode-by-opcode, verified
+  **offline & differentially** (run the same `ctx` through the recompiled function vs the interpreter,
+  compare output `ctx` — no game run); M2 = exclude functions **coldest→hottest** (10 %→20 %→…), each
+  step gated by detdiff + Δ`.text` + `ab.sh` floor A/B. The interpreter keeps **all** state in `ctx`
+  (no register promotion), so unlike GPR-as-local it is **inherently SEH/setjmp-compatible** — the
+  blocker that killed GPR-as-local is simply absent. So progress is monotone and each milestone is
+  independently diagnosable. **(a) = GO.**
+
+**(b) But it will NOT move the floor — and the cache-level test proves why, correcting the
+"L3-bound" wording used in all prior reports.**
+
+M0 projection (`tools/perf/m0_hybrid_projection.py`, joining the PGO profile `/tmp/sp/port.profdata`
+— 36.7 B block-executions — with per-symbol `.text` sizes):
+- **9,788 of 15,380 guest functions (63 %) never execute once during combat.** Only 5,592 ever run.
+- **All code that ever runs in combat = 5.51 MB** of `.text` (of 17.49 MB total guest code).
+- 99 % of all execution = **176 functions = 0.44 MB**; 99.9 % = 731 funcs = 1.30 MB.
+
+So the hybrid *can* produce a tiny native image — but that already exposes the contradiction with
+"`.text` 19.6 MB ≫ 12 MB L3 ⇒ overflows L3": if ≤5.5 MB ever runs in combat, it **fits** L3. The
+decisive per-cache-level combat profile (`tools/perf/cache_levels.sh`, 20 s heavy combat, fps ~51)
+settles it:
+
+| counter | value | reading |
+|---|---|---|
+| IPC | 0.79 | front-end-bound (confirmed) |
+| L1-icache-load-misses | 1.56 B | spill to L2 |
+| **L2 code-read miss** | **380 M (24.8 % of code reads)** | ¼ of code misses L2 |
+| L2 code-read hit | 1.15 B (75 %) | L2 catches ¾ |
+| **LLC (L3) load-miss → DRAM** | **4.07 M (9.2 %)** | almost nothing reaches DRAM |
+| cache-misses → DRAM (code+data) | 76 M (13 %) | low |
+| DSB : MITE : MS uops | **12.8 : 87.2** | uop-cache overwhelmed (worse than the earlier 18:82) |
+| fetch-latency vs bandwidth | 35.9 % vs 14.7 % | latency, not decode-bandwidth |
+
+**L2 code misses (380 M) are ~80× the code traffic that reaches DRAM. The hot working set FITS IN L3
+but NOT in L2.** The real wall is one level lower than every prior report stated: **L2 (256 KB/core)
+and the DSB µop-cache (KB-scale)** — 87 % of µops come from the legacy MITE decoder. This is the
+precise reason BOLT, AS_LOCAL (−16 %), and the outliner (−8.87 %) were **all** floor-neutral: each
+shrank total code below 12 MB (which already fit L3), but none brought the hot set near the **256 KB
+L2** or the **KB DSB**.
+
+**This kills the hybrid as a floor lever by *mechanism*, not analogy:** the hybrid interprets exactly
+the 63 % of functions that *never execute in combat* — they are already cache-cold and never enter
+L1i/L2/DSB during a frame. Removing them from `.text` changes the hot path's cache behaviour by
+**zero**. The hot 5.5 MB stays native and untouched, and its pressure on L2/DSB *is* the floor. (BOLT
+hot/cold-split already simulated this exact effect on the fetched set — and was measured neutral.)
+**(b) = NO-GO for the floor.** (The hybrid is still a real win for **distribution size / load time /
+RAM** — it removes 12 MB of never-in-combat code — and is well-de-risked/stageable if those are the
+goal.)
+
+**Why nothing reaches the real target:** to fit L2, even the 99.9 % hot core (1.30 MB) must get ~5×
+denser. The only way to 5× density is more abstraction (interpreter / threaded code) — which is
+**slower per instruction**. You cannot be 5× more compact *and* not slower; that contradiction is the
+floor. AS_LOCAL already demonstrated it (made code denser by removing ctx traffic → 1.16× isn't 5× →
+neutral).
+
+---
 
 ## 4. The floor is at the hardware limit (capstone)
 
