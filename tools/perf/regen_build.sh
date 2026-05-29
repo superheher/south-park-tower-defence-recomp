@@ -34,6 +34,15 @@ if [ "$MODE" = "full" ]; then
   echo "== [build] 4/4 configure + build port =="
   ( cd "$ROOT" && cmake --preset linux-amd64-release -DCMAKE_PREFIX_PATH="$SDK_INSTALL" >/dev/null )
   cmake --build "$PORT_BUILD" --parallel "$J"
+  # The exe loads librexruntime.so via RUNPATH=$ORIGIN (the port build dir), but the port build has
+  # NO rule to refresh that copy from the freshly-installed .so -- so an SDK/.so change (e.g. the
+  # -mcmodel flip) would silently NOT reach the game. Copy the install .so (correct RUNPATH/SONAME)
+  # into the port dir here. Caller guarantees no live game (build-only), so the mmap'd .so is free.
+  INSTALL_SO="$(ls "$SDK_INSTALL"/lib64/librexruntime.so "$SDK_INSTALL"/lib/librexruntime.so 2>/dev/null | head -1)"
+  if [ -n "$INSTALL_SO" ] && [ -f "$INSTALL_SO" ]; then
+    cp -f "$INSTALL_SO" "$PORT_BUILD/librexruntime.so"
+    echo "  [build] refreshed port librexruntime.so from $INSTALL_SO"
+  fi
 else
   echo "== [build] port-only rebuild =="
   cmake --build "$PORT_BUILD" --parallel "$J"

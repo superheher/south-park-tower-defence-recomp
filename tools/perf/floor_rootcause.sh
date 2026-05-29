@@ -41,6 +41,11 @@ perf stat -M tma_icache_misses,tma_itlb_misses,tma_branch_resteers,tma_dsb_switc
 echo "  --- raw branch + icache to size the two (8s) ---"
 perf stat -p "$PID" -e instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses \
   -- sleep 8 2>&1 | grep -iE 'instructions|branch|icache|iTLB'
+echo "  --- residual BTB-resteer events (the layer-2 floor wall; full per-1e9i isolation in resteer.sh) ---"
+echo "    FRONTEND_RETIRED.BRANCH_RESTEER does NOT exist on Coffee Lake; BACLEARS.ANY is the BTB-resteer proxy."
+echo "    (DSB_MISS is NOT subtracted from BACLEARS -- orthogonal uop-cache capacity, ~2.5x scale; see resteer.sh.)"
+perf stat -p "$PID" -e instructions,BACLEARS.ANY,INT_MISC.CLEAR_RESTEER_CYCLES,MACHINE_CLEARS.COUNT,ICACHE_64B.IFTAG_MISS,br_misp_retired.near_call \
+  -- sleep 8 2>&1 | grep -iE 'instructions|BACLEARS|CLEAR_RESTEER|MACHINE_CLEARS|IFTAG|near_call'
 
 echo
 echo "############ (3) DO THE HOTTEST FUNCTIONS FIT L1i(32K)/L2(256K)? ############"

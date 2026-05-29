@@ -1,3 +1,27 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 83902e7..7e25a7e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -89,8 +89,17 @@ set(CMAKE_RELWITHDEBINFO_POSTFIX rd)
+ if(NOT WIN32)
+     # Use appropriate code model based on architecture
+     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+-        # Large code model on x86_64 for linking with very large recompiled executables (35MB+)
+-        add_compile_options(-mcmodel=large)
++        # -mcmodel=medium (not large) for all SDK libs (rexcore/graphics/audio/... OBJECT libs +
++        # the rexruntime SHARED lib = librexruntime.so). Same indirect-call pathology the recomp exe
++        # had under large: LARGE forces `movabs $imm64; call *reg`/`jmp *reg` for EVERY internal call,
++        # over-subscribing the ~4K-entry BTB -> a front-end resteer storm. The .so has ~142k indirect
++        # calls / ~221k movabs under large. MEDIUM lets intra-.so calls use 32-bit pc-relative direct
++        # branches (the .so is ~21MB << 2GB) while still 64-bit-addressing any >64KB data object, so it
++        # is safe. The .so is PIC, so cross-module calls still go via GOT/PLT, but the internal call
++        # graph (most of the 142k) becomes direct. The recomp exe is built in the PORT tree (find_package,
++        # not this directory) and already gets medium via rexglue_apply_target_settings.
++        # See docs/FLOOR-MCMODEL-MEDIUM-REPORT.md + FLOOR-SO-MEDIUM-REPORT.md.
++        add_compile_options(-mcmodel=medium)
+     else()
+         # Small code model for other architectures (ARM64, etc.)
+         add_compile_options(-mcmodel=small)
 diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
 index 4bd6694..0bff908 100644
 --- a/cmake/rexglue_helpers.cmake
