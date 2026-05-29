@@ -424,3 +424,40 @@ GPR-as-local and GPU-offload are unaffected (both were size/throughput levers th
 misprediction). Next concrete step if the floor is to be pursued: read the `blr`/return emission,
 prototype an RSB-friendly return, gate + floor-A/B it. Tooling for this section:
 `tools/perf/floor_rootcause.sh`, `tools/perf/branch_breakdown.sh`.
+
+---
+
+## 8. REAL ROOT CAUSE FOUND + FIXED — `-mcmodel=large` indirect-call storm (2026-05-29)
+
+§7 correctly said "branch-misprediction-bound, fixable in codegen, not a hardware wall" — that
+framing unlocked the fix. But §7's **type split was wrong**: it claimed conditional 69 % / return
+24.6 %. A direct re-read of the perf counters (`br_misp_retired.{conditional,near_call}`) on the
+shipped Phase C binary shows the opposite — **near_call 70 %, near_return ~26 %, conditional only
+2.3 %.** And `near_call` mispredicts can only come from **indirect** calls. The full analysis is in
+**`docs/FLOOR-MCMODEL-MEDIUM-REPORT.md`**.
+
+**Cause:** the recomp target was compiled `-mcmodel=large` (`cmake/rexglue_helpers.cmake`, comment
+"Large executable support"). The large code model forbids 32-bit pc-relative addressing, so clang
+emitted **every** guest call/branch as `movabs $imm64; call *reg` / `jmp *reg` — ~20k+ indirect
+sites that swamp the ~4K-entry BTB → the 39 % resteer storm. The model was never needed (`.text`
+~19 MB ≪ 2 GB; no large static sections; the 4 GB guest arena is a runtime `mmap` via a register
+base, not a linked symbol).
+
+**Fix:** `-mcmodel=large` → **`-mcmodel=medium`** (recomp exe only; `.so` untouched, md5 `1996b550`).
+Whole-binary disasm: **direct calls 1 → 85,220**, indirect calls 107,688 → 23,991 (the residual are
+the genuine `REX_CALL_INDIRECT_FUNC` dispatch sites), `.text` 19.61 → 18.65 MB (−4.9 %).
+
+**Measured (gate `status=pass`, behaviour-equivalent):**
+- **execution mispredicts (`br_misp_retired`/`branch-misses`) −79 %** (near_call rate 65 % → 17.6 %);
+- floor `ab.sh` 8-rep median p10 **14.35 → 15.0 (+0.65)**, clean/non-overlapping (8/8 reps), avg +0.6;
+- front-end resteers (BACLEARS) 39.3 % → 32.8 % only.
+
+**The nuance (§6.5 of the report):** killing the indirect calls removes ~79 % of the costly
+**misprediction flushes** (→ floor +0.65, avg +0.6) but BACLEARS fall only ~17 %, because even
+*direct* branches need BTB entries and ~157k of them still over-subscribe the BTB. So the residual
+floor wall is **BTB *capacity*** (a real predictor-capacity wall — a bigger-BTB CPU floors higher),
+plus the ~178 M insn/frame of raw guest work. **This is the corrected, final mechanism**: the floor
+was *partly* a fixable codegen pathology (indirect calls, now fixed) and *partly* a genuine
+prediction-structure capacity limit. It does NOT clear the +1.0 keep-bar (lands +0.65) but is a
+strict, gate-passing, multi-axis win shipped as the new best-known-good. Next lever (untried): cut the
+*number* of hot branch sites (selective leaf inlining — blocked today by per-function `noinline`).

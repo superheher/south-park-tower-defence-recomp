@@ -1,8 +1,27 @@
 # South Park recomp — attack the combat-floor branch-mispredict wall (codegen)
 
-> Next-session runbook. The combat-floor root cause was **corrected** on 2026-05-29: it is
-> **branch-misprediction-bound**, not the i-cache/L3/L2 *capacity* wall every earlier report claimed.
-> Full corrected analysis: `docs/FLOOR-GPR-ASLOCAL-GONOGO.md §7`.
+> ## ✅ RESOLVED 2026-05-29 (read `docs/FLOOR-MCMODEL-MEDIUM-REPORT.md` first)
+> The branch-mispredict wall's real cause was found and fixed: the recomp was compiled
+> **`-mcmodel=large`**, forcing every guest call/branch to `movabs;call *reg` / `jmp *reg`
+> (~20k+ indirect sites → BTB-thrash → the 39 % resteer storm). §7 below mis-split the mispredicts
+> (it said conditional 69 %; the truth was **near_call 70 %, conditional 2.3 %** — i.e. the
+> indirect calls). **Fix: `-mcmodel=large` → `medium`** (recomp exe only; `.so` md5 `1996b550`
+> unchanged). Measured, gate-pass, behaviour-equivalent: **execution mispredicts −79 %**, floor
+> 8-rep median p10 **14.35 → 15.0 (+0.65, clean/non-overlapping)**, avg +0.6, **`.text` −4.9 %**.
+> New best-known-good `south_park_td` md5 `bef1b65c`. Committed on `main` (NOT pushed).
+>
+> **Residual floor wall (next lever, untried):** killing indirect calls removed the misprediction
+> *flushes* (−79 %) but front-end *resteers* fell only 39.3 %→32.8 % — ~157k direct branches still
+> over-subscribe the ~4K-entry BTB. That is a genuine **predictor-capacity** wall (a bigger-BTB CPU
+> floors higher). The only remaining codegen lever is to cut the *number* of hot branch sites —
+> selective inlining of tiny leaf functions, today blocked by the per-function `noinline` in
+> `DEFINE_REX_FUNC` (`REX_WEAK_FUNC` = `weak, noinline`). Also still-open: the genuine indirect
+> dispatch (`REX_CALL_INDIRECT_FUNC`, residual 17.6 % near_call rate).
+
+> Next-session runbook (historical — superseded by the RESOLVED box above). The combat-floor root
+> cause was **corrected** on 2026-05-29: it is **branch-misprediction-bound**, not the i-cache/L3/L2
+> *capacity* wall every earlier report claimed. Full corrected analysis:
+> `docs/FLOOR-GPR-ASLOCAL-GONOGO.md §7` (and the FINAL mechanism in §8).
 
 ## Where we are
 Static recompilation (rexglue-sdk) of South Park: Let's Go Tower Defense Play! (XBLA)

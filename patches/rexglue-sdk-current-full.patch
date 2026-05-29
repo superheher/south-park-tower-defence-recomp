@@ -1,3 +1,30 @@
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index 4bd6694..0bff908 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -19,10 +19,20 @@ function(rexglue_apply_target_settings target_name)
+         pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+         target_include_directories(${target_name} PRIVATE ${GTK3_INCLUDE_DIRS})
+         target_link_libraries(${target_name} PRIVATE ${GTK3_LIBRARIES})
+-        # Large executable support
++        # Large executable support.
++        # NOTE: -mcmodel=medium (not large) on x86_64. The recompiled .text is ~19MB
++        # (<<2GB), so intra-module calls fit a 32-bit pc-relative displacement. Under the
++        # LARGE model clang must materialize every callee address (movabs $imm64) and emit
++        # an INDIRECT `call *reg`/`jmp *reg`; with ~20k+ such sites the BTB (~4K entries)
++        # is hopelessly over-subscribed -> ~65% of guest calls mispredict their target
++        # (measured: br_misp_retired.near_call dominated the front-end resteer storm that
++        # gates the combat floor). MEDIUM keeps code in the low 2GB (direct `call rel32`,
++        # no target prediction needed) while still addressing any >64KB data object with a
++        # 64-bit absolute, so it is safe for the 4GB guest arena (which is mmap'd at runtime
++        # via a register base anyway, not a linked symbol). See docs/FLOOR-MCMODEL-*.md.
+         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
+-            target_compile_options(${target_name} PRIVATE -mcmodel=large)
++            target_compile_options(${target_name} PRIVATE -mcmodel=medium)
+         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+             target_compile_options(${target_name} PRIVATE -march=armv8-a)
+         endif()
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
 index 6998a45..af1546f 100644
 --- a/include/rex/graphics/command_processor.h
