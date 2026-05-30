@@ -1,81 +1,46 @@
-# South Park recomp — next-session LAUNCH PROMPT: the floor is SERIAL RENDER-PIPELINE LATENCY (cores are free)
+# South Park recomp — next-session prompt: the heavy-combat floor is STRUCTURAL (do not re-chase blindly)
 
-> **THE FLOOR IS THE SERIAL PER-FRAME RENDER-PIPELINE ROUND-TRIP LATENCY** (guest-sim → CP-translate →
-> GPU-exec → present), NOT CPU throughput / core contention / thermal / saturation. A `perf sched` probe
-> this session PROVED it: the CP thread's average scheduling delay is **5 µs** (cores are free), it is only
-> **~50% on-cpu**, and it context-switches **~14k×/s** (runs in tiny bursts, blocks constantly). This is why
-> **every CPU-side lever for 7 sessions has been floor-neutral** — none shorten the dependency chain.
-> **READ FIRST:** `docs/FLOOR-AUDIO-DESPIN-REPORT.md` (§1 is the decisive measurement) and memory
-> `sp_floor_latency_bound`. Prior framing (`FLOOR-CP-ELISION-REPORT.md` / `sp_floor_cp_elision`: "CP
-> translation **throughput**") is now *refined* by this — the CP is not CPU-bound, it's latency-bound.
+> **READ FIRST:** `docs/FLOOR-STRUCTURAL-CONCLUSION-REPORT.md` and memory `sp_two_regime_lag`.
+> This session (2026-05-30/31) closed the floor campaign with a multi-probe, on-machine,
+> user-corroborated conclusion: **the 15–20 fps heavy-combat floor is the title's OWN per-frame CPU
+> cost at a fixed-60 Hz timestep**, in a serial *guest-logic → render → guest-waits* round-trip. It is
+> NOT an emulator inefficiency, NOT GPU-bound, and cannot be moved without speeding up the game.
 
-## Where we are
-Static recompilation (rexglue-sdk) of South Park: Let's Go Tower Defense Play! (XBLA) → native
-Linux/Vulkan, fully playable (boot→match→win). Repo `/home/h/src/recomp/rexglue-recomps` (super, `main`)
-+ submodule `south-park-recomp` (port, `main`). **SDK edits = granular patch series in
-`patches/0*.patch`** (the submodule gitlink stays on upstream `e8ce24f`; `git am` the series to apply —
-see `patches/README.md`). Identity `superheher <heh@vivaldi.net>`, on `main`, **NO Co-Authored-By
-trailer**, **commit, do NOT push** unless asked. Host: i9-8950HK (6c/12t), governor=performance, sudo
-`<redacted>`, disposable bench. **NOT thermally throttled under combat** (measured: cores hold ~4.2GHz all-core
-through the dip; `load_probe.sh`).
+## What was proven (don't re-derive — see the report for the probes/numbers)
+- The combat clock is **vblank-coupled fixed-timestep** — the decisive proof: at `REX_VIDEO_MODE_REFRESH_RATE=120`
+  the **combat ran ~2× faster** (user-watched), while menus/splashes (wall-clock-paced) did not. So any
+  lever that lets the guest proceed faster **speeds up the game** ⇒ the vsync/quantization lever is unsafe.
+- Frame periods are **hard-quantized to vblank multiples** (`quant_diag.sh`): a lever must cut **≥16 ms**
+  off a heavy frame to cross one boundary; every available CPU/codegen lever saves < 16 ms ⇒ floor-neutral
+  (explains all 7 prior neutral sessions).
+- The GPU is **idle** in the dip (`gpu_busy_probe.sh`, p50=3%) ⇒ not GPU-bound; draw-batching helps the
+  CPU-side render, not the GPU.
+- The guest "Main XThread" is **92% recompiled GAME code, 0.9% emulator** (`guest_profile.sh`); **51% is one
+  guest spin-WAIT** (`sub_821B9270`) for its own render round-trip (already de-spun, floor-neutral).
+- A latency A/B this session (`VblankBackoffWait` 2 ms→200 µs) was **floor-neutral** (kept p10 19.3 vs
+  19.8) — the guest wait is gated by real frame-completion, not re-check granularity. Reverted.
 
-**Current working binary (kept this session — audiofix, gate PASS, render-verified):** exe `848f191c`
-(`south_park_td.cpfence6`, UNCHANGED) + `librexruntime.so` `8d2bf92e` (`librexruntime.so.audiofix` = patch
-0015 audio de-spin on top of elis1). Prior was **elis1** (`.so` `5276a282`). The keep-bar reference base is
-**bothfix**: exe `d4b0f50b` + `.so` `605ce3ee`. Floor p10 ≈ 15 (bothfix) → ≈ 17-18 (elis1/audiofix).
+## The ONLY remaining theoretical lever (and why it needs YOU present)
+**Draw-call batching / CP-translate reduction.** A heavy 2-vbl frame ≈ guest-logic(~16 ms) + CP-render(~17 ms),
+serial, GPU idle. In the **deep 15 fps dip** (4 vbl/66 ms, render ~34 ms), *halving* the CP render could
+reach < 50 ms ⇒ 20 fps (+5 swaps — a real boundary cross). It is the one lever with headroom. BUT it is a
+large, risky change (coalescing draws / cutting `radv_UpdateDescriptorSets` ~7.5% / descriptor-set re-bind
+elision); a subtle bug corrupts combat rendering and the detdiff gate may not catch a wrong-state glitch.
+**Do this only with the user available to eyeball mid-combat rendering**, and gate hard. Even then it only
+*might* cross one boundary; it will not reach 60 fps.
 
-## THE TASK — shorten the per-frame serial dependency chain (the ONLY thing that can move the floor)
-CPU-side cuts are floor-neutral here (the cores are free; see §1 of the audio-despin report). Attack the
-ROUND-TRIP LATENCY, hardest-but-only-real first:
-1. **Overlap CP-translate with GPU-exec (biggest headroom).** The GPU HW is 17-26% idle, starved by the
-   serial CP burst. Pipeline the next frame's PM4→Vulkan translation against the current frame's GPU
-   execution (double-buffer the command stream / submit earlier / cut the present→next-frame stall). This
-   attacks the dependency chain directly. Non-trivial but it is the lever with real headroom.
-2. **Shorten the per-heavy-frame CP critical path** — draw batching/instancing for the many small
-   tower-defense sprites. After the audio de-spin, `radv_UpdateDescriptorSets` rose to ~7.5% of the CP
-   thread; coalescing identical-state draws cuts pipeline lookups + descriptor updates + cmd-buffer records
-   per frame, shortening the CP segment of the chain.
-3. **Cut sync-wait LATENCY on the guest→CP→present handshakes** — the *latency* of the round-trip, not the
-   CPU spent spinning (de-spinning is already done and is floor-neutral).
-**Measure the chain, not CPU%.** Use `cp_offcpu.sh` (perf sched) to see CP/GPU/present on-cpu vs blocked
-fractions and the per-stage wait, and the per-frame `[frame-diag]` split (translate/sync/present). A lever
-only matters if it shrinks the per-frame round-trip.
+## Constructive work that IS achievable
+1. **Fresh-install transient smoothness** (the OTHER lag regime): on a cold machine the first playthrough
+   compiles shaders/pipelines on the fly → frame-skip freezes (`vulkan_async_skip_incomplete_frames`).
+   Ship/verify a pre-warmed pipeline cache so a fresh first playthrough is smooth. The local machine is
+   already warm, so this benefits new installs, not the dev box.
+2. Otherwise: **the floor is done.** Don't burn sessions on CPU/codegen micro-levers — proven floor-neutral.
 
-## DEAD ENDS — do NOT retry for the floor (all measured neutral; the cores are FREE)
-- **Audio de-spin** (this session, patch 0015): removed ~20% whole-proc of Audio Worker mutex-spin → libc
-  DSO 22%→10%, gate-pass, render-correct — **floor-neutral** (kept as a CPU/power efficiency win, NOT a
-  floor lever). Confirmed the latency-bound model: freeing a spin just idles a spare core.
-- **Per-register-write micro-opt is EXHAUSTED** (prior): generic unchanged-write elision (~90% of writes)
-  + the TYPE0 dispatch-skip — the body-elision was the last worthwhile bite.
-- **De-spin / block-on-signal** (prior): CP `WAIT_REG_MEM`→CV block, guest Main→vblank-park — floor-neutral.
-- **Codegen / µop / layout / flags / mcmodel / PGO / BOLT / ICF / outliner / ThinLTO / GPR-as-local**
-  (6 prior sessions) — all floor-neutral. See `FLOOR-FRONTEND-REBASELINE-REPORT.md` + `FLOOR-OVEREXEC-REPORT.md`.
-- **Thermal / CPU-saturation** (this session): REFUTED on-machine — not throttled, 11 of 12 cores idle.
-- A bulk-constant `memcmp`-skip in `WriteRegistersFromMem` is a valid *throughput* micro-opt but is expected
-  floor-neutral too (cuts CP CPU, not chain length) — only worth it as efficiency, not for the floor.
-**Only chain-shortening (overlap/batch/cut-latency) can move the floor.**
-
-## Validation discipline (mandatory)
-- `tools/perf/detdiff.sh gate <label> 40` must be `status=pass`.
-- **MID-COMBAT screenshots** (`tools/perf/smoke_shot.sh <tag>` does play→escalate→3 shots) — the gate will
-  NOT catch a wrong-state rendering glitch; eyeball sprites/colors/transforms.
-- Floor A/B: `tools/perf/ab_both.sh 75 6 base <bothfix exe> <bothfix so> cand <new exe> <new so>` (swaps
-  BOTH binaries). Keep-bar: median p10 > +1.0 swaps/s vs bothfix, ≥5 heavy reps. The floor is **noisy
-  run-to-run (~±2)** — interleave + ≥6 reps; bothfix is the stable ~15.0 anchor.
-- `.so`-only change: `cmake --build third_party/rexglue-sdk/out/build/linux-amd64 --target install` then
-  `cp out/install/linux-amd64/lib64/librexruntime.so` into the port build dir (~20s, exe unchanged).
-  `tools/perf/regen_build.sh full` only if an init_h.inja/header change (new exe).
-- HOST GOTCHAS: (a) the harness BLOCKS a literal `sleep` token in a Bash string → put waits in a SCRIPT
-  FILE (`tools/perf/wait_for.sh <file> <marker> <timeout>`); (b) `gamectl play` uses `setsid`; (c) ONE game
-  instance only — run ONE `ab_both.sh` at a time and NEVER launch a 2nd while one is swapping binaries
-  (they collide and corrupt both); (d) `gamectl kill` + `rm -f /dev/shm/xenia_memory_*` cleans the shm leak.
-- ⚠ HARNESS: an early Bash command that exits non-zero CANCELS every later tool call in the same message.
-  Run benchmark/commit steps ONE per message and end each Bash with `; true`. Also `pkill -f ab_both.sh`
-  matches your OWN shell — build the pattern non-contiguously (`pat='ab''_both.sh'`) or use `gamectl kill`.
-
-## Tools (tools/perf/)
-`cp_offcpu.sh` (perf-sched on/off-cpu + sched-delay — THE decisive latency probe), `load_probe.sh`
-(per-core MHz + hot-thread count under dip), `turbo_probe.sh` (turbostat power/freq), `heavydip.sh`
-(per-thread/per-comm dip profile), `ab_both.sh` (both-exe+so A/B), `detdiff.sh` (gate), `smoke_shot.sh`,
-`floor.sh`, `regen_build.sh`. This session's artifacts: `audio_thermal_findings_2026-05-30.txt` (raw
-measurements + the two refuted hypotheses), `heavydip_elis1_baseline.txt`, `ab_audiofix.txt`.
+## Environment / discipline (unchanged)
+Repo `/home/h/src/recomp/rexglue-recomps` (super, `main`) + submodule `south-park-recomp` (port, `main`);
+SDK edits = `patches/0*.patch` on the upstream gitlink. Kept binary: exe `848f191c` (`south_park_td.cppfence6`)
++ `.so` `8d2bf92e` (audiofix). Identity `superheher <heh@vivaldi.net>`, commit (NOT push), no Co-Authored-By.
+Host i9-8950HK + RX 460/RADV, governor=performance, sudo `<redacted>`, NOT thermally throttled. New tools in
+`tools/perf/`: `cp_offcpu_stacks.sh`, `quant_diag.sh`, `gpu_busy_probe.sh`, `cold_cache_probe.sh`,
+`slack_probe.sh`, `guest_profile.sh`. Harness: never batch tool calls after a Bash that can exit non-zero;
+put `sleep` in a script file (`tools/perf/wait_for.sh`); ONE game instance at a time.
