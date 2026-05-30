@@ -112,9 +112,10 @@ a heavy dip; DSO = 79 % librexruntime + 13 % RADV + 7 % libc) — the map for an
   pass/equivalent (both the packet-only `.so` `1dd98fdb` and the full set `1a3f6076`), mid-combat render
   pixel-correct**. **Validated by re-profile** (`cp_oncpu_profile.sh`): `WritePacketStart`/
   `WritePacketEnd` dropped **out of the CP on-cpu top-30 entirely** (were 3.2%, now absent — folded into
-  callers). **Floor A/B** (`ab_both.sh 60 6`, on the packet-only subset): kept median p10 **19.3** vs **19.8** (+0.5, inside
-  the ±2 noise → floor-neutral, no regression; patch-0016's samples never dipped below 19.7 vs kept's 16.4,
-  so the heaviest frames are marginally more stable). Kept as a CPU efficiency win (same rationale as the
+  callers). **Floor A/B** (`ab_both.sh 60 6`, run twice — the packet-only `.so` and the full `.so` `1a3f6076`):
+  baseline median p10 **19.3** vs patch-0016 **19.8** both times (+0.5, inside the ±2 noise → floor-neutral,
+  no regression; patch-0016 ran ≥ baseline in 5/6 reps, a consistent tiny positive lean). Kept as a CPU
+  efficiency win (same rationale as the
   audio de-spin). The remaining CP hotspots (register writes ~23 %, descriptors ~7 %) are genuine work, each
   saving < 4 ms even if fully eliminated, so none is a floor lever (and reducing them is render-affecting/risky).
 
