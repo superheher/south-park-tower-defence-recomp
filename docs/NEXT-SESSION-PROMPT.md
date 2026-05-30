@@ -1,14 +1,43 @@
-# South Park recomp — next-session runbook: the combat floor is FRONT-END-DELIVERY + RETIRING bound
-# (measured), the per-instruction codegen lever class is EXHAUSTED, and the one real lever is SEH-blocked
+# South Park recomp — next-session runbook: the combat floor is GUEST OVER-EXECUTION (busy-waits /
+# frame-sync spin-polling), NOT the CPU. The remaining floor fix is runtime GPU-fence write-back.
 
-> **This runbook supersedes the "back-end-bound" one.** The 2026-05-30 session **measured the Main
-> thread directly** (`tools/perf/topdown.sh`, heavy combat) and found **Frontend 39.1 %, Retiring
-> 49.7 %, Backend only 10.1 %, L1-hit 99.9 %** — so the floor is front-end-delivery + retiring bound,
-> NOT back-end/raw-work bound and NOT memory-latency bound. It then built+measured three µop/instruction
-> levers (arch-flags/movbe, rlwinm special-casing, non-volatile RAM) — **all dud** — and rejected the
-> HT-contention hypothesis. Read `docs/FLOOR-FRONTEND-REBASELINE-REPORT.md` first, plus memory
-> `sp_floor_frontend_bound`. The prior `FLOOR-PGO-MEDIUM-REPORT.md` / `sp_floor_backend_bound` framing
-> is corrected there.
+> **⚠ THIS SUPERSEDES ALL PRIOR "the floor is a CPU/codegen limit" FRAMINGS** (front-end-capacity,
+> back-end-bound, etc. — all were measuring the cost of a SPIN LOOP, not a real bottleneck). The
+> 2026-05-30 session, prompted by the user's killer data point (**Sonic Unleashed Recompiled, a full 3D
+> game, runs great on this SAME machine while our 2D TD drops hard**), proved the floor is **guest
+> OVER-EXECUTION**: the Main thread burns **5.3 G instr/s even while PAUSED** (`tools/perf/pausetest.sh`,
+> 99% of running). There are **three busy-wait layers**; two are fixed, the third IS the floor. Read
+> `docs/FLOOR-OVEREXEC-REPORT.md` first, plus memory `sp_floor_overexec`. The big lesson: **do NOT do
+> codegen/µop/layout work for the floor — it's a spin, not compute.**
+
+## The 3 over-execution layers (see the report for detail)
+1. ✅ FIXED — Main thread guest spin on the GPU vblank fence (`sub_821C6E58`/`sub_821B9270`); the Xenon
+   spin idiom `cctpl`/`db16cyc`/`cctpm` was no-op'd. Now `db16cyc`→`REX_SPIN_BACKOFF()` (pause + periodic
+   yield): −25× insn-rate, gate PASS.
+2. ✅ FIXED — Timer thread `spin_wait_strategy` (16.6% of all cycles) → `blocking_wait_strategy` (+ a
+   disruptorplus arg-order bugfix); gate PASS.
+3. 🔎 THE FLOOR — GPU CommandProcessor spin-polls `WAIT_REG_MEM` (`command_processor.cpp` ~1230) with
+   `sched_yield` syscalls (~17% of CP cycles in kernel), AND the Main thread spins on the GPU fence; the
+   frame quantizes to vblank (p10 ≈ 15 = 60/4). GPU HW is 17–26% IDLE + libvulkan 2.4% ⇒ NOT GPU-bound.
+
+## Goal / the real lever
+Lift the combat floor. **The fix is runtime GPU-fence write-back** (the SDK's own stated fix,
+`command_processor.cpp:1273`): when the Vulkan GPU work that a WAIT_REG_MEM / the guest post-frame fence
+gates completes, write the awaited value to guest memory/register promptly (via a Vulkan
+fence/semaphore-completion hook) so both waits resolve on a SIGNAL instead of spin-polling. Moderate,
+RISKY rework (the pacing area has had fixes tried+reverted — validate the boot present/vsync path hard).
+Cheaper partial first: WAIT_REG_MEM fast-poll `sched_yield`-per-spin → `_mm_pause` + periodic yield
+(cut the ~17% CP kernel overhead). Also check the Audio Worker (13.6% mutex-spin = likely 4th busy-wait).
+Verify any fix with `pausetest.sh` (insn-rate must stay low) + `ab.sh` floor + detdiff gate.
+
+---
+# (ARCHIVED below: the prior front-end-capacity runbook — kept for the dead-end list only; its
+#  "floor is a CPU limit" premise is WRONG per above. The arch-flags/rlwinm/nonvol/ThinLTO/HT/OS
+#  dead-ends remain valid as "don't retry codegen for the floor".)
+
+> Prior header: "the combat floor is FRONT-END-DELIVERY + RETIRING bound" — measured the spin, not a wall.
+> See `docs/FLOOR-FRONTEND-REBASELINE-REPORT.md` / memory `sp_floor_frontend_bound` for those (now-moot
+> for the floor) codegen dead-ends.
 
 ## Where we are
 Static recompilation (rexglue-sdk) of South Park: Let's Go Tower Defense Play! (XBLA) → native

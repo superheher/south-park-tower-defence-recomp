@@ -273,7 +273,7 @@ index 3b8f739..e4bfa97 100644
  void seh_initialize();
  
 diff --git a/resources/templates/codegen/init_h.inja b/resources/templates/codegen/init_h.inja
-index 8449a0b..1eeeaec 100644
+index 8449a0b..40f395e 100644
 --- a/resources/templates/codegen/init_h.inja
 +++ b/resources/templates/codegen/init_h.inja
 @@ -9,14 +9,19 @@
@@ -310,7 +310,37 @@ index 8449a0b..1eeeaec 100644
  
  #include <atomic>
  #include <cassert>
-@@ -64,6 +70,13 @@ extern PPCFuncMapping PPCFuncMappings[];
+@@ -43,8 +49,29 @@
+ #include <cstdlib>
+ #include <stdexcept>
+ #include <string_view>
++#include <thread>
+ #include <unordered_map>
+ 
++//=============================================================================
++// Spin-wait backoff (guest db16cyc / cctpl..cctpm spin-wait idiom)
++//=============================================================================
++// Xenon titles bracket a spin-wait with `cctpl` (set thread priority LOW) ... `db16cyc` (16-cycle
++// backoff, repeated) ... `cctpm` (restore priority). Emitting these as pure no-ops makes the
++// recompiled guest spin a host core at FULL speed/priority, burning ~5.3 G instructions/s even while
++// the game is PAUSED -- and starving the guest thread/GPU that will satisfy the wait. Map the
++// `db16cyc` backoff to a real x86 PAUSE (frees the SMT sibling, cuts power/thermal) plus a *periodic*
++// host yield so the condition-setter actually gets scheduled and the wait exits. This is a pure
++// backoff/scheduling hint: it changes NO guest-visible result (the loop still re-checks the same
++// condition), it only stops the busy-wait from hogging the core. See FLOOR-OVEREXEC report.
++static inline void rex_spin_backoff() noexcept {
++#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
++  __builtin_ia32_pause();
++#endif
++  static thread_local unsigned rex_sb_ctr = 0;
++  if ((++rex_sb_ctr & 0x3FFFu) == 0u) std::this_thread::yield();
++}
++#define REX_SPIN_BACKOFF() rex_spin_backoff()
++
+ //=============================================================================
+ // Image Info
+ //=============================================================================
+@@ -64,6 +91,13 @@ extern PPCFuncMapping PPCFuncMappings[];
    __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name); \
    REX_EXTERN(__imp__##name)
  
@@ -324,7 +354,7 @@ index 8449a0b..1eeeaec 100644
  //=============================================================================
  // Function Prologue
  //=============================================================================
-@@ -318,3 +331,9 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
+@@ -318,3 +352,9 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
  
  {% for fn in functions %}DECLARE_REX_FUNC({{ fn.name }});
  {% endfor %}
@@ -532,6 +562,24 @@ index 3dd7fa5..915eb6b 100644
  bool build_stwbrx(BuilderContext& ctx) {
    ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
    if (ctx.insn.operands[1] != 0)
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+index b2d70f5..9b2f94a 100644
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -49,8 +49,11 @@ bool build_eieio(BuilderContext& ctx) {
+ }
+ 
+ bool build_db16cyc(BuilderContext& ctx) {
+-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
+-  (void)ctx;
++  // Xenon 16-cycle backoff hint used in spin-waits (cctpl..db16cyc..cctpm). Emitting it as a no-op
++  // makes recompiled guest spin-waits hog a host core at full speed (measured: the guest burns
++  // ~5.3G insn/s even while PAUSED). Map it to a real backoff: x86 PAUSE + a periodic host yield so
++  // the thread/GPU that satisfies the wait gets scheduled. No guest-visible effect. See REX_SPIN_BACKOFF.
++  ctx.println("\tREX_SPIN_BACKOFF();");
+   return true;
+ }
+ 
 diff --git a/src/codegen/codegen_writer.cpp b/src/codegen/codegen_writer.cpp
 index 69e4793..a367686 100644
 --- a/src/codegen/codegen_writer.cpp
@@ -884,6 +932,38 @@ index 9fc4763..42d55da 100644
  [[noreturn]] void seh_rethrow() {
    uint32_t code = tls_seh_state.code;
    ULONG_PTR info[2] = {tls_seh_state.info[0], tls_seh_state.info[1]};
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..d8b786f 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -15,7 +15,13 @@
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+ #include <disruptorplus/ring_buffer.hpp>
+ #include <disruptorplus/sequence_barrier.hpp>
+-#include <disruptorplus/spin_wait_strategy.hpp>
++// [recomp fix] Use the BLOCKING wait strategy, not spin: TimerThreadMain was measured burning ~16%
++// of all CPU cycles busy-spinning in wait_until_published between timer events (it polls the clock
++// until the next timer is due). On this recomp that spinning thread steals a core from the GPU command
++// processor / guest-sim threads that gate the combat-frame floor (and wastes power/thermal headroom on
++// the laptop i9). blocking_wait_strategy parks on a condvar until a timer is published or its due-time
++// timeout, with identical timer semantics. See FLOOR-OVEREXEC report.
++#include <disruptorplus/blocking_wait_strategy.hpp>
+ 
+ #include <rex/assert.h>
+ #include <rex/thread.h>
+@@ -142,9 +148,9 @@ class TimerQueue {
+   // This ring buffer will be used to introduce timers queued by the public API
+   static constexpr size_t kWaitCount = 512;
+   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
+-  dp::spin_wait_strategy wait_strategy_;
+-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
+-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
++  dp::blocking_wait_strategy wait_strategy_;
++  dp::multi_threaded_claim_strategy<dp::blocking_wait_strategy> claim_strategy_;
++  dp::sequence_barrier<dp::blocking_wait_strategy> consumed_;
+ 
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
 diff --git a/src/filesystem/devices/host_path_entry.cpp b/src/filesystem/devices/host_path_entry.cpp
 index 56f5a97..e39c435 100644
 --- a/src/filesystem/devices/host_path_entry.cpp
@@ -3226,3 +3306,25 @@ index 09c44a3..fbc0161 100644
    // Move the window to the requested monitor before entering fullscreen so
    // that MonitorFromWindow picks the correct display.
    if (int32_t monitor_index = REXCVAR_GET(monitor); monitor_index > 0) {
+diff --git a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp b/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
+index 32d427d..ebaa2e6 100644
+--- a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
++++ b/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
+@@ -169,13 +169,15 @@ namespace disruptorplus
+             sequence_t result;
+             {
+                 std::unique_lock<std::mutex> lock(m_mutex);
++                // [fix] std::condition_variable::wait_until takes (lock, time_point, predicate);
++                // disruptorplus had the predicate and timeout swapped -> no matching overload.
+                 m_cv.wait_until(
+                     lock,
++                    timeoutTime,
+                     [&]() -> bool {
+                         result = minimum_sequence_after(sequence, count, sequences);
+                         return difference(result, sequence) >= 0;
+-                    },
+-                    timeoutTime);
++                    });
+             }
+             return result;
+         }
