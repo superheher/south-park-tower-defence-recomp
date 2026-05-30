@@ -1,0 +1,80 @@
+From e348782ba6f48b75ea1af72f54298f979897ad63 Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sat, 30 May 2026 16:22:03 +0300
+Subject: [PATCH 07/13] audio: SDL driver bring-up fixes
+
+
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 46719f3..defa535 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -12,6 +12,8 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
++#include <fstream>
++#include <string>
+ 
+ #include <rex/assert.h>
+ #include <rex/audio/conversion.h>
+@@ -25,6 +27,41 @@
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+ 
++// [recomp audio-dump] When set, append the exact interleaved F32LE PCM we hand to SDL
++// to this raw file, so the decoded game audio can be auditioned/inspected offline (the
++// XMA->SDL path is objectively correct, but fidelity needs a human ear). Captures BOTH
++// real frames and silence gaps, so the clip is real-time accurate. Post-convert with:
++//   ffmpeg -f f32le -ar 48000 -ac <channels> -i <file> out.wav
++// (channels = 2 or 6; logged once when the dump opens).
++REXCVAR_DEFINE_STRING(audio_dump, "", "Audio",
++                      "If non-empty, write the interleaved F32LE PCM sent to SDL to this raw file");
++
++// Appends the interleaved PCM block to the audio_dump file (opened once, on the SDL audio
++// callback thread only -- no locking needed). No-op unless the cvar is set.
++static void AppendAudioDump(const float* data, int len_bytes, unsigned channels) {
++  const std::string& path = REXCVAR_GET(audio_dump);
++  if (path.empty()) {
++    return;
++  }
++  static std::ofstream dump_stream;
++  static bool open_attempted = false;
++  if (!open_attempted) {
++    open_attempted = true;
++    dump_stream.open(path, std::ios::binary | std::ios::trunc);
++    if (dump_stream.is_open()) {
++      REXAPU_INFO(
++          "audio_dump: capturing {}-channel F32LE @48000Hz to '{}' "
++          "(convert: ffmpeg -f f32le -ar 48000 -ac {} -i <file> out.wav)",
++          channels, path, channels);
++    } else {
++      REXAPU_ERROR("audio_dump: failed to open '{}'", path);
++    }
++  }
++  if (dump_stream.is_open()) {
++    dump_stream.write(reinterpret_cast<const char*>(data), len_bytes);
++  }
++}
++
+ namespace rex::audio::sdl {
+ 
+ SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
+@@ -175,6 +212,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+         sdl_callback_count++;
+       }
+       std::memset(data, 0, len);
++      AppendAudioDump(data, len, driver->sdl_device_channels_);
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
+         break;
+@@ -198,6 +236,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+             break;
+         }
+       }
++      AppendAudioDump(data, len, driver->sdl_device_channels_);
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
+         driver->frames_unused_.push(buffer);
+-- 
+2.54.0
+

@@ -1,0 +1,543 @@
+From d0bad1be004434e5dbe7de926c236a1525f668e7 Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sat, 30 May 2026 16:22:02 +0300
+Subject: [PATCH 02/13] codegen: implement lmw + as-local/context decouple +
+ db16cyc spin-backoff
+
+
+diff --git a/include/rex/codegen/function_graph.h b/include/rex/codegen/function_graph.h
+index 171eb67..141ac71 100644
+--- a/include/rex/codegen/function_graph.h
++++ b/include/rex/codegen/function_graph.h
+@@ -95,6 +95,14 @@ class FunctionGraph {
+   // Get all SEALED functions
+   std::vector<FunctionNode*> getSealedFunctions();
+ 
++  // P2 leaf-inlining: mark tiny straight-line leaves as inline-eligible (sets FunctionNode::
++  // isInlineLeaf()). Must run after sealing and rexcrt renaming, before codegen emission, so that
++  // call-site emission can route eligible callees to the always_inline variant. Excludes imports,
++  // rexcrt CRT replacements (passed in rexcrtAddrs), functions with calls/tailcalls/jumptables,
++  // SEH/EH, an LR data-read (mflr/mfspr-LR), a mid-asm hook in their body, or size > maxBytes.
++  void markInlineLeaves(const RecompilerConfig& cfg,
++                        const std::unordered_set<uint32_t>& rexcrtAddrs, uint32_t maxBytes);
++
+   // Statistics
+   size_t functionCount() const { return functions_.size(); }
+   size_t pendingCount() const;
+diff --git a/include/rex/codegen/function_node.h b/include/rex/codegen/function_node.h
+index a335b37..8a537f1 100644
+--- a/include/rex/codegen/function_node.h
++++ b/include/rex/codegen/function_node.h
+@@ -139,6 +139,14 @@ class FunctionNode {
+   const std::optional<ExceptionInfo>& exceptionInfo() const { return exceptionInfo_; }
+   bool hasExceptionInfo() const { return exceptionInfo_.has_value() && exceptionInfo_->hasInfo(); }
+ 
++  // Inline-leaf eligibility (set by FunctionGraph::markInlineLeaves before codegen). True for a tiny
++  // straight-line leaf (no calls/tailcalls/jumptables, no SEH/EH, no LR-data-read, no mid-asm hook,
++  // size <= threshold). Such a function is emitted as an always_inline header body + an out-of-line
++  // thunk (so the dispatch table/weak alias still work), and its direct callsites are routed to the
++  // inline variant -- cutting the static branch-site count (the BTB-capacity floor lever). See
++  // docs/P2-LEAF-INLINE-DESIGN.md.
++  bool isInlineLeaf() const { return inlineLeaf_; }
++
+   void setName(std::string name) { name_ = std::move(name); }
+ 
+  private:
+@@ -182,6 +190,7 @@ class FunctionNode {
+   FunctionAuthority authority_;
+   FunctionState state_ = FunctionState::kRegistered;
+   bool hasExceptionHandler_ = false;
++  bool inlineLeaf_ = false;  // set by FunctionGraph::markInlineLeaves (P2 leaf-inlining)
+ 
+   // Populated at discover()
+   std::vector<Block> blocks_;
+diff --git a/include/rex/codegen/function_types.h b/include/rex/codegen/function_types.h
+index ef36b6a..babd005 100644
+--- a/include/rex/codegen/function_types.h
++++ b/include/rex/codegen/function_types.h
+@@ -51,6 +51,7 @@ struct EmitContext {
+   const FunctionGraph& graph;
+   uint32_t entryPoint = 0;                      ///< For "xstart" naming
+   runtime::ExportResolver* resolver = nullptr;  ///< For import ordinal resolution (nullable)
++  std::string* inlinesOut = nullptr;            ///< P2: sink for always_inline leaf bodies ({project}_inlines.h); nullable
+ };
+ 
+ //=============================================================================
+diff --git a/resources/templates/codegen/init_h.inja b/resources/templates/codegen/init_h.inja
+index 8449a0b..40f395e 100644
+--- a/resources/templates/codegen/init_h.inja
++++ b/resources/templates/codegen/init_h.inja
+@@ -9,14 +9,19 @@
+ #define REX_CONFIG_H_INCLUDED
+ 
+ {% if config_flags.skip_lr %}#define REX_CONFIG_SKIP_LR
+-{% endif %}{% if config_flags.ctr_as_local %}#define REX_CONFIG_CTR_AS_LOCAL
+-{% endif %}{% if config_flags.xer_as_local %}#define REX_CONFIG_XER_AS_LOCAL
+-{% endif %}{% if config_flags.reserved_as_local %}#define REX_CONFIG_RESERVED_AS_LOCAL
+ {% endif %}{% if config_flags.skip_msr %}#define REX_CONFIG_SKIP_MSR
+-{% endif %}{% if config_flags.cr_as_local %}#define REX_CONFIG_CR_AS_LOCAL
+-{% endif %}{% if config_flags.non_argument_as_local %}#define REX_CONFIG_NON_ARGUMENT_AS_LOCAL
+-{% endif %}{% if config_flags.non_volatile_as_local %}#define REX_CONFIG_NON_VOLATILE_AS_LOCAL
+ {% endif %}
++// [CODEGEN-ASLOCAL] DECOUPLE: the REX_CONFIG_*_AS_LOCAL macros are intentionally NOT
++// emitted here. In rex/ppc/context.h they are guarded around PPCContext members, so
++// defining them SHRINKS the struct -- but the prebuilt librexruntime.so is compiled
++// WITHOUT them (port<->.so layout mismatch: cr0-7/xer/ctr/nonvol GPRs removed, shifting
++// fpscr/f*/v*), and this title's setjmp (env=ctx / ctx=env) + SEH snapshot the WHOLE ctx.
++// Instead we keep the PPCContext layout FULL (struct unchanged => .so matches, and env=ctx
++// still has a ctx.cr/ctx.r* to snapshot) while the codegen STILL emits the registers as
++// per-function C++ locals (the clang-DCE + register-allocation .text win). The promoted
++// locals are synced <-> ctx only at the snapshot boundaries: setjmp (builders/context.cpp)
++// and SEH (function_graph.cpp, for GPRs). The *_as_local config flags still drive the
++// accessor + local-declaration emission in the codegen tool. See docs/CODEGEN-ASLOCAL-PLAN.md.
+ #define REX_IMAGE_BASE {{ image_base }}ull
+ #define REX_IMAGE_SIZE {{ image_size }}ull
+ #define REX_CODE_BASE {{ code_base }}ull
+@@ -36,6 +41,7 @@
+ #include <rex/perf/counter.h>
+ #include <rex/thread/mutex.h>
+ #include <rex/system/mmio_handler.h>
++#include <rex/platform/exceptions.h>  // SEH_TRY/SEH_CATCH_ALL for generate_exception_handlers
+ 
+ #include <atomic>
+ #include <cassert>
+@@ -43,8 +49,29 @@
+ #include <cstdlib>
+ #include <stdexcept>
+ #include <string_view>
++#include <thread>
+ #include <unordered_map>
+ 
++//=============================================================================
++// Spin-wait backoff (guest db16cyc / cctpl..cctpm spin-wait idiom)
++//=============================================================================
++// Xenon titles bracket a spin-wait with `cctpl` (set thread priority LOW) ... `db16cyc` (16-cycle
++// backoff, repeated) ... `cctpm` (restore priority). Emitting these as pure no-ops makes the
++// recompiled guest spin a host core at FULL speed/priority, burning ~5.3 G instructions/s even while
++// the game is PAUSED -- and starving the guest thread/GPU that will satisfy the wait. Map the
++// `db16cyc` backoff to a real x86 PAUSE (frees the SMT sibling, cuts power/thermal) plus a *periodic*
++// host yield so the condition-setter actually gets scheduled and the wait exits. This is a pure
++// backoff/scheduling hint: it changes NO guest-visible result (the loop still re-checks the same
++// condition), it only stops the busy-wait from hogging the core. See FLOOR-OVEREXEC report.
++static inline void rex_spin_backoff() noexcept {
++#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
++  __builtin_ia32_pause();
++#endif
++  static thread_local unsigned rex_sb_ctr = 0;
++  if ((++rex_sb_ctr & 0x3FFFu) == 0u) std::this_thread::yield();
++}
++#define REX_SPIN_BACKOFF() rex_spin_backoff()
++
+ //=============================================================================
+ // Image Info
+ //=============================================================================
+@@ -64,6 +91,13 @@ extern PPCFuncMapping PPCFuncMappings[];
+   __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name); \
+   REX_EXTERN(__imp__##name)
+ 
++// P2 leaf-inlining: an inline-eligible leaf gets an always_inline body `name##_inl` here (in the
++// shared {project}_inlines.h, included at the end of this file) in addition to the normal out-of-line
++// DEFINE_REX_FUNC(name) thunk + weak alias. Eligible call sites call `name##_inl(ctx, base)` so the
++// body inlines; dispatch table + overrides still use the out-of-line `name`/`__imp__name`.
++#define STATIC_INLINE_REX_FUNC(name) \
++  [[gnu::always_inline, maybe_unused]] static inline REX_FUNC(name##_inl)
++
+ //=============================================================================
+ // Function Prologue
+ //=============================================================================
+@@ -318,3 +352,9 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
+ 
+ {% for fn in functions %}DECLARE_REX_FUNC({{ fn.name }});
+ {% endfor %}
++
++//=============================================================================
++// Inline-eligible leaf bodies (P2). Included LAST: needs the macros/types above + the __imp__
++// declarations, and must be visible in every recomp TU so the always_inline leaves inline.
++//=============================================================================
++#include "{{ project }}_inlines.h"
+diff --git a/src/codegen/builders.h b/src/codegen/builders.h
+index 24894f2..56e0a88 100644
+--- a/src/codegen/builders.h
++++ b/src/codegen/builders.h
+@@ -292,6 +292,7 @@ bool build_lwaux(BuilderContext& ctx);
+ bool build_lwax(BuilderContext& ctx);
+ bool build_lwbrx(BuilderContext& ctx);
+ bool build_lwz(BuilderContext& ctx);
++bool build_lmw(BuilderContext& ctx);
+ bool build_lwzu(BuilderContext& ctx);
+ bool build_lwzux(BuilderContext& ctx);
+ bool build_lwzx(BuilderContext& ctx);
+diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
+index 6eae29d..276ba01 100644
+--- a/src/codegen/builders/context.cpp
++++ b/src/codegen/builders/context.cpp
+@@ -177,12 +177,45 @@ void BuilderContext::emit_function_call(uint32_t address) {
+   }
+ 
+   if (address == cfg.setJmpAddress) {
+-    // Save PPCContext for restoration after longjmp
++    // [CODEGEN-ASLOCAL] setjmp/longjmp ctx-snapshot sync.
++    // When registers/flags are promoted to C++ locals (cr/xer/ctr/reserved/GPR-as-local),
++    // the LIVE values are NOT in ctx. setjmp snapshots the whole ctx (env = ctx) and a
++    // longjmp restores it (ctx = env); without help, the longjmp would resurrect STALE
++    // ctx register state. We keep PPCContext full (see the init_h.inja DECOUPLE note) and
++    // sync the promoted set around the snapshot: save locals -> ctx before env=ctx, then
++    // reload locals <- ctx after ctx=env. The promoted set is enumerated from the config
++    // flags; we sync the whole register class (not only regs used so far) for
++    // unconditional correctness -- clang DCEs any that are dead. setjmp sites are rare
++    // (image-format detection) so the extra stores are negligible.
++    const int kNonArgGpr[] = {0, 2, 11, 12};
++    auto forEachPromoted = [&](auto&& fn) {
++      if (cfg.crRegistersAsLocalVariables)
++        for (int i = 0; i < 8; ++i) { locals.cr[i] = true; fn(fmt::format("cr{}", i), fmt::format("ctx.cr{}", i)); }
++      if (cfg.xerAsLocalVariable)              { locals.xer = true;      fn("xer", "ctx.xer"); }
++      if (cfg.ctrAsLocalVariable)              { locals.ctr = true;      fn("ctr", "ctx.ctr"); }
++      if (cfg.reservedRegisterAsLocalVariable) { locals.reserved = true; fn("reserved", "ctx.reserved"); }
++      if (cfg.nonVolatileRegistersAsLocalVariables) {
++        for (int i = 14; i <= 31; ++i)  { locals.r[i] = true; fn(fmt::format("r{}", i), fmt::format("ctx.r{}", i)); }
++        for (int i = 14; i <= 31; ++i)  { locals.f[i] = true; fn(fmt::format("f{}", i), fmt::format("ctx.f{}", i)); }
++        for (int i = 14; i <= 31; ++i)  { locals.v[i] = true; fn(fmt::format("v{}", i), fmt::format("ctx.v{}", i)); }
++        for (int i = 64; i <= 127; ++i) { locals.v[i] = true; fn(fmt::format("v{}", i), fmt::format("ctx.v{}", i)); }
++      }
++      if (cfg.nonArgumentRegistersAsLocalVariables) {
++        for (int i : kNonArgGpr)        { locals.r[i] = true; fn(fmt::format("r{}", i), fmt::format("ctx.r{}", i)); }
++        locals.f[0] = true; fn("f0", "ctx.f0");
++        for (int i = 32; i <= 63; ++i)  { locals.v[i] = true; fn(fmt::format("v{}", i), fmt::format("ctx.v{}", i)); }
++      }
++    };
++    // 1) save promoted locals -> ctx, then snapshot the (now-coherent) ctx
++    forEachPromoted([&](const std::string& reg, const std::string& cx) { println("\t{} = {};", cx, reg); });
+     println("\t{} = ctx;", env());
+-    // Use custom ppc_setjmp that uses guest address as key
++    // 2) custom ppc_setjmp keyed by guest address
+     println("\t{}.s64 = ppc_setjmp({}.u32);", temp(), r(3));
+-    // Restore PPCContext if returning from longjmp
+-    println("\tif ({}.s64 != 0) ctx = {};", temp(), env());
++    // 3) on longjmp return (!=0): restore whole ctx, then reload promoted locals <- ctx
++    println("\tif ({}.s64 != 0) {{", temp());
++    println("\t\tctx = {};", env());
++    forEachPromoted([&](const std::string& reg, const std::string& cx) { println("\t\t{} = {};", reg, cx); });
++    println("\t}}");
+     println("\t{} = {};", r(3), temp());
+     return;
+   }
+@@ -200,6 +233,14 @@ void BuilderContext::emit_function_call(uint32_t address) {
+         return;
+       }
+ 
++      // P2: route a call to an inline-eligible leaf to its always_inline variant (defined in
++      // {project}_inlines.h). The out-of-line thunk + weak alias `name` still exist (dispatch/
++      // overrides unaffected); this is what actually inlines the leaf and drops the call site.
++      if (targetFn->isInlineLeaf()) {
++        println("\t{}_inl(ctx, base);", name);
++        return;
++      }
++
+       println("\t{}(ctx, base);", name);
+       return;
+     }
+diff --git a/src/codegen/builders/control_flow.cpp b/src/codegen/builders/control_flow.cpp
+index 102a538..734df3b 100644
+--- a/src/codegen/builders/control_flow.cpp
++++ b/src/codegen/builders/control_flow.cpp
+@@ -146,7 +146,10 @@ bool build_bctr(BuilderContext& ctx) {
+         case TargetKind::Function:
+         case TargetKind::Import:
+           if (auto* targetFn = ctx.graph().getFunction(label)) {
+-            ctx.println("\t\t{}(ctx, base);", targetFn->name());
++            if (targetFn->isInlineLeaf())  // P2: inline-eligible leaf -> always_inline variant
++              ctx.println("\t\t{}_inl(ctx, base);", targetFn->name());
++            else
++              ctx.println("\t\t{}(ctx, base);", targetFn->name());
+           } else {
+             REXCODEGEN_ERROR(
+                 "Jump target 0x{:08X} classified as function but not in graph at bctr 0x{:08X}",
+diff --git a/src/codegen/builders/memory.cpp b/src/codegen/builders/memory.cpp
+index 3dd7fa5..915eb6b 100644
+--- a/src/codegen/builders/memory.cpp
++++ b/src/codegen/builders/memory.cpp
+@@ -395,6 +395,25 @@ bool build_stmw(BuilderContext& ctx) {
+   return true;
+ }
+ 
++bool build_lmw(BuilderContext& ctx) {
++  // EA = (rA == 0 ? 0 : r[rA]) + EXTS(d); load r[rD]..r[31] from EA, EA+4, ...
++  // Load-multiple mirror of build_stmw (function epilogues pair lmw with the
++  // prologue's stmw to restore non-volatile GPRs). Without this, any function
++  // using the stmw/lmw save-restore pattern compiles its prologue but throws
++  // REX_UNIMPLEMENTED in its epilogue.
++  uint32_t rD = ctx.insn.operands[0];
++  int32_t offset = static_cast<int32_t>(ctx.insn.operands[1]);
++  uint32_t rA = ctx.insn.operands[2];
++  if (rA != 0)
++    ctx.println("\t{} = {}.u32 + {};", ctx.ea(), ctx.r(rA), offset);
++  else
++    ctx.println("\t{} = {};", ctx.ea(), offset);
++  for (uint32_t i = rD; i <= 31; ++i) {
++    ctx.println("\t{}.u64 = REX_LOAD_U32({} + {});", ctx.r(i), ctx.ea(), (i - rD) * 4);
++  }
++  return true;
++}
++
+ bool build_stwbrx(BuilderContext& ctx) {
+   ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
+   if (ctx.insn.operands[1] != 0)
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+index b2d70f5..9b2f94a 100644
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -49,8 +49,11 @@ bool build_eieio(BuilderContext& ctx) {
+ }
+ 
+ bool build_db16cyc(BuilderContext& ctx) {
+-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
+-  (void)ctx;
++  // Xenon 16-cycle backoff hint used in spin-waits (cctpl..db16cyc..cctpm). Emitting it as a no-op
++  // makes recompiled guest spin-waits hog a host core at full speed (measured: the guest burns
++  // ~5.3G insn/s even while PAUSED). Map it to a real backoff: x86 PAUSE + a periodic host yield so
++  // the thread/GPU that satisfies the wait gets scheduled. No guest-visible effect. See REX_SPIN_BACKOFF.
++  ctx.println("\tREX_SPIN_BACKOFF();");
+   return true;
+ }
+ 
+diff --git a/src/codegen/codegen_writer.cpp b/src/codegen/codegen_writer.cpp
+index 69e4793..a367686 100644
+--- a/src/codegen/codegen_writer.cpp
++++ b/src/codegen/codegen_writer.cpp
+@@ -16,6 +16,7 @@
+ #include <filesystem>
+ #include <string>
+ #include <unordered_map>
++#include <unordered_set>
+ 
+ #include <fmt/format.h>
+ #include <inja/inja.hpp>
+@@ -190,6 +191,23 @@ bool CodegenWriter::write(bool force) {
+ 
+   const std::string& projectName = config().projectName;
+ 
++  // P2 leaf-inlining: mark tiny straight-line leaves inline-eligible (after rexcrt rename, before
++  // emission) so call-site emission can route eligible callees to the always_inline variant.
++  // GATED OFF BY DEFAULT (maxBytes=0 => nothing marked). Measured 2026-05-29: at maxBytes=64 this
++  // inlined 1,679 leaves / 17,448 sites (mostly the __save/__restgprlr millicode) and cut front-end
++  // stalls hard (BACLEARS -23%, DSB-miss -57%), but the combat FLOOR was NEUTRAL (the floor is
++  // back-end/raw-work-bound, not front-end-bound) at +7.4% .text -- so it fails the floor keep-bar
++  // and is not shipped. The capability is correct + gate-passing and preserved for a front-end-bound
++  // target (smaller-BTB/-DSB CPU, or a less execution-heavy guest): raise maxBytes (e.g. 64) to enable.
++  // See docs/FLOOR-LEAF-INLINE-REPORT.md + docs/P2-LEAF-INLINE-DESIGN.md.
++  {
++    std::unordered_set<uint32_t> rexcrtAddrs;
++    rexcrtAddrs.reserve(rexcrtByAddr.size());
++    for (const auto& [addr, crtName] : rexcrtByAddr)
++      rexcrtAddrs.insert(addr);
++    graph().markInlineLeaves(config(), rexcrtAddrs, /*maxBytes=*/0);
++  }
++
+   TemplateRegistry registry;
+   if (!config().templateDir.empty())
+     registry.loadOverrides(config().templateDir);
+@@ -220,9 +238,13 @@ bool CodegenWriter::write(bool force) {
+     return rexcrtByAddr.contains(static_cast<uint32_t>(fn->base()));
+   });
+ 
+-  // Build EmitContext -- resolver is now properly connected
++  // Build EmitContext -- resolver is now properly connected.
++  // inlinesHeader collects the always_inline bodies of inline-eligible leaves (P2); written below.
++  std::string inlinesHeader;
++  inlinesHeader.reserve(1 * 1024 * 1024);
+   EmitContext emitCtx{binary(), config(), graph(),
+                       static_cast<uint32_t>(analysisState().entryPoint), nullptr};
++  emitCtx.inlinesOut = &inlinesHeader;
+   if (runtime_)
+     emitCtx.resolver = runtime_->export_resolver();
+ 
+@@ -252,6 +274,21 @@ bool CodegenWriter::write(bool force) {
+   SaveCurrentOutData();
+   REXCODEGEN_TRACE("Recompilation complete.");
+ 
++  // Generate {project}_inlines.h: the always_inline bodies of inline-eligible leaves (P2). Included
++  // at the END of {project}_init.h (after the type/macro setup + DECLARE_REX_FUNC declarations), so
++  // the bodies see everything they need and every recomp TU can inline them. Always written (even if
++  // empty) so the #include in init.h resolves.
++  {
++    std::string hdr;
++    hdr.reserve(inlinesHeader.size() + 256);
++    hdr += "// Auto-generated by rexglue (P2 leaf-inlining). Always-inline bodies of inline-eligible\n";
++    hdr += fmt::format("// leaf functions. Included at the END of {}_init.h. Do not edit.\n", projectName);
++    hdr += "#pragma once\n\n";
++    hdr += inlinesHeader;
++    out = std::move(hdr);
++    SaveCurrentOutData(fmt::format("{}_inlines.h", projectName));
++  }
++
+   // Generate sources.cmake
+   REXCODEGEN_TRACE("Recompile: generating sources.cmake");
+   {
+diff --git a/src/codegen/function_graph.cpp b/src/codegen/function_graph.cpp
+index 0c0d1be..c3c3d20 100644
+--- a/src/codegen/function_graph.cpp
++++ b/src/codegen/function_graph.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include <rex/codegen/binary_view.h>
+ #include <rex/codegen/code_emitter.h>
++#include <rex/codegen/config.h>
+ #include <rex/codegen/function_graph.h>
+ #include <rex/codegen/function_scanner.h>
+ #include <rex/logging.h>
+@@ -607,28 +608,16 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+   bool generateSeh = sehInfo && !sehInfo->scopes.empty() && ctx.config.generateExceptionHandlers;
+   if (generateSeh) {
+     emit_println(body, "\t\t}} SEH_CATCH_ALL {{");
+-    emit_println(body, "\t\t\tREXLOG_WARN(\"SEH exception caught in sub_{:08X}\");", base());
+-
+-    if (sehInfo->frameSize > 0) {
+-      emit_println(body, "\t\t\tctx.r12.s64 = ctx.r31.s64 + {};  // Establisher frame pointer",
+-                   sehInfo->frameSize);
+-    }
+-
+-    for (auto it = sehInfo->scopes.rbegin(); it != sehInfo->scopes.rend(); ++it) {
+-      const auto& scope = *it;
+-      if (scope.filter == 0 && scope.handler != 0) {
+-        emit_println(body, "\t\t\tsub_{:08X}(ctx, base);  // __finally handler", scope.handler);
+-      }
+-    }
+-
+-    if (sehInfo->restoreHelper != 0) {
+-      auto* restoreFn = ctx.graph.getFunction(sehInfo->restoreHelper);
+-      if (restoreFn && !restoreFn->name().empty()) {
+-        emit_println(body, "\t\t\t{}(ctx, base);  // Restore caller registers", restoreFn->name());
+-      }
+-    }
+-
+-    emit_println(body, "\t\t\tSEH_RETHROW;");
++    emit_println(body, "\t\t\tREXLOG_WARN(\"SEH: unwind through sub_{:08X} -> return to caller\");",
++                 base());
++    // At catch time `ctx` holds the RAISE-POINT registers (from deep in the unwound call
++    // chain), not this function's frame. First-cut SEH recovery: restore the caller-saved
++    // register state captured at entry and return to the caller signalling failure (r3=0).
++    emit_println(body, "\t\t\tctx.r1.u32 = __seh_r1; ctx.lr = __seh_lr;");
++    for (int r = 13; r <= 31; ++r)
++      emit_println(body, "\t\t\tctx.r{}.u64 = __seh_r{};", r, r);
++    emit_println(body, "\t\t\tctx.r3.s64 = 0;  // signal failure to the caller");
++    emit_println(body, "\t\t\treturn;");
+     emit_println(body, "\t\t}} SEH_END");
+     emit_println(body, "\t}}\n");
+   } else {
+@@ -674,6 +663,13 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+ 
+   // If SEH, emit SEH_TRY and indent body
+   if (generateSeh) {
++    // Capture the caller-saved register state at function entry. These live in function
++    // scope so they are visible in the SEH_CATCH_ALL block (where `ctx` otherwise holds
++    // the raise-point registers from deep in the unwound call chain). On an unhandled
++    // guest exception we restore these and return to the caller cleanly (see catch).
++    emit_println(out, "\tconst uint32_t __seh_r1 = ctx.r1.u32; const uint64_t __seh_lr = ctx.lr;");
++    for (int r = 13; r <= 31; ++r)
++      emit_println(out, "\tconst uint64_t __seh_r{} = ctx.r{}.u64;", r, r);
+     emit_println(out, "\tSEH_TRY {{");
+     std::string indentedBody;
+     indentedBody.reserve(body.size() + body.size() / 20);
+@@ -688,9 +684,87 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+     out += body;
+   }
+ 
++  // --- P2: selective leaf-inlining ---
++  // An inline-eligible leaf is emitted as an always_inline body in the shared {project}_inlines.h
++  // (visible to every TU so its direct callsites inline) plus a thin out-of-line thunk here (so the
++  // weak alias + __imp__ + dispatch table are unchanged -- overrides/dispatch keep working). The body
++  // is emitted exactly ONCE (the header inline); the TU keeps only the thunk. markInlineLeaves()
++  // guarantees such a function has NO mid-asm-hook externs and NO SEH, so `out` begins exactly with
++  // the DEFINE_REX_FUNC opener -- the substr split below is therefore safe. See P2-LEAF-INLINE-DESIGN.
++  if (isInlineLeaf() && ctx.inlinesOut) {
++    const std::string opener = fmt::format("DEFINE_REX_FUNC({}) {{\n", name);
++    if (out.compare(0, opener.size(), opener) == 0) {
++      // inner = everything after the opener line (REX_FUNC_PROLOGUE + local decls + body + close)
++      const std::string inner = out.substr(opener.size());
++      *ctx.inlinesOut += fmt::format("STATIC_INLINE_REX_FUNC({}) {{\n", name);
++      *ctx.inlinesOut += inner;
++      // The TU contribution becomes a thunk whose single statement is the (always-inlined) leaf.
++      out = fmt::format("DEFINE_REX_FUNC({}) {{\n\t{}_inl(ctx, base);\n}}\n\n", name, name);
++    } else {
++      REXCODEGEN_WARN("inline-leaf {} did not start with expected DEFINE opener; emitting normally",
++                      name);
++    }
++  }
++
+   return out;
+ }
+ 
++void FunctionGraph::markInlineLeaves(const RecompilerConfig& cfg,
++                                     const std::unordered_set<uint32_t>& rexcrtAddrs,
++                                     uint32_t maxBytes) {
++  size_t n = 0;
++  for (auto& [addr, nodeptr] : functions_) {
++    FunctionNode* fn = nodeptr.get();
++    fn->inlineLeaf_ = false;
++    if (!fn->isSealed())
++      continue;
++    if (fn->authority() == FunctionAuthority::IMPORT)
++      continue;
++    if (rexcrtAddrs.contains(fn->base()))  // rexcrt CRT replacements are emitted separately
++      continue;
++    if (fn->blocks().empty())  // stub
++      continue;
++    if (!fn->calls().empty() || !fn->tailCalls().empty())  // not a leaf (no bl/bctrl/blrl out)
++      continue;
++    if (!fn->jumpTables().empty())  // indirect dispatch (bctr switch)
++      continue;
++    if (fn->hasExceptionInfo() || fn->hasExceptionHandler())  // no SEH/C++ EH/setjmp frame
++      continue;
++    if (fn->size() == 0 || fn->size() > maxBytes)
++      continue;
++
++    bool ok = true;
++    // Exclude an LR DATA read (mflr / mfspr SPR_LR): inlining would capture the CALLER's return
++    // address, not the leaf's. A terminal/return blr also "reads_lr" but is_return/is_branch -- it
++    // just becomes fallthrough when inlined, which is correct, so it is allowed.
++    for (auto* insn : fn->instructions()) {
++      auto sem = insn->get_semantics();
++      if (sem.reads_lr && !sem.is_return && !sem.is_branch) {
++        ok = false;
++        break;
++      }
++    }
++    if (!ok)
++      continue;
++    // Exclude any function whose body contains a mid-asm hook address: a hook must fire at one fixed
++    // address, not at N inlined copies.
++    if (!cfg.midAsmHooks.empty()) {
++      for (uint32_t a = fn->base(); a < fn->end(); a += 4) {
++        if (cfg.midAsmHooks.contains(a)) {
++          ok = false;
++          break;
++        }
++      }
++    }
++    if (!ok)
++      continue;
++
++    fn->inlineLeaf_ = true;
++    ++n;
++  }
++  REXCODEGEN_TRACE("markInlineLeaves: {} inline-eligible leaves (maxBytes={})", n, maxBytes);
++}
++
+ void FunctionGraph::addCodeBuffer(uint32_t baseAddress, const uint8_t* data, size_t size) {
+   assert_always("FunctionGraph::addCodeBuffer not implemented. Use Recompiler with builders");
+   return;
+diff --git a/src/codegen/instruction_dispatch.cpp b/src/codegen/instruction_dispatch.cpp
+index 40ae269..279b10d 100644
+--- a/src/codegen/instruction_dispatch.cpp
++++ b/src/codegen/instruction_dispatch.cpp
+@@ -227,6 +227,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
+       {PPC_INST_LWZU, build_lwzu},
+       {PPC_INST_LWZUX, build_lwzux},
+       {PPC_INST_LWZX, build_lwzx},
++      {PPC_INST_LMW, build_lmw},
+       {PPC_INST_LWBRX, build_lwbrx},
+       {PPC_INST_LD, build_ld},
+       {PPC_INST_LDU, build_ldu},
+-- 
+2.54.0
+

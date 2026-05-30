@@ -1,0 +1,173 @@
+From 1e53a15ca56caa896cd87048b45eb2eb68526515 Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sat, 30 May 2026 16:22:02 +0300
+Subject: [PATCH 03/13] platform: SEH forced-unwind fix (POSIX) + first-cut SEH
+ recovery
+
+
+diff --git a/include/rex/platform/exceptions.h b/include/rex/platform/exceptions.h
+index 1614b4d..5f7b1e4 100644
+--- a/include/rex/platform/exceptions.h
++++ b/include/rex/platform/exceptions.h
+@@ -22,6 +22,9 @@
+ 
+ #include <cstdint>
+ #include <exception>
++#ifdef _WIN32
++#include <excpt.h>  // GetExceptionCode/GetExceptionInformation intrinsics for SEH_CATCH_ALL (file scope!)
++#endif
+ 
+ #include <rex/platform.h>
+ #include <rex/platform/seh.h>
+@@ -140,7 +143,14 @@ class SehGuard {
+ 
+ #define SEH_CATCH catch (const ::rex::SehException&)
+ 
+-#define SEH_CATCH_ALL catch (...)
++// Must NOT be catch(...): on Windows this maps to __except(seh_filter), which is
++// selective (handles only hardware faults + the guest-unwind code, CONTINUE_SEARCH
++// otherwise). A literal catch(...) here also swallows glibc's *forced unwind* (used
++// by pthread_exit/pthread_cancel); when a guest thread exits, that unwind passes
++// through this handler, isn't rethrown, and glibc aborts with
++// "FATAL: exception not rethrown". Catching only SehException lets forced unwinds
++// propagate, matching the Windows filter.
++#define SEH_CATCH_ALL catch (const ::rex::SehException&)
+ 
+ #define SEH_RETHROW throw
+ 
+diff --git a/include/rex/platform/seh.h b/include/rex/platform/seh.h
+index 3b8f739..e4bfa97 100644
+--- a/include/rex/platform/seh.h
++++ b/include/rex/platform/seh.h
+@@ -37,6 +37,14 @@ int seh_filter(u32 code, void* exception_pointers);
+ /// Re-raise the captured exception.
+ [[noreturn]] void seh_rethrow();
+ 
++/// Custom exception code raised by a guest SEH unwind (e.g. RtlUnwind). seh_filter
++/// treats it as EXECUTE_HANDLER so the nearest generated SEH_CATCH_ALL catches it.
++constexpr u32 kGuestSehUnwindCode = 0xE0524548u;  // 'REXH'
++
++/// Raise a guest SEH unwind as a host exception so the nearest SEH_TRY/SEH_CATCH_ALL
++/// wrapper catches it (used to implement RtlUnwind in the recompiled CRT).
++[[noreturn]] void seh_raise_guest_unwind();
++
+ /// Initialize SEH signal handlers (POSIX only, no-op on Windows).
+ void seh_initialize();
+ 
+diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
+index 5e0a932..c9b7706 100644
+--- a/src/core/seh_posix.cpp
++++ b/src/core/seh_posix.cpp
+@@ -100,6 +100,15 @@ static void signal_handler(int sig, siginfo_t* info, void* /*ucontext*/) {
+   abort();  // Should not reach here
+ }
+ 
++[[noreturn]] void seh_raise_guest_unwind() {
++  // Mirror seh_win.cpp: a guest SEH unwind (e.g. RtlUnwind) is raised as a host
++  // exception so the nearest generated SEH_CATCH_ALL handles it. On POSIX the SEH
++  // layer is built on C++ exceptions (SEH_CATCH_ALL == catch(...)), so throw the
++  // SehException directly rather than RaiseException().
++  tls_seh_state.code = kGuestSehUnwindCode;
++  throw rex::SehException(static_cast<rex::SehException::Code>(kGuestSehUnwindCode));
++}
++
+ void seh_initialize() {
+   if (g_seh_initialized.exchange(true)) {
+     return;  // Already initialized
+diff --git a/src/core/seh_win.cpp b/src/core/seh_win.cpp
+index 9fc4763..42d55da 100644
+--- a/src/core/seh_win.cpp
++++ b/src/core/seh_win.cpp
+@@ -13,11 +13,61 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
+ 
+ #include "platform_win.h"
+ 
++#include <rex/logging.h>
++#include <dbghelp.h>
++#include <atomic>
++#include <cstdio>
++#pragma comment(lib, "dbghelp.lib")
++
+ namespace rex::platform {
+ 
+ static thread_local SehThreadState tls_seh_state;
+ static thread_local bool tls_seh_active = false;
+ 
++// [diag] Symbolized backtrace of an SEH-caught hardware fault. The recovery
++// (return-to-caller-as-failure) otherwise hides where a guest worker faulted,
++// which can stall the boot. Capped + first-fault-symbol-init to stay cheap.
++static void seh_dump_fault(EXCEPTION_POINTERS* p) {
++  static std::atomic<int> dumps{0};
++  if (dumps.fetch_add(1) >= 12) return;
++  if (!p || !p->ExceptionRecord || !p->ContextRecord) return;
++  auto* er = p->ExceptionRecord;
++  unsigned long long fault_addr =
++      (er->NumberParameters >= 2) ? (unsigned long long)er->ExceptionInformation[1] : 0ull;
++  HANDLE proc = GetCurrentProcess();
++  static std::atomic<bool> sym_done{false};
++  bool expected = false;
++  if (sym_done.compare_exchange_strong(expected, true)) {
++    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
++    SymInitialize(proc, nullptr, TRUE);
++  }
++  CONTEXT ctx = *p->ContextRecord;
++  STACKFRAME64 sf = {};
++  sf.AddrPC.Offset = ctx.Rip;     sf.AddrPC.Mode = AddrModeFlat;
++  sf.AddrFrame.Offset = ctx.Rbp;  sf.AddrFrame.Mode = AddrModeFlat;
++  sf.AddrStack.Offset = ctx.Rsp;  sf.AddrStack.Mode = AddrModeFlat;
++  std::string bt;
++  char buf[640];
++  for (int i = 0; i < 16; ++i) {
++    if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &sf, &ctx, nullptr,
++                     SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
++      break;
++    if (!sf.AddrPC.Offset) break;
++    char symbuf[sizeof(SYMBOL_INFO) + 512] = {};
++    auto* s = reinterpret_cast<SYMBOL_INFO*>(symbuf);
++    s->SizeOfStruct = sizeof(SYMBOL_INFO);
++    s->MaxNameLen = 511;
++    DWORD64 disp = 0;
++    if (SymFromAddr(proc, sf.AddrPC.Offset, &disp, s))
++      snprintf(buf, sizeof buf, "%s+0x%llX ", s->Name, (unsigned long long)disp);
++    else
++      snprintf(buf, sizeof buf, "0x%llX ", (unsigned long long)sf.AddrPC.Offset);
++    bt += buf;
++  }
++  REXLOG_WARN("SEH FAULT code=0x{:08X} fault_addr=0x{:X} tid={} bt: {}",
++              er->ExceptionCode, fault_addr, (unsigned)GetCurrentThreadId(), bt);
++}
++
+ SehThreadState& seh_thread_state() {
+   return tls_seh_state;
+ }
+@@ -36,12 +86,27 @@ int seh_filter(uint32_t code, void* ep) {
+         tls_seh_state.info[0] = pointers->ExceptionRecord->ExceptionInformation[0];
+         tls_seh_state.info[1] = pointers->ExceptionRecord->ExceptionInformation[1];
+       }
++      seh_dump_fault(pointers);  // [diag] log where the faulting worker died
++      return EXCEPTION_EXECUTE_HANDLER;
++    case kGuestSehUnwindCode:
++      // Guest SEH unwind (e.g. RtlUnwind) raised as a host exception; handle it at the
++      // nearest generated SEH_CATCH_ALL.
++      tls_seh_state.code = code;
+       return EXCEPTION_EXECUTE_HANDLER;
+     default:
+       return EXCEPTION_CONTINUE_SEARCH;
+   }
+ }
+ 
++[[noreturn]] void seh_raise_guest_unwind() {
++  RaiseException(kGuestSehUnwindCode, EXCEPTION_NONCONTINUABLE, 0, nullptr);
++#ifdef __clang__
++  __builtin_unreachable();
++#else
++  __assume(false);
++#endif
++}
++
+ [[noreturn]] void seh_rethrow() {
+   uint32_t code = tls_seh_state.code;
+   ULONG_PTR info[2] = {tls_seh_state.info[0], tls_seh_state.info[1]};
+-- 
+2.54.0
+

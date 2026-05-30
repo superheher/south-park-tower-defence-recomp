@@ -1,0 +1,244 @@
+From cd6732a091c50ea174f4e0f21982d78e150e9f0d Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sat, 30 May 2026 16:22:03 +0300
+Subject: [PATCH 10/13] kernel/xboxkrnl: debug/io/rtl fixes
+
+
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_debug.cpp b/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
+index 670c446..8c283b8 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
+@@ -21,6 +21,7 @@
+ #include <rex/system/xexception.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtypes.h>
++#include <rex/platform/seh.h>
+ 
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+@@ -127,20 +128,23 @@ void HandleCppException(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
+ }
+ 
+ void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
+-  switch (record->code) {
+-    case 0x406D1388: {
+-      HandleSetThreadName(record);
+-      return;
+-    }
+-    case 0xE06D7363: {
+-      HandleCppException(record);
+-      return;
+-    }
++  // 0x406D1388 = MS_VC_EXCEPTION (SetThreadName debugger notification) — not a real
++  // exception; just record the name and return.
++  if (record->code == 0x406D1388) {
++    HandleSetThreadName(record);
++    return;
+   }
+-
+-  // TODO(benvanik): unwinding.
+-  // This is going to suck.
+-  rex::debug::Break();
++  // Any real guest exception (C++ throw 0xE06D7363, or other status) must PROPAGATE.
++  // Previously this fell through to rex::debug::Break() (abort/no-op), so the guest's
++  // recompiled CRT then ran its own manual SEH dispatch (RtlDispatchException ->
++  // ... -> RtlRestoreContext/sub_8242EA70), whose non-local jump the static recomp
++  // can't perform -> register corruption -> guest-null write -> worker dies -> hang.
++  // Raise it as a host exception so the nearest generated SEH_CATCH_ALL handles it
++  // (recover-to-caller failure), bypassing the broken manual dispatch. See KB
++  // titles/south-park-lgtdp/40-seh-implementation-plan.md.
++  REXKRNL_WARN("RtlRaiseException code=0x{:08X}: raising guest SEH to nearest handler",
++               static_cast<uint32_t>(record->code));
++  rex::platform::seh_raise_guest_unwind();
+ }
+ 
+ void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index 3f1a852..ed746dc 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/logging.h>
+ #include <rex/memory.h>
+ #include <rex/hook.h>
++#include <rex/cvar.h>
+ #include <rex/types.h>
+ #include <rex/system/info/file.h>
+ #include <rex/system/kernel_state.h>
+@@ -32,6 +33,12 @@
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
++// [recomp] Hide the Xbox Live Arcade boot logo (ArcadeLogo.ptc). Its frames are JPEG-compressed
++// in the source asset, so the full-screen splash shows blocky/ringing artifacts. With this set,
++// NtCreateFile reports it as not-found -> the game shows black and proceeds. Default off.
++REXCVAR_DEFINE_BOOL(skip_arcade_logo, false, "Game",
++                    "Skip the Xbox Live Arcade boot logo (ArcadeLogo.ptc); shows black instead.");
++
+ struct CreateOptions {
+   // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
+   static const uint32_t FILE_DIRECTORY_FILE = 0x00000001;
+@@ -100,6 +107,41 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
+   return true;
+ }
+ 
++// [recomp locale-fallback] The retail disc lays localized assets under a locale
++// subdirectory (e.g. ...\Frontend\Graphics\en-en\foo.png or ...\Movies\en-en\bar.wmv),
++// but our extracted asset tree flattened them into the parent directory. When an open
++// fails, NtCreateFile retries once with a locale-looking path component (xx-yy: two
++// ASCII letters / '-' / two ASCII letters) removed, so the base asset is served. This
++// makes the previously-manual "movie en-en hardlink" setup step automatic and general
++// (covers the campaign slides/diagrams, the intro/level movies, etc.). Only the first
++// such middle component is stripped. Returns true and fills `out` on a match.
++static bool TryStripLocaleSegment(const std::string& path, std::string* out) {
++  auto is_alpha = [](char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); };
++  const size_t n = path.size();
++  size_t i = 0;
++  while (i < n) {
++    size_t start = i;
++    size_t end = start;
++    while (end < n && path[end] != '\\' && path[end] != '/') {
++      ++end;
++    }
++    // A locale tag is a *middle* directory component: a separator precedes it
++    // (start > 0) and one follows it (end < n), and it is exactly "xx-yy".
++    if (start > 0 && end < n && (end - start) == 5 && is_alpha(path[start]) &&
++        is_alpha(path[start + 1]) && path[start + 2] == '-' && is_alpha(path[start + 3]) &&
++        is_alpha(path[start + 4])) {
++      out->assign(path, 0, start);                    // prefix incl. the separator before the tag
++      out->append(path, end + 1, std::string::npos);  // skip the tag and its trailing separator
++      return true;
++    }
++    if (end >= n) {
++      break;
++    }
++    i = end + 1;
++  }
++  return false;
++}
++
+ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+                        ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attrs,
+                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
+@@ -133,6 +175,18 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+     return X_STATUS_OBJECT_NAME_INVALID;
+   }
+ 
++  // [recomp] Optionally hide the Xbox Live Arcade boot logo (its JPEG frames look blocky
++  // full-screen): report ArcadeLogo.ptc as not-found so the game shows black and continues.
++  if (REXCVAR_GET(skip_arcade_logo) && target_path.find("ArcadeLogo") != std::string::npos) {
++    REXKRNL_INFO("[NtCreateFile] skip_arcade_logo: hiding '{}'", target_path);
++    *handle_out = X_INVALID_HANDLE_VALUE;
++    if (io_status_block) {
++      io_status_block->status = X_STATUS_NO_SUCH_FILE;
++      io_status_block->information = 0;
++    }
++    return X_STATUS_NO_SUCH_FILE;
++  }
++
+   if (object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
+       object_attrs->root_directory != 0) {
+     auto root_file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(object_attrs->root_directory);
+@@ -149,6 +203,29 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+       root_entry, target_path, rex::filesystem::FileDisposition((uint32_t)creation_disposition),
+       desired_access, (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
+       (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file, &file_action);
++
++  // [recomp locale-fallback] If a pure open failed and the path carries a locale subdir
++  // (xx-yy) that the flattened extraction dropped, retry once at the parent directory.
++  if (XFAILED(result) && !root_entry &&
++      (uint32_t)creation_disposition == (uint32_t)rex::filesystem::FileDisposition::kOpen) {
++    std::string fallback_path;
++    if (TryStripLocaleSegment(target_path, &fallback_path)) {
++      rex::filesystem::File* fb_file = nullptr;
++      rex::filesystem::FileAction fb_action;
++      X_STATUS fb_result = REX_KERNEL_FS()->OpenFile(
++          root_entry, fallback_path, rex::filesystem::FileDisposition::kOpen, desired_access,
++          (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
++          (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &fb_file, &fb_action);
++      if (XSUCCEEDED(fb_result)) {
++        REXKRNL_INFO("[NtCreateFile] locale-fallback: served '{}' for '{}'", fallback_path,
++                     target_path);
++        result = fb_result;
++        vfs_file = fb_file;
++        file_action = fb_action;
++      }
++    }
++  }
++
+   object_ref<XFile> file = nullptr;
+ 
+   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
+index 8b862fc..c83e713 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
+@@ -21,6 +21,7 @@
+ #include <rex/kernel/xboxkrnl/threading.h>
+ #include <rex/logging.h>
+ #include <rex/hook.h>
++#include <rex/platform/seh.h>
+ #include <rex/types.h>
+ #include <rex/string.h>
+ #include <rex/system/kernel_state.h>
+@@ -555,13 +556,53 @@ u32 RtlComputeCrc32_entry(u32 seed, mapped_void buffer, u32 length) {
+ }
+ 
+ void RtlCaptureContext_entry() {
+-  // TODO(tomc): do we even need this?
+-  REXKRNL_WARN("[STUB] RtlCaptureContext called - not implemented");
++  // Capture the calling thread's PPCContext into the guest CONTEXT buffer (r3), in the exact
++  // layout the title's RtlRestoreContext (sub_8242EA70) reads: f14..f31@+0..136, SP(r1)@+144,
++  // r13..r31@+152..296, packed CR@+304, continuation PC(=lr)@+308 (VMX@+320 not yet). This is
++  // the FOUNDATION of SEH dispatch; RtlUnwind (scope walk + set target) and RtlRestoreContext
++  // (call the __except funclet) are still TODO. See KB titles/south-park-lgtdp/40-seh-*.
++  auto* thread = rex::system::XThread::GetCurrentThread();
++  if (!thread) {
++    REXKRNL_WARN("RtlCaptureContext: no current thread");
++    return;
++  }
++  auto& ctx = *thread->thread_state()->context();
++  uint32_t buf = ctx.r3.u32;
++  if (!buf) return;
++  auto* mem = REX_KERNEL_MEMORY();
++  auto p64 = [&](uint32_t off, uint64_t v) {
++    *mem->TranslateVirtual<uint64_t*>(buf + off) = rex::byte_swap(v);
++  };
++  auto p32 = [&](uint32_t off, uint32_t v) {
++    *mem->TranslateVirtual<uint32_t*>(buf + off) = rex::byte_swap(v);
++  };
++  p64(0, ctx.f14.u64);   p64(8, ctx.f15.u64);   p64(16, ctx.f16.u64);  p64(24, ctx.f17.u64);
++  p64(32, ctx.f18.u64);  p64(40, ctx.f19.u64);  p64(48, ctx.f20.u64);  p64(56, ctx.f21.u64);
++  p64(64, ctx.f22.u64);  p64(72, ctx.f23.u64);  p64(80, ctx.f24.u64);  p64(88, ctx.f25.u64);
++  p64(96, ctx.f26.u64);  p64(104, ctx.f27.u64); p64(112, ctx.f28.u64); p64(120, ctx.f29.u64);
++  p64(128, ctx.f30.u64); p64(136, ctx.f31.u64);
++  p64(144, ctx.r1.u64);
++  p64(152, ctx.r13.u64); p64(160, ctx.r14.u64); p64(168, ctx.r15.u64); p64(176, ctx.r16.u64);
++  p64(184, ctx.r17.u64); p64(192, ctx.r18.u64); p64(200, ctx.r19.u64); p64(208, ctx.r20.u64);
++  p64(216, ctx.r21.u64); p64(224, ctx.r22.u64); p64(232, ctx.r23.u64); p64(240, ctx.r24.u64);
++  p64(248, ctx.r25.u64); p64(256, ctx.r26.u64); p64(264, ctx.r27.u64); p64(272, ctx.r28.u64);
++  p64(280, ctx.r29.u64); p64(288, ctx.r30.u64); p64(296, ctx.r31.u64);
++  auto nib = [](const auto& c) -> uint32_t {
++    return (uint32_t(c.lt) << 3) | (uint32_t(c.gt) << 2) | (uint32_t(c.eq) << 1) | uint32_t(c.so);
++  };
++  uint32_t cr = (nib(ctx.cr0) << 28) | (nib(ctx.cr1) << 24) | (nib(ctx.cr2) << 20) |
++                (nib(ctx.cr3) << 16) | (nib(ctx.cr4) << 12) | (nib(ctx.cr5) << 8) |
++                (nib(ctx.cr6) << 4) | nib(ctx.cr7);
++  p32(304, cr);
++  p32(308, static_cast<uint32_t>(ctx.lr));
+ }
+ 
+ void RtlUnwind_entry() {
+-  // TODO(tomc): do we even need this?
+-  REXKRNL_WARN("[STUB] RtlUnwind called - not implemented");
++  // The guest uses Win32 SEH for error handling; on hardware RtlUnwind unwinds the stack
++  // to a target handler and does NOT return. Raise a host exception so the nearest
++  // generated SEH_CATCH_ALL wrapper catches it (recompiled-CRT SEH support; the wrapper
++  // restores the caller frame and returns failure). See src/codegen/function_graph.cpp.
++  rex::platform::seh_raise_guest_unwind();
+ }
+ 
+ void __C_specific_handler_entry() {
+-- 
+2.54.0
+

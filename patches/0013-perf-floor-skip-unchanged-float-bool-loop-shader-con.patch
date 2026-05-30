@@ -1,0 +1,37 @@
+From 0a5fe41d2d562b25b8e95e6d5147cddd554cfd55 Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sat, 30 May 2026 16:22:03 +0300
+Subject: [PATCH 13/13] perf(floor): skip unchanged float/bool/loop
+ shader-constant register writes (cut CP translation)
+
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index a40436e..de3a8c9 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -2137,6 +2137,22 @@ void VulkanCommandProcessor::ShutdownContext() {
+ }
+ 
+ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
++  // [perf] Skip unchanged float / bool / loop shader-constant writes. These registers are PURE GPU
++  // state with no write side effect, so re-writing the value the register already holds is a no-op
++  // for the base store AND for the constant-buffer dirty-mark below (the GPU already has it). Heavy
++  // combat re-sets large constant ranges every draw, much of it identical, and WriteRegister was the
++  // single hottest CP function during a dip (~11% of all cycles) -- so skipping the redundant ones
++  // cuts real PM4->Vulkan translation time (the measured combat-floor bottleneck). The fetch-constant
++  // range is intentionally NOT short-circuited: its writes have side effects (texture cache /
++  // vertex-buffer residency invalidation) that must run even on an unchanged value.
++  if (index < RegisterFile::kRegisterCount &&
++      ((index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
++       (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
++        index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31)) &&
++      register_file_->values[index] == value) {
++    return;
++  }
++
+   CommandProcessor::WriteRegister(index, value);
+ 
+   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+-- 
+2.54.0
+

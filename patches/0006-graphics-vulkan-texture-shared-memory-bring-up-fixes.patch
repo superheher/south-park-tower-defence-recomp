@@ -1,0 +1,457 @@
+From fbeb51f0347bc33b46c9139fc2c195127f28ef6a Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sat, 30 May 2026 16:22:03 +0300
+Subject: [PATCH 06/13] graphics: vulkan/texture/shared-memory bring-up fixes
+
+
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index d1580fc..0856b16 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -228,6 +228,11 @@ class TextureCache {
+     }
+     void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
+ 
++    // [recomp fix: font-glyph striping — KB 65, ironclad pt3] If a base reload is pending to catch a
++    // settled CPU glyph memcpy (see base_recheck_frames_), consume one frame: re-mark the base
++    // outdated so it reloads this pass, and return true. Returns false when nothing is pending.
++    bool ConsumeBaseRecheckFrame(const std::unique_lock<std::recursive_mutex>& global_lock);
++
+     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+ 
+     // For LRU caching - updates the last usage frame and moves the texture to
+@@ -269,6 +274,20 @@ class TextureCache {
+     bool base_outdated_ = false;
+     // Whether the recent mip data needs reloading from the memory.
+     bool mips_outdated_ = false;
++    // [recomp fix: font-glyph striping — KB 65, ironclad pt3] The host write-watch is one-shot: the
++    // first guest write to a watched range fires the callback and cancels the watch, and the wide
++    // invalidation drops page protection so the REST of a multi-page CPU glyph memcpy does not
++    // re-fault. If the texture is loaded mid-memcpy (true even for the very FIRST/creation load of
++    // the in-match hint banner), its tail pages capture stale bytes and are never reloaded (loads=1)
++    // -> persistent, timing-dependent vertical-striped text. After any load triggered by a real
++    // reason (creation or a guest write), force a couple extra reloads on the following frames so the
++    // settled memcpy is captured. base_arm_recheck_on_load_ is set ONLY by creation and the write
++    // callback (NOT by these forced rechecks), so the recheck cannot loop.
++    bool base_arm_recheck_on_load_ = false;
++    uint8_t base_recheck_frames_ = 0;
++    // Gates recheck consumption to one per GPU submission so the extra reloads span real frames
++    // (giving a multi-page CPU glyph memcpy time to settle), not multiple draws within one frame.
++    uint64_t base_recheck_last_submission_ = 0;
+     std::atomic<uint32_t> outdated_mask_{0};
+     // Watch handles for the memory ranges.
+     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index b05df6a..00155f2 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -77,7 +77,17 @@ class SharedMemory {
+   // Checks if the range has been updated, uploads new data if needed and
+   // ensures the host GPU memory backing the range are resident. Returns true if
+   // the range has been fully updated and is usable.
+-  bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
++  // [recomp fix: font-glyph striping — KB 65, ironclad] force_upload bypasses the per-page
++  // "already valid -> skip upload" optimization and re-uploads every requested page EXCEPT pages
++  // the GPU itself wrote (those stay protected so GPU-produced data is not clobbered by stale CPU
++  // memory — clobbering them regresses the boot to a black screen).
++  // The texture cache passes true: it only calls this when a texture is already known outdated
++  // (its own watch fired), so the data MUST be refetched in full. Trusting the page-valid flags
++  // there raced the host write-watch (some CPU-rasterized glyph pages read "valid" though their
++  // bytes had changed) -> the GPU sampled stale bytes -> vertical-striped text. Vertex/index and
++  // other GPU reads keep force_upload=false (the optimization is safe and wanted for them).
++  bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count,
++                     bool force_upload = false);
+   bool RequestRange(uint32_t start, uint32_t length);
+ 
+   // Marks the range and, if not exact_range, potentially its surroundings
+@@ -196,6 +206,15 @@ class SharedMemory {
+   std::atomic<uint64_t*> staging_valid_flags_{nullptr};
+   // Subset of valid pages containing data written by the GPU.
+   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
++  // [recomp fix: font-glyph striping — KB 65, ironclad] Sticky per-page "this guest page is
++  // CPU-rewritten (dynamic)" flags. Set the first time a page is invalidated by a guest CPU
++  // write (MemoryInvalidationCallback) and never cleared. RequestRanges treats a dynamic page as
++  // NOT valid, so it can never skip the page's re-upload again. This removes the dependence on
++  // every per-frame CPU glyph write tripping the host write-watch: a single missed/raced watch
++  // can no longer leave the GPU sampling stale bytes (vertical-striped text). Costs nothing for
++  // static content — the texture cache only re-requests a texture whose own watch fired, so pages
++  // that are never CPU-rewritten are never re-uploaded regardless of this flag.
++  std::vector<uint64_t> system_page_flags_dynamic_;
+   // Dirty state tracking for frame-end page-state refresh.
+   std::atomic<bool> gpu_written_data_dirty_{false};
+   std::atomic<uint32_t> dirty_blocks_{0};
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index c7c824e..e17dd2f 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -449,7 +449,25 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
+ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+   const auto& regs = register_file();
+ 
+-  if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
++  bool bindings_need_reset = texture_became_outdated_.exchange(false, std::memory_order_acquire);
++
++  // [recomp fix: font-glyph striping — KB 65, ironclad pt3] Re-mark recently CPU-written bound
++  // textures outdated for a couple of frames so a glyph memcpy that settled after the one-shot
++  // write-watch already fired (mid-write load -> striped tail, loads=1) is reloaded once complete.
++  // Cheap: only bound textures with a pending recheck, and the count is bounded per write event.
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    for (TextureBinding& binding : texture_bindings_) {
++      if (binding.texture && binding.texture->ConsumeBaseRecheckFrame(global_lock)) {
++        bindings_need_reset = true;
++      }
++      if (binding.texture_signed && binding.texture_signed->ConsumeBaseRecheckFrame(global_lock)) {
++        bindings_need_reset = true;
++      }
++    }
++  }
++
++  if (bindings_need_reset) {
+     // A texture has become outdated - make sure whether textures are outdated
+     // is rechecked in this draw and in subsequent ones to reload the new data
+     // if needed.
+@@ -569,8 +587,12 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+     for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
+       pending_shared_memory_range_pairs.emplace_back(pending_range.start, pending_range.length);
+     }
++    // [recomp fix: font-glyph striping — KB 65, ironclad] force_upload=true: these textures are
++    // being (re)loaded because they are outdated, so fetch their full contents fresh rather than
++    // trusting the racy per-page valid flags (which left dynamic glyph pages stale -> striping).
+     batched_shared_memory_request_succeeded = shared_memory().RequestRanges(
+-        pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size());
++        pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size(),
++        /*force_upload=*/true);
+   }
+ 
+   if (batched_shared_memory_request_succeeded) {
+@@ -656,6 +678,10 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
+   outdated_mask_.store(
+       (base_outdated_ ? kOutdatedBitBase : 0) | (mips_outdated_ ? kOutdatedBitMips : 0),
+       std::memory_order_relaxed);
++  // [recomp fix: font-glyph striping — KB 65, ironclad pt3] Arm the settle-recheck for the initial
++  // base load: a CPU-rasterized texture (e.g. the in-match hint banner) is frequently created while
++  // the guest is still writing its glyph bytes, so the first load captures a stale tail.
++  base_arm_recheck_on_load_ = base_outdated_;
+ }
+ 
+ TextureCache::Texture::~Texture() {
+@@ -691,6 +717,17 @@ void TextureCache::Texture::MakeUpToDateAndWatch(
+     base_watch_handle_ = shared_memory.WatchMemoryRange(
+         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
+     outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
++    // [recomp fix: font-glyph striping — KB 65, ironclad pt3] If this load was triggered by a real
++    // reason (creation or a guest write) rather than by a forced recheck, schedule a couple of extra
++    // reloads. The one-shot write-watch + wide invalidation can let a multi-page glyph memcpy finish
++    // AFTER this upload read the pages but BEFORE protection was re-armed, with no further fault -> a
++    // stale striped tail that would otherwise never reload (loads=1). The forced rechecks don't set
++    // base_arm_recheck_on_load_, so this cannot loop.
++    if (base_arm_recheck_on_load_) {
++      base_arm_recheck_on_load_ = false;
++      base_recheck_frames_ = 3;
++      base_recheck_last_submission_ = texture_cache().current_submission_index_;
++    }
+   }
+   if (mips_outdated_) {
+     assert_not_zero(GetGuestMipsSize());
+@@ -740,7 +777,28 @@ void TextureCache::Texture::WatchCallback(
+     base_outdated_ = true;
+     base_watch_handle_ = nullptr;
+     outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
++    // [recomp fix: font-glyph striping — KB 65, ironclad pt3] Mark that this outdating came from a
++    // real guest CPU write so the next load arms the settle-recheck (see MakeUpToDateAndWatch).
++    base_arm_recheck_on_load_ = true;
++  }
++}
++
++bool TextureCache::Texture::ConsumeBaseRecheckFrame(
++    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock) {
++  if (base_recheck_frames_ == 0) {
++    return false;
++  }
++  // Only consume one recheck per GPU submission, so the forced reloads are spread across real
++  // frames rather than several draws within a single frame (which could all still race the memcpy).
++  uint64_t submission = texture_cache_.current_submission_index_;
++  if (submission == base_recheck_last_submission_) {
++    return false;
+   }
++  base_recheck_last_submission_ = submission;
++  --base_recheck_frames_;
++  base_outdated_ = true;
++  outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
++  return true;
+ }
+ 
+ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
+@@ -888,7 +946,10 @@ bool TextureCache::LoadTextureData(Texture& texture) {
+   for (size_t i = 0; i < pending_range_count; ++i) {
+     pending_range_pairs[i] = std::make_pair(pending_ranges[i].start, pending_ranges[i].length);
+   }
+-  if (!shared_memory().RequestRanges(pending_range_pairs, pending_range_count)) {
++  // [recomp fix: font-glyph striping — KB 65, ironclad] force_upload=true (see RequestTextures):
++  // a texture reaching here is outdated, so re-upload it in full instead of trusting valid flags.
++  if (!shared_memory().RequestRanges(pending_range_pairs, pending_range_count,
++                                     /*force_upload=*/true)) {
+     return false;
+   }
+ 
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 333becb..e06de3d 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -35,6 +35,8 @@ void SharedMemory::InitializeCommon() {
+   valid_buffer_a_.assign(num_system_page_flags_, 0);
+   valid_buffer_b_.assign(num_system_page_flags_, 0);
+   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
++  // [recomp fix: font-glyph striping — KB 65, ironclad] Sticky CPU-dynamic page flags.
++  system_page_flags_dynamic_.assign(num_system_page_flags_, 0);
+   active_valid_flags_.store(valid_buffer_a_.data(), std::memory_order_relaxed);
+   staging_valid_flags_.store(valid_buffer_b_.data(), std::memory_order_relaxed);
+   gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
+@@ -97,6 +99,8 @@ void SharedMemory::ShutdownCommon() {
+   valid_buffer_b_.shrink_to_fit();
+   system_page_flags_valid_and_gpu_written_.clear();
+   system_page_flags_valid_and_gpu_written_.shrink_to_fit();
++  system_page_flags_dynamic_.clear();
++  system_page_flags_dynamic_.shrink_to_fit();
+   num_system_page_flags_ = 0;
+   gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
+   dirty_blocks_.store(0, std::memory_order_relaxed);
+@@ -128,6 +132,18 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
+     return;
+   }
+ 
++  // [recomp fix: in-match font-glyph corruption] The active/staging valid-flag buffer SWAP
++  // below must be atomic w.r.t. MemoryInvalidationCallback (which runs under this same global
++  // lock on guest CPU writes). Without it, the unlocked exchange() races the invalidation: a
++  // guest thread loads the active pointer, then we swap, then it clears the now-RETIRED buffer
++  // -> the just-invalidated page stays VALID in the new active buffer for one frame -> the
++  // RequestRanges fast-path skips the re-upload -> the GPU samples last frame's bytes for those
++  // pages. Harmless for static textures (menu atlas, uploaded once) but the in-match text path
++  // re-rasterizes a dynamic glyph texture EVERY frame, so its pages are invalidated every frame
++  // and hit this race -> vertical-striped glyphs that vary per render. The global lock is a
++  // recursive std::mutex; acquiring it here once per frame is cheap. See KB 65.
++  auto global_lock = global_critical_region_.Acquire();
++
+   uint64_t* staging = staging_valid_flags_.load(std::memory_order_acquire);
+   if (!staging || !num_system_page_flags_) {
+     gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
+@@ -135,26 +151,19 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
+     return;
+   }
+ 
+-  uint32_t dirty_mask = dirty_blocks_.exchange(0, std::memory_order_relaxed);
+-  uint32_t dirty_count = rex::bit_count(dirty_mask);
+-  if (dirty_count == 0 || dirty_count > 16) {
+-    std::memcpy(staging, system_page_flags_valid_and_gpu_written_.data(),
+-                num_system_page_flags_ * sizeof(uint64_t));
+-  } else {
+-    while (dirty_mask) {
+-      uint32_t block_index;
+-      rex::bit_scan_forward(dirty_mask, &block_index);
+-      dirty_mask &= ~(uint32_t(1) << block_index);
+-      uint32_t entry_offset = block_index * 64;
+-      if (entry_offset >= num_system_page_flags_) {
+-        continue;
+-      }
+-      uint32_t entry_count = std::min(uint32_t(64), num_system_page_flags_ - entry_offset);
+-      std::memcpy(staging + entry_offset,
+-                  system_page_flags_valid_and_gpu_written_.data() + entry_offset,
+-                  entry_count * sizeof(uint64_t));
+-    }
+-  }
++  // [recomp fix: font-glyph corruption — rexglue-sdk issue #341] The incremental per-dirty-
++  // block copy here was flawed: `staging` is the buffer retired two swaps ago, so its NON-dirty
++  // blocks still hold stale valid bits; copying only the dirty blocks left those stale "valid"
++  // flags in the new active buffer -> pages that should be invalid read as valid -> RequestRanges
++  // skips their re-upload -> the GPU samples stale bytes. On South Park LGTDP that struck the
++  // per-frame CPU-rasterized dynamic glyph textures -> intermittent vertical-striped text
++  // (in-match hints, menu difficulty labels, results TOTAL), varying by timing/hardware; the
++  // upstream report saw missing character geometry on Ninja Gaiden 2. Fix: always rebuild
++  // `staging` as a FULL snapshot of the master flags (the upstream issue forces
++  // dirty_mask = UINT32_MAX; we memcpy the whole buffer directly). Still drain dirty_blocks_.
++  dirty_blocks_.exchange(0, std::memory_order_relaxed);
++  std::memcpy(staging, system_page_flags_valid_and_gpu_written_.data(),
++              num_system_page_flags_ * sizeof(uint64_t));
+ 
+   uint64_t* old_active = active_valid_flags_.exchange(staging, std::memory_order_acq_rel);
+   staging_valid_flags_.store(old_active, std::memory_order_release);
+@@ -402,7 +411,8 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
+   watch_range_first_free_ = range;
+ }
+ 
+-bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
++bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count,
++                                 bool force_upload) {
+   if (ranges == nullptr || !count) {
+     return true;
+   }
+@@ -454,43 +464,63 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     }
+   }
+ 
+-  uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_acquire);
+-  if (valid_flags) {
+-    bool all_valid = true;
+-    for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+-      if (!range.second) {
+-        continue;
+-      }
+-      uint32_t page_first = range.first >> page_size_log2_;
+-      uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+-      uint32_t block_first = page_first >> 6;
+-      uint32_t block_last = page_last >> 6;
+-      for (uint32_t i = block_first; i <= block_last; ++i) {
+-        uint64_t block_valid = valid_flags[i];
+-        if (i == block_first) {
+-          uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
+-          block_valid |= block_before;
++  // [recomp fix: font-glyph corruption pt2 — KB 65] This fast-path "all pages already valid
++  // -> skip upload" check reads active_valid_flags_ CONTENTS, which MemoryInvalidationCallback
++  // and the frame-end swap mutate under global_critical_region_. Reading it lock-free raced
++  // them: a page just invalidated by a guest CPU write could still read VALID here -> the
++  // upload was wrongly skipped -> the GPU sampled stale bytes -> intermittent, timing/HW-
++  // dependent vertical-striped glyphs. KB 65's first fix only locked the swap; serialize this
++  // reader too, so EVERY access to the valid-flag buffer contents is under the one global lock
++  // (no data race). Scoped so the lock is released before UploadRanges() below. (Confirmed it
++  // is the skip path: clear_memory_page_state=false, which forces uploads, renders clean.)
++  uint64_t* valid_flags = nullptr;
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
++    // [recomp fix: ironclad] CPU-dynamic pages are never "already valid" for the skip fast-path.
++    const uint64_t* dynamic_flags =
++        system_page_flags_dynamic_.empty() ? nullptr : system_page_flags_dynamic_.data();
++    // [recomp fix: ironclad] force_upload (texture reloads) never takes the skip fast-path.
++    if (!force_upload && valid_flags) {
++      bool all_valid = true;
++      for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
++        if (!range.second) {
++          continue;
+         }
+-        if (i == block_last && (page_last & 63) != 63) {
+-          uint64_t block_inside = (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+-          block_valid |= ~block_inside;
++        uint32_t page_first = range.first >> page_size_log2_;
++        uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
++        uint32_t block_first = page_first >> 6;
++        uint32_t block_last = page_last >> 6;
++        for (uint32_t i = block_first; i <= block_last; ++i) {
++          uint64_t block_valid = valid_flags[i];
++          if (dynamic_flags) {
++            block_valid &= ~dynamic_flags[i];  // force re-upload of CPU-dynamic pages
++          }
++          if (i == block_first) {
++            uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
++            block_valid |= block_before;
++          }
++          if (i == block_last && (page_last & 63) != 63) {
++            uint64_t block_inside = (uint64_t(1) << ((page_last & 63) + 1)) - 1;
++            block_valid |= ~block_inside;
++          }
++          if (block_valid != UINT64_MAX) {
++            all_valid = false;
++            break;
++          }
+         }
+-        if (block_valid != UINT64_MAX) {
+-          all_valid = false;
++        if (!all_valid) {
+           break;
+         }
+       }
+-      if (!all_valid) {
+-        break;
++      if (all_valid) {
++        COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
++        COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
++                          uint32_t(merged_ranges.size()));
++        COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count", 0);
++        return true;
+       }
+     }
+-    if (all_valid) {
+-      COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
+-      COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
+-                        uint32_t(merged_ranges.size()));
+-      COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count", 0);
+-      return true;
+-    }
+   }
+ 
+   upload_ranges_.clear();
+@@ -510,6 +540,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   {
+     auto global_lock = global_critical_region_.Acquire();
+     valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
++    // [recomp fix: ironclad] CPU-dynamic pages are always treated as invalid -> always uploaded.
++    const uint64_t* dynamic_flags =
++        system_page_flags_dynamic_.empty() ? nullptr : system_page_flags_dynamic_.data();
+     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+       uint32_t page_first = range.first >> page_size_log2_;
+       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+@@ -517,7 +550,24 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+       uint32_t block_last = page_last >> 6;
+       uint32_t range_start = UINT32_MAX;
+       for (uint32_t i = block_first; i <= block_last; ++i) {
+-        uint64_t block_valid = valid_flags ? valid_flags[i] : 0;
++        // [recomp fix: font-glyph striping — KB 65, ironclad] On a forced texture reload, re-upload
++        // every in-range page EXCEPT pages the GPU itself wrote. Re-uploading GPU-written pages from
++        // guest CPU memory would clobber GPU-produced data (resolved render targets, memexport) ->
++        // corrupted rendering / black boot. CPU-rasterized glyph pages are NOT GPU-written, so they
++        // all re-upload -> no stale bytes -> no striping. (A blunt block_valid=0 here regressed the
++        // boot to a black screen exactly because it clobbered the intro's GPU-written pages.) The
++        // non-forced path keeps the per-page valid skip plus the dynamic-page safety net.
++        uint64_t block_valid;
++        if (force_upload) {
++          block_valid = system_page_flags_valid_and_gpu_written_.empty()
++                            ? 0
++                            : system_page_flags_valid_and_gpu_written_[i];
++        } else {
++          block_valid = valid_flags ? valid_flags[i] : 0;
++          if (dynamic_flags) {
++            block_valid &= ~dynamic_flags[i];  // force re-upload of CPU-dynamic pages
++          }
++        }
+         // Consider pages in the block outside the requested range valid.
+         if (i == block_first) {
+           uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
+@@ -635,6 +685,10 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+       valid_flags[i] &= ~invalidate_bits;
+     }
+     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
++    // [recomp fix: font-glyph striping — KB 65, ironclad] Record that the guest CPU has
++    // rewritten these pages. From now on RequestRanges never skips their upload, so a later
++    // missed/raced write-watch cannot leave the GPU sampling stale glyph bytes. Sticky on purpose.
++    system_page_flags_dynamic_[i] |= invalidate_bits;
+     dirty_blocks_mask |= uint32_t(1) << (i >> 6);
+   }
+   gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 91ac08f..8b98d5e 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -37,6 +37,7 @@
+ #include <rex/graphics/pipeline/shader/spirv_builder.h>
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/graphics/register_file.h>
++#include <rex/chrono/clock.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/util/draw.h>
+ #include <rex/graphics/vulkan/command_processor.h>
+@@ -3032,6 +3033,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+                 creation_arguments.vertex_shader->shader().ucode_data_hash());
+   }
+ 
++  // [frame-limiter] Record shader-compile activity so the CP frame limiter skips
++  // throttling while a level is loading (heavy pipeline creation) -- throttling
++  // the loading screen breaks the load.
++  rex::graphics::LastPipelineHostTick().store(rex::chrono::Clock::QueryHostTickCount(),
++                                              std::memory_order_relaxed);
++
+   const PipelineDescription& description = creation_arguments.pipeline->first;
+   if (!ArePipelineRequirementsMet(description)) {
+     assert_always(
+-- 
+2.54.0
+

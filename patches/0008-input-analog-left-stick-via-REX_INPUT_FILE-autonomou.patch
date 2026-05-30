@@ -1,0 +1,240 @@
+From fa6b82d928a073e58fbc01297c6a917b3c693f3f Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sat, 30 May 2026 16:22:03 +0300
+Subject: [PATCH 08/13] input: analog left-stick via REX_INPUT_FILE (autonomous
+ test harness)
+
+
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index b8eae3c..eea619e 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -18,7 +18,10 @@
+ #include <rex/ui/window.h>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #if REX_PLATFORM_WIN32
+@@ -27,9 +30,17 @@
+ #endif
+ 
+ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
++REXCVAR_DEFINE_BOOL(mnk_ignore_focus, false, "Input",
++                    "Read keyboard/mouse even when the window isn't focused "
++                    "(for remote desktop / headless, where focus events are unreliable)");
+ REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
+ REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
+     .range(0.01, 10.0);
++REXCVAR_DEFINE_BOOL(mnk_mouse_look, false, "Input",
++                    "Capture the mouse for camera / right-stick control (hides the cursor and "
++                    "re-centers it every frame, locking it to the window). Default OFF keeps the "
++                    "cursor free; mouse BUTTONS still map to triggers, only mouse movement won't "
++                    "drive the right stick.");
+ 
+ REXCVAR_DEFINE_STRING(keybind_a, "Space", "Input/Keybinds/Controller", "A button");
+ REXCVAR_DEFINE_STRING(keybind_b, "Shift", "Input/Keybinds/Controller", "B button");
+@@ -140,9 +151,112 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
++  // [TEST-INJECT] Drive input programmatically when SDL can't receive synthetic keys
++  // (background automation / UIPI: a real keypress is never delivered to SDL's keyboard).
++  // REX_INJECT_SCRIPT="t:hexbtn,t:hexbtn,..." presses each XInput button mask at time t
++  // (seconds since first poll) for REX_INJECT_DUR seconds (default 0.5). Bypasses the
++  // focus gate. Diagnostic/verification only; absent => normal input path.
++  static const char* s_script = std::getenv("REX_INJECT_SCRIPT");
++  if (s_script && out_state) {
++    static const double dur = std::getenv("REX_INJECT_DUR") ? std::atof(std::getenv("REX_INJECT_DUR")) : 0.5;
++    auto rex_tick_ms = []() -> unsigned long long {
++      return static_cast<unsigned long long>(
++          std::chrono::duration_cast<std::chrono::milliseconds>(
++              std::chrono::steady_clock::now().time_since_epoch())
++              .count());
++    };
++    static const unsigned long long t0 = rex_tick_ms();
++    double el = (rex_tick_ms() - t0) / 1000.0;
++    uint16_t btn = 0;
++    for (const char* p = s_script; *p;) {
++      double t = std::atof(p);
++      const char* colon = std::strchr(p, ':');
++      if (!colon) break;
++      uint16_t b = static_cast<uint16_t>(std::strtoul(colon + 1, nullptr, 16));
++      if (el >= t && el < t + dur) btn |= b;
++      const char* comma = std::strchr(colon, ',');
++      if (!comma) break;
++      p = comma + 1;
++    }
++    // Feed the keystroke queue on button edges (menus often poll XamInputGetKeystroke).
++    static uint16_t s_last = 0;
++    if (btn != s_last) {
++      auto vkfor = [](uint16_t m) -> uint16_t {
++        if (m & 0x0010) return 0x5814;  // START
++        if (m & 0x0020) return 0x5815;  // BACK
++        if (m & 0x1000) return 0x5800;  // A
++        if (m & 0x2000) return 0x5801;  // B
++        if (m & 0x0001) return 0x5810;  // DPAD_UP
++        if (m & 0x0002) return 0x5811;  // DPAD_DOWN
++        if (m & 0x0004) return 0x5812;  // DPAD_LEFT
++        if (m & 0x0008) return 0x5813;  // DPAD_RIGHT
++        return 0; };
++      uint16_t v = vkfor(static_cast<uint16_t>(btn | s_last));
++      if (v) { std::lock_guard lk(state_mutex_); EnqueueKeystroke(v, btn != 0); }
++      s_last = btn;
++    }
++    std::memset(out_state, 0, sizeof(*out_state));
++    out_state->packet_number = ++packet_number_;
++    out_state->gamepad.buttons = btn;
++    return X_ERROR_SUCCESS;
++  }
++
++  // [LIVE-INPUT] Focus-INDEPENDENT live input source. REX_INPUT_FILE points to a small text file
++  // holding the current XInput button mask in hex (e.g. "1000"=A, "0010"=START, "0002"=DPAD_DOWN,
++  // "2000"=B, "0020"=BACK, "0001/4/8"=DPAD up/left/right). It is re-read every poll and reported as
++  // the pad state WITHOUT requiring window focus (unlike OS key injection, which SDL ignores when
++  // unfocused). Menus that poll GetKeystroke get edge-triggered keystrokes. Write the mask to press,
++  // write "0" (or empty) to release; a momentary tap = write mask then write 0. The InputSystem ORs
++  // this with any real SDL pad/keyboard, so it augments rather than replaces real input.
++  static const char* s_input_file = std::getenv("REX_INPUT_FILE");
++  if (s_input_file && out_state) {
++    uint16_t btn = 0;
++    int16_t lx = 0, ly = 0;
++    if (FILE* f = std::fopen(s_input_file, "rb")) {
++      char buf[64] = {0};
++      size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
++      std::fclose(f);
++      if (n) {
++        char* end = nullptr;
++        btn = static_cast<uint16_t>(std::strtoul(buf, &end, 16));
++        // Optional left-stick analog: "<btnhex> <lx> <ly>" with lx/ly in
++        // [-32768,32767] (e.g. "0 -28000 0" pushes the stick left). Digital button
++        // masks alone can't move the player character; autonomous tests need this.
++        if (end && *end) {
++          long vx = std::strtol(end, &end, 10);
++          long vy = (end && *end) ? std::strtol(end, &end, 10) : 0;
++          lx = static_cast<int16_t>(std::clamp<long>(vx, -32768, 32767));
++          ly = static_cast<int16_t>(std::clamp<long>(vy, -32768, 32767));
++        }
++      }
++    }
++    static uint16_t s_lastf = 0;
++    if (btn != s_lastf) {
++      auto vkfor = [](uint16_t m) -> uint16_t {
++        if (m & 0x0010) return 0x5814;  // START
++        if (m & 0x0020) return 0x5815;  // BACK
++        if (m & 0x1000) return 0x5800;  // A
++        if (m & 0x2000) return 0x5801;  // B
++        if (m & 0x0001) return 0x5810;  // DPAD_UP
++        if (m & 0x0002) return 0x5811;  // DPAD_DOWN
++        if (m & 0x0004) return 0x5812;  // DPAD_LEFT
++        if (m & 0x0008) return 0x5813;  // DPAD_RIGHT
++        return 0; };
++      uint16_t v = vkfor(static_cast<uint16_t>(btn | s_lastf));
++      if (v) { std::lock_guard lk(state_mutex_); EnqueueKeystroke(v, btn != 0); }
++      s_lastf = btn;
++    }
++    std::memset(out_state, 0, sizeof(*out_state));
++    out_state->packet_number = ++packet_number_;
++    out_state->gamepad.buttons = btn;
++    out_state->gamepad.thumb_lx = lx;
++    out_state->gamepad.thumb_ly = ly;
++    return X_ERROR_SUCCESS;
++  }
++
+   UpdateMouseCapture();
+ 
+-  if (!is_active() || !has_focus_) {
++  if (!is_active() || (!has_focus_ && !REXCVAR_GET(mnk_ignore_focus))) {
+     if (out_state) {
+       std::memset(out_state, 0, sizeof(*out_state));
+       out_state->packet_number = packet_number_;
+@@ -209,6 +323,31 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
+   };
+ 
++  // [recomp-fix] Feed the keystroke queue from REAL keyboard/mouse button edges, so
++  // menus/title that poll XamInputGetKeystroke (not just GetState) respond to the
++  // keyboard. Previously only the focus-free inject paths did this, so real keyboard
++  // set the button state but never enqueued keystrokes (menus ignored it). We already
++  // hold state_mutex_ here, and EnqueueKeystroke does not self-lock.
++  {
++    static uint16_t s_last_kb_buttons = 0;
++    if (buttons != s_last_kb_buttons) {
++      auto vkfor = [](uint16_t m) -> uint16_t {
++        if (m & 0x0010) return 0x5814;  // START
++        if (m & 0x0020) return 0x5815;  // BACK
++        if (m & 0x1000) return 0x5800;  // A
++        if (m & 0x2000) return 0x5801;  // B
++        if (m & 0x0001) return 0x5810;  // DPAD_UP
++        if (m & 0x0002) return 0x5811;  // DPAD_DOWN
++        if (m & 0x0004) return 0x5812;  // DPAD_LEFT
++        if (m & 0x0008) return 0x5813;  // DPAD_RIGHT
++        return 0;
++      };
++      uint16_t v = vkfor(static_cast<uint16_t>(buttons | s_last_kb_buttons));
++      if (v) EnqueueKeystroke(v, buttons != 0);
++      s_last_kb_buttons = buttons;
++    }
++  }
++
+   packet_number_++;
+ 
+   if (out_state) {
+@@ -278,7 +417,11 @@ void MnkInputDriver::UpdateMouseCapture() {
+   if (!attached_window_)
+     return;
+ 
+-  bool should_capture = IsEnabled() && has_focus_ && is_active();
++  // [recomp] Only grab/hide/re-center the cursor when mouse-look is explicitly enabled. By
++  // default the cursor stays free + visible (the capture made it impossible to move or resize
++  // the window). Buttons/triggers are unaffected (read from key state, not from capture).
++  bool should_capture =
++      REXCVAR_GET(mnk_mouse_look) && IsEnabled() && has_focus_ && is_active();
+ 
+   if (should_capture && !mouse_captured_) {
+     mouse_captured_ = true;
+@@ -306,7 +449,18 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+ }
+ 
+ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  // [mnk-key-diag] Capped log to diagnose "keyboard not reaching the game": if these
++  // lines appear when you press keys, the key reached the mnk driver (check focus/
++  // active); if none appear, the key never reached mnk (consumed earlier / not
++  // delivered). Remove once keyboard input is confirmed.
++  static int s_mnk_diag = 0;
++  if (s_mnk_diag < 24) {
++    ++s_mnk_diag;
++    REXLOG_INFO("[mnk-key] vk=0x{:X} enabled={} focus={} active={} ignore_focus={}",
++                static_cast<int>(e.virtual_key()), IsEnabled(), has_focus_, is_active(),
++                static_cast<bool>(REXCVAR_GET(mnk_ignore_focus)));
++  }
++  if (!IsEnabled() || (!has_focus_ && !REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   std::lock_guard lock(state_mutex_);
+   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+@@ -322,7 +476,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || (!has_focus_ && !REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   std::lock_guard lock(state_mutex_);
+   switch (e.button()) {
+@@ -360,7 +514,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || (!has_focus_ && !REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   std::lock_guard lock(state_mutex_);
+   int32_t x = e.x();
+-- 
+2.54.0
+

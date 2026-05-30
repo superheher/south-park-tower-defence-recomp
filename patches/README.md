@@ -1,45 +1,58 @@
-# patches/ — local bring-up patches to third_party/rexglue-sdk
+# patches/ — granular local patch series for third_party/rexglue-sdk
 
-rexglue-sdk is a third-party submodule tracking upstream
-(`github.com/rexglue/rexglue-sdk`). These are **small local fixes** found during
-bring-up, kept as patch files (not pushed upstream, not committed into the
-submodule) so the super-repo gitlink stays clean and the fixes are reproducible.
+`rexglue-sdk` is a third-party submodule pinned at upstream `e8ce24f` (Release v0.8.0).
+These are **local bring-up + perf fixes** found while porting *South Park: Let's Go Tower
+Defense Play!* to native Linux/Vulkan. They are kept as a **granular `git format-patch`
+series** (not pushed upstream, not committed into the submodule) so the super-repo gitlink
+stays on the upstream commit and every fix is individually reviewable / revertible.
 
-Apply after `git submodule update`, then rebuild + reinstall the SDK:
+> **2026-05-30:** the old single rolling `rexglue-sdk-current-full.patch` blob (~3.3k lines,
+> all fixes mixed together, and it silently dropped the untracked `netplay.{h,cpp}`) was
+> **split into the granular series below**. The series is byte-for-byte equivalent to the old
+> working tree *plus* the previously-missing netplay files (verified: `git am` onto a pristine
+> `e8ce24f` reproduces the exact build).
 
-```powershell
-git -C third_party/rexglue-sdk apply ../../south-park-recomp/patches/0001-rexglue-thread-r1-stack-headroom.patch
-cmake --build --preset win-amd64-release --target install   # in third_party/rexglue-sdk
+## Apply (after `git submodule update`)
+
+```bash
+cd third_party/rexglue-sdk
+git am ../../south-park-recomp/patches/0*.patch      # applies the whole series in order
+#   …or, to keep the submodule on a detached gitlink with a dirty tree (the build only needs
+#   the changes applied, not committed):  for p in ../../south-park-recomp/patches/0*.patch; do git apply "$p"; done
+cmake --build out/build/linux-amd64 --target install # rebuild + reinstall the SDK
 ```
 
-| Patch | Fixes |
-|-------|-------|
-| `0001-rexglue-thread-r1-stack-headroom.patch` | Initial guest `r1` was set to `stack_base`, which sits on the stack's `PAGE_NOACCESS` guard page. A no-prologue XEX entry thunk that reads its caller frame *above* `r1` (South Park's `xstart`: `addi r1,r1,112; lwz r12,-8(r1)`) faults. Reserve a small 16-byte-aligned initial frame below `stack_base`. |
-| ~~`0002` (r3=-1)~~ **REVERTED** | Was a wrong hypothesis. Studying Xenia's `KernelState::LaunchModule` (`kernel_state.cc:276`) showed it launches the main thread with `start_context = 0` (guest `r3 = 0`) — **identical to rexglue's default**. rexglue's launch correctly mirrors Xenia (which runs 360 games); `r3 = -1` was an unjustified deviation, now reverted. (South Park's entry returns regardless of `r3`; it's a stub — see `30-boot-log.md`.) |
-| `0003-rexglue-codegen-implement-lmw.patch` | Codegen had `build_stmw` (store-multiple, in prologues) but no `build_lmw` (load-multiple, in matching epilogues), so any function using the stmw/lmw non-volatile-GPR save-restore pair compiled its prologue but `throw`s `REX_UNIMPLEMENTED` in its epilogue. Adds `build_lmw` (load mirror of `build_stmw`) + dispatch entry. Verified: `Unimplemented: lmw` 119 → 0. |
-| `0004-rexglue-entry-point-override-envvar.patch` | **Bring-up experiment.** South Park's XEX entry is a do-nothing stub (see `35-entry-forensics.md`); to empirically test starting at the real `mainCRTStartup`, this reads `REX_ENTRY_OVERRIDE=0x82xxxxxx` (env var) right after the loader caches `XEX_HEADER_ENTRY_POINT` and overrides `entry_point_`. No per-address rebuild needed. Used to brute-force candidate entries (`tools/find_zeroref_roots.py` + the brute-force scripts). General technique in `knowledge-base/general/80`. |
-| `0009-rexglue-stfs-direct-mount.patch` | **Launcher M1.** Lets `--game_data_root` point at a single STFS package file (the user's own console dump) instead of a pre-extracted folder — no extraction step. `Runtime::SetupVfs` auto-detects file-vs-directory and mounts `StfsContainerDevice` for a file / `HostPathDevice` for a folder. `ReXApp::ConstructRuntime` accepts a file (relaxes `is_directory`) and skips the host `default.xex` pre-flight for packages (the VFS validates the in-package XEX at load). Generic + upstreamable; offline folder boot is byte-for-byte unchanged. Verified by running: boots the title from both an STFS package and an extracted folder. |
+## The series
 
-## Linux bring-up fixes (folded into the full patch)
+| # | Patch | What |
+|---|-------|------|
+| 01 | `build-mcmodel-medium…` | Recomp built `-mcmodel=large` → every guest call was an indirect `movabs;call *reg` (BTB-thrash). Flip to `medium` (direct calls 1→85k, exec mispredicts −79%, .text −4.9%). + rexglue cmake helper tweaks. |
+| 02 | `codegen-implement-lmw-as-local…` | `build_lmw` (load-multiple, was `REX_UNIMPLEMENTED` in epilogues; `lmw` 119→0); the as-local/context decouple (registers as per-fn C++ locals synced to ctx only at setjmp/SEH boundaries, −16% .text, gate-pass); `db16cyc` spin-idiom → `REX_SPIN_BACKOFF` (the guest spin no longer pegs a core). |
+| 03 | `platform-SEH-forced-unwind…` | POSIX `SEH_CATCH_ALL` `catch(...)` swallowed glibc's `pthread_exit` forced-unwind → `FATAL: exception not rethrown` abort; narrowed to `catch(SehException&)`. + `seh_raise_guest_unwind()` POSIX impl (the missing link symbol) + first-cut SEH recovery. |
+| 04 | `core-timer-queue-blocking…` | `TimerQueue::TimerThreadMain` was **16.6% of all CPU cycles** busy-spinning in disruptorplus `spin_wait_strategy` → `blocking_wait_strategy` (+ fix a latent arg-order bug in `blocking_wait_strategy.hpp`). |
+| 05 | `graphics-command-processor-boot-present-fence…` | The boot present/vsync + WAIT_REG_MEM fence-deadlock fixes: `RefreshVblankFence` (push live `counter_` to the guest's vblank fence each vblank), periodic ring read-ptr write-back, WAIT_REG_MEM fast-poll + escape (the 1 ms-sleep-per-poll throttle that froze the intro). |
+| 06 | `graphics-vulkan-texture-shared-memory…` | Vulkan pipeline-cache / texture-cache / shared-memory bring-up fixes. |
+| 07 | `audio-SDL-driver…` | SDL audio driver bring-up fixes. |
+| 08 | `input-analog-left-stick…` | `REX_INPUT_FILE` parses an optional left-stick suffix `"<btnhex> <lx> <ly>"` so the autonomous harness (`tools/gamectl.sh`) can move the player, not just press buttons. |
+| 09 | `kernel-xam-save-user-net-msg-input…` | xam save/user-profile/messaging/input-mapping + the **paused, cvar-gated netplay** code (incl. `netplay.{h,cpp}` — these were missing from the old blob). |
+| 10 | `kernel-xboxkrnl-debug-io-rtl…` | xboxkrnl debug / io / rtl fixes. |
+| 11 | `system-loader-r1-stack-headroom…` | Initial guest `r1` stack headroom (no-prologue XEX thunk reads above `r1`); `REX_ENTRY_OVERRIDE` env var; boot-continuation re-enter + stack-zero; STFS direct-mount (`--game_data_root` can be a single STFS package). |
+| 12 | `perf-floor-GPU-fence-block-on-signal…` | **This session.** CP `WAIT_REG_MEM` blocks on a vblank `condition_variable` (instead of the 8000× `sched_yield` fast-poll); guest Main spin parks on the vblank signal (`REX_SPIN_BACKOFF` → exported `rex::thread::VblankBackoffWait()`/`NotifyVblank()`, `sub_821B9270` 34%→9.6%); `WriteRegister` caches `GetLoggerRaw` (was ~3% of CP cycles). All floor-neutral but de-spun + avg/ceiling up. |
+| 13 | `perf-floor-skip-unchanged…shader-constant…` | **This session.** Skip unchanged float/bool/loop shader-constant register writes (pure GPU state) — the first real combat-floor lever (heavy-frame min +2, p10 +0.3): cuts redundant PM4→Vulkan translation. See `../docs/FLOOR-CP-TRANSLATION-REPORT.md`. |
 
-The port was first brought up on Windows + D3D12; these additional fixes make the SDK
-build and run on Linux via the Vulkan backend. All are small/additive and are folded
-into `rexglue-sdk-current-full.patch`. Full build/run/automation guide:
-`../docs/RUN-linux.md`.
+## Adding / regenerating patches (keep it granular!)
 
-| Area | Fix |
-|------|-----|
-| **SEH unwind (decisive)** | `include/rex/platform/exceptions.h`: POSIX `SEH_CATCH_ALL` was `catch(...)`, which swallowed glibc's `pthread_exit` forced-unwind when a guest thread exited → `__libc_fatal("FATAL: exception not rethrown")` abort. Changed to `catch(const ::rex::SehException&)` so forced unwinds propagate, matching the selective Windows `__except(seh_filter)`. |
-| **Missing POSIX symbol** | `src/core/seh_posix.cpp`: add `seh_raise_guest_unwind()` (Linux counterpart of the seh_win.cpp impl; throws `SehException` so the nearest generated catch handles the guest RtlUnwind). Without it `librexruntime.so` had an undefined reference and the toolchain failed to link. |
-| **Win32-ism in shared code** | `src/input/mnk/mnk_input_driver.cpp`: `GetTickCount64()` → `std::chrono::steady_clock` (in the env-gated REX_INJECT test path). |
-| **Winsock in shared code** | `src/kernel/xam/xam_net.cpp`: add `using SOCKET = int` to the Linux include branch. `src/kernel/xam/netplay.cpp`: add an `#else` with `<arpa/inet.h>`/`<netinet/in.h>` so `htons`/`inet_addr` resolve (the `SOCKET`-using paths were already `_WIN32`-only). |
-| **Analog test input** | `src/input/mnk/mnk_input_driver.cpp`: `REX_INPUT_FILE` now also parses an optional left-stick suffix `"<btnhex> <lx> <ly>"` and sets `gamepad.thumb_lx/ly`, so autonomous tests can move the player character (digital masks alone cannot). Paired with `tools/gamectl.sh`. |
-
-**`rexglue-sdk-current-full.patch`** is the rolling, self-contained snapshot of the
-*entire* rexglue-sdk working tree (all the bring-up fixes above plus the larger
-boot/font/save/SEH/audio/locale fixes and the paused, cvar-gated netplay code incl. the
-untracked `netplay.{h,cpp}`). Apply it to a pristine `rexglue-sdk` checkout to reproduce the
-current build, then rebuild + reinstall the SDK. Regenerate with:
-`git -C third_party/rexglue-sdk add -N include/rex/system/netplay.h src/kernel/xam/netplay.cpp && git -C third_party/rexglue-sdk diff > south-park-recomp/patches/rexglue-sdk-current-full.patch && git -C third_party/rexglue-sdk reset -q`
-
-Both detailed in `knowledge-base/titles/south-park-lgtdp/30-boot-log.md`.
+- **New fix** → its own new numbered patch. Stage just that fix's hunks and:
+  `git -C third_party/rexglue-sdk diff -- <files> > south-park-recomp/patches/00NN-<feature>.patch`
+  (for files shared with an existing patch, stage only the new hunks with `git add -p`).
+- **Re-split everything** (if it drifts) → rebuild the series on a throwaway branch and
+  `git format-patch e8ce24f`:
+  ```bash
+  git -C third_party/rexglue-sdk worktree add --detach /tmp/wt e8ce24f
+  # apply existing series, make per-feature commits, then:
+  git -C /tmp/wt format-patch e8ce24f -o south-park-recomp/patches/
+  ```
+- **Capture untracked files** (e.g. netplay): `git add` them on the branch before `format-patch`
+  (a plain `git diff` does NOT include untracked files — that was the old blob's bug).
+- **Always verify**: `git am` the series onto a pristine `e8ce24f` worktree and byte-compare to
+  the live SDK tree before committing.

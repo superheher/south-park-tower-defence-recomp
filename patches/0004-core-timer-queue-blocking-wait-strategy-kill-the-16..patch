@@ -1,0 +1,64 @@
+From c24df7241630d49b7f9283f3f91d80f93ed23cf7 Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sat, 30 May 2026 16:22:02 +0300
+Subject: [PATCH 04/13] core: timer-queue blocking wait-strategy (kill the
+ 16.6%-cycles spin)
+
+
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..d8b786f 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -15,7 +15,13 @@
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+ #include <disruptorplus/ring_buffer.hpp>
+ #include <disruptorplus/sequence_barrier.hpp>
+-#include <disruptorplus/spin_wait_strategy.hpp>
++// [recomp fix] Use the BLOCKING wait strategy, not spin: TimerThreadMain was measured burning ~16%
++// of all CPU cycles busy-spinning in wait_until_published between timer events (it polls the clock
++// until the next timer is due). On this recomp that spinning thread steals a core from the GPU command
++// processor / guest-sim threads that gate the combat-frame floor (and wastes power/thermal headroom on
++// the laptop i9). blocking_wait_strategy parks on a condvar until a timer is published or its due-time
++// timeout, with identical timer semantics. See FLOOR-OVEREXEC report.
++#include <disruptorplus/blocking_wait_strategy.hpp>
+ 
+ #include <rex/assert.h>
+ #include <rex/thread.h>
+@@ -142,9 +148,9 @@ class TimerQueue {
+   // This ring buffer will be used to introduce timers queued by the public API
+   static constexpr size_t kWaitCount = 512;
+   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
+-  dp::spin_wait_strategy wait_strategy_;
+-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
+-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
++  dp::blocking_wait_strategy wait_strategy_;
++  dp::multi_threaded_claim_strategy<dp::blocking_wait_strategy> claim_strategy_;
++  dp::sequence_barrier<dp::blocking_wait_strategy> consumed_;
+ 
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
+diff --git a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp b/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
+index 32d427d..ebaa2e6 100644
+--- a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
++++ b/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
+@@ -169,13 +169,15 @@ namespace disruptorplus
+             sequence_t result;
+             {
+                 std::unique_lock<std::mutex> lock(m_mutex);
++                // [fix] std::condition_variable::wait_until takes (lock, time_point, predicate);
++                // disruptorplus had the predicate and timeout swapped -> no matching overload.
+                 m_cv.wait_until(
+                     lock,
++                    timeoutTime,
+                     [&]() -> bool {
+                         result = minimum_sequence_after(sequence, count, sequences);
+                         return difference(result, sequence) >= 0;
+-                    },
+-                    timeoutTime);
++                    });
+             }
+             return result;
+         }
+-- 
+2.54.0
+

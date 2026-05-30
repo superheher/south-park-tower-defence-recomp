@@ -1,0 +1,1461 @@
+From 0c27bc8d8378bf657f15de263a9b474a43db3d20 Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sat, 30 May 2026 16:22:03 +0300
+Subject: [PATCH 09/13] kernel/xam: save/user/net/msg/input + paused cvar-gated
+ netplay
+
+
+diff --git a/include/rex/system/netplay.h b/include/rex/system/netplay.h
+new file mode 100644
+index 0000000..cc4f1fe
+--- /dev/null
++++ b/include/rex/system/netplay.h
+@@ -0,0 +1,86 @@
++/**
++ ******************************************************************************
++ * ReXGlue runtime — South Park: Let's Go Tower Defense online co-op
++ ******************************************************************************
++ * Netplay manager: bridges the title's Xbox 360 XGI/XNet calls to a local
++ * matchmaking broker (sp-netplay-server) so two instances on one host can find
++ * each other and exchange game UDP.
++ *
++ * Design (see sp-netplay-server/NIGHT-LOG.md): each instance is assigned a
++ * distinct loopback IP 127.0.0.(1+instance) via the --netplay_instance cvar and
++ * binds its game socket there; 127.0.0.0/8 all routes to loopback so distinct
++ * instances on the same port reach each other with no payload rewriting. The
++ * broker just matches host<->joiner and hands over each peer's XNADDR<->IP map.
++ *
++ * Entirely behind the --netplay_server cvar: when empty (default), enabled() is
++ * false and every hook is a no-op, so offline/single-player is unchanged.
++ ******************************************************************************
++ */
++#ifndef REX_SYSTEM_NETPLAY_H_
++#define REX_SYSTEM_NETPLAY_H_
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace rex {
++namespace system {
++
++class Netplay {
++ public:
++  static Netplay& Get();
++
++  // True when --netplay_server is set (online co-op active). When false, all
++  // hooks below are inert and the title behaves exactly as offline.
++  bool enabled();
++
++  int instance();               // --netplay_instance (0,1,2,...)
++  std::string instance_id();    // "inst<N>"
++  uint32_t loopback_ip_net();   // network-order in_addr for 127.0.0.(1+N) (bind/resolve)
++  std::string loopback_ip_str();
++  uint32_t advertised_ip_net(); // non-loopback "online" IP for the advertised XNADDR
++                                // ina/inaOnline (identity only; reachability is via
++                                // abOnline -> XNetXnAddrToInAddr -> loopback)
++  const uint8_t* online_key();  // stable 20-byte abOnline identity for this instance
++  std::string online_key_hex();
++  uint16_t game_port();         // UDP port the game bound (default 1000)
++  void set_game_port(uint16_t p);
++
++  // Build the 36-byte XNADDR this instance advertises (ina/inaOnline = loopback
++  // ip, abOnline = online_key, abEnet = derived MAC). out must hold >=36 bytes.
++  void BuildSelfXnaddr(uint8_t* out36);
++
++  void EnsureRegistered();      // POST /register (idempotent) + start heartbeat
++
++  bool CreateSession(const std::string& session_id_hex, uint32_t flags,
++                     uint32_t pub, uint32_t priv, uint32_t game_type);
++
++  struct SessionResult {
++    std::string session_id_hex;       // 16 hex chars (8-byte XNKID)
++    std::string host_online_key_hex;  // 40 hex chars (20-byte abOnline)
++    uint32_t host_ip_net = 0;         // network order
++    uint16_t host_port = 0;
++    uint32_t open_pub = 0;
++    uint32_t open_priv = 0;
++    std::vector<uint8_t> host_xnaddr; // 36 bytes if the host published one
++  };
++
++  bool Search(uint32_t game_type, std::vector<SessionResult>& out);
++  bool Join(const std::string& session_id_hex, std::vector<SessionResult>& peers_out);
++  bool Leave(const std::string& session_id_hex);
++
++  // Resolve a peer's 20-byte abOnline -> loopback IP:port (broker, then cache).
++  bool Resolve(const uint8_t* online_key20, uint32_t& out_ip_net, uint16_t& out_port);
++
++  // Local peer cache (populated from search/join so Resolve is instant).
++  void CachePeer(const std::string& key_hex, uint32_t ip_net, uint16_t port);
++  bool LookupPeer(const std::string& key_hex, uint32_t& ip_net, uint16_t& port);
++
++ private:
++  Netplay() = default;
++};
++
++}  // namespace system
++}  // namespace rex
++
++#endif  // REX_SYSTEM_NETPLAY_H_
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index 99ea636..6ca70a2 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -14,6 +14,7 @@ set(REXKERNEL_SOURCES
+     xam/xam_locale.cpp
+     xam/xam_msg.cpp
+     xam/xam_net.cpp
++    xam/netplay.cpp
+     xam/xam_notify.cpp
+     xam/xam_nui.cpp
+     xam/xam_party.cpp
+diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
+index 7fd57ec..496b4e2 100644
+--- a/src/kernel/xam/apps/xgi_app.cpp
++++ b/src/kernel/xam/apps/xgi_app.cpp
+@@ -12,6 +12,13 @@
+ #include <rex/kernel/xam/apps/xgi_app.h>
+ #include <rex/logging.h>
+ #include <rex/thread.h>
++#include <rex/system/netplay.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <string>
++#include <vector>
+ 
+ namespace rex {
+ namespace kernel {
+@@ -21,6 +28,68 @@ using namespace rex::system::xam;
+ namespace apps {
+ using namespace rex::system;
+ 
++namespace {
++
++// XSESSION create flags (subset). HOST distinguishes the host from a joiner;
++// the *_USES_* bits mark an Xbox Live (vs pure system-link/local) session.
++enum {
++  XSESSION_CREATE_HOST = 0x00000001,
++  XSESSION_CREATE_USES_PRESENCE = 0x00000002,
++  XSESSION_CREATE_USES_STATS = 0x00000004,
++  XSESSION_CREATE_USES_MATCHMAKING = 0x00000008,
++  XSESSION_CREATE_USES_ARBITRATION = 0x00000010,
++  XSESSION_CREATE_USES_PEER_NETWORK = 0x00000020,
++};
++
++// Process-global netplay session bookkeeping (one active session per instance).
++struct NpSession {
++  bool active = false;
++  bool is_host = false;
++  std::string session_id_hex;     // current session XNKID (hex)
++  std::string pending_search_id;  // last session id returned by Search (for join)
++  uint8_t host_xnaddr[36] = {};   // host XNADDR (set on host create / search hit)
++  uint8_t session_key[16] = {};   // XNKEY
++};
++NpSession g_np;
++
++std::string BytesToHex(const uint8_t* p, size_t n) {
++  static const char* d = "0123456789abcdef";
++  std::string s;
++  s.resize(n * 2);
++  for (size_t i = 0; i < n; ++i) {
++    s[i * 2] = d[p[i] >> 4];
++    s[i * 2 + 1] = d[p[i] & 0xF];
++  }
++  return s;
++}
++
++// Generate a unique 8-byte XNKID for a host session. High bit of byte 0 marks
++// an "online" session id (matches the platform convention closely enough).
++void GenXnkid(uint8_t out[8], int instance) {
++  uint64_t t = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
++  static std::atomic<uint32_t> seq{0};
++  uint32_t s = ++seq;
++  out[0] = 0xAE;  // online session marker
++  out[1] = (uint8_t)instance;
++  out[2] = (uint8_t)(s & 0xFF);
++  out[3] = (uint8_t)((s >> 8) & 0xFF);
++  out[4] = (uint8_t)(t & 0xFF);
++  out[5] = (uint8_t)((t >> 8) & 0xFF);
++  out[6] = (uint8_t)((t >> 16) & 0xFF);
++  out[7] = (uint8_t)((t >> 24) & 0xFF);
++}
++
++// Hex dump a guest buffer to the log (recon aid for unimplemented messages).
++void LogBuffer(const char* what, uint8_t* buffer, uint32_t len) {
++  if (!buffer || !len || len > 256) {
++    REXKRNL_DEBUG("[netplay] {} buffer_len={}", what, len);
++    return;
++  }
++  REXKRNL_DEBUG("[netplay] {} ({}B): {}", what, len, BytesToHex(buffer, len));
++}
++
++}  // namespace
++
+ XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
+ 
+ // http://mb.mirage.org/bugzilla/xliveless/main.c
+@@ -29,6 +98,82 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                                       uint32_t buffer_length) {
+   // NOTE: buffer_length may be zero or valid.
+   auto buffer = memory_->TranslateVirtual(buffer_ptr);
++  // [netplay] Recon: log every XGI message + buffer when online co-op is active.
++  if (Netplay::Get().enabled()) {
++    REXKRNL_INFO("[netplay] XGI msg={:08X} len={}", message, buffer_length);
++    LogBuffer("XGI", buffer, buffer_length);
++  }
++
++  // [netplay] Fill an XSESSION_SEARCHRESULT buffer from the broker. Writes the
++  // XSESSIONSEARCHRESULT_HEADER {dwSearchResults, pResults} followed by an array
++  // of XSESSION_SEARCHRESULT (XSESSION_INFO[60] + 6 DWORD slot/count fields + 2
++  // ptrs = 0x5C each). Returns the number of sessions written.
++  auto fill_search = [this](uint32_t results_ptr, uint32_t buf_size,
++                            uint32_t max_results) -> uint32_t {
++    auto& np = Netplay::Get();
++    std::vector<Netplay::SessionResult> results;
++    np.Search(7, results);
++    if (max_results && results.size() > max_results) results.resize(max_results);
++    const uint32_t kHeader = 8;
++    const uint32_t kResultSz = 0x5C;  // 92
++    uint32_t count = (uint32_t)results.size();
++    uint32_t needed = kHeader + count * kResultSz;
++    if (buf_size && buf_size < needed) {
++      REXKRNL_WARN("[netplay] search buf too small: have {} need {} ({} results)",
++                   buf_size, needed, count);
++      while (count && kHeader + count * kResultSz > buf_size) count--;
++    }
++    if (!results_ptr) return count;
++    uint8_t* base = memory_->TranslateVirtual(results_ptr);
++    uint32_t array_addr = results_ptr + kHeader;
++    memory::store_and_swap<uint32_t>(base + 0, count);
++    memory::store_and_swap<uint32_t>(base + 4, count ? array_addr : 0);
++    for (uint32_t i = 0; i < count; ++i) {
++      auto& r = results[i];
++      uint8_t* e = base + kHeader + i * kResultSz;
++      // XSESSION_INFO.hostAddress (36-byte XNADDR)
++      uint8_t xn[36];
++      if (r.host_xnaddr.size() == 36) {
++        std::memcpy(xn, r.host_xnaddr.data(), 36);
++      } else {
++        // Reconstruct from key + ip if the host didn't publish a full XNADDR.
++        std::memset(xn, 0, 36);
++        std::memcpy(xn + 0, &r.host_ip_net, 4);
++        std::memcpy(xn + 4, &r.host_ip_net, 4);
++        xn[8] = (uint8_t)(r.host_port >> 8);    // wPortOnline, network order
++        xn[9] = (uint8_t)(r.host_port & 0xFF);
++        for (size_t b = 0; b + 1 < r.host_online_key_hex.size() && b / 2 < 20; b += 2)
++          xn[16 + b / 2] =
++              (uint8_t)std::stoul(r.host_online_key_hex.substr(b, 2), nullptr, 16);
++      }
++      // XSESSION_INFO layout: sessionID(XNKID,8)@0, hostAddress(XNADDR,36)@8,
++      // keyExchangeKey(XNKEY,16)@44. The session id MUST come first (the title
++      // checks sessionID.ab[0]==0xAE to accept it as an online session).
++      for (int b = 0; b < 8 && (size_t)(b * 2 + 1) < r.session_id_hex.size(); ++b)
++        e[0 + b] = (uint8_t)std::stoul(r.session_id_hex.substr(b * 2, 2), nullptr, 16);
++      std::memcpy(e + 8, xn, 36);       // hostAddress (XNADDR)
++      std::memset(e + 44, 0xA5, 16);    // keyExchangeKey (XNKEY)
++      // open/filled slot counts + property/context counts (none)
++      memory::store_and_swap<uint32_t>(e + 60, r.open_pub);
++      memory::store_and_swap<uint32_t>(e + 64, r.open_priv);
++      memory::store_and_swap<uint32_t>(e + 68, 1);
++      memory::store_and_swap<uint32_t>(e + 72, 0);
++      memory::store_and_swap<uint32_t>(e + 76, 0);
++      memory::store_and_swap<uint32_t>(e + 80, 0);
++      memory::store_and_swap<uint32_t>(e + 84, 0);
++      memory::store_and_swap<uint32_t>(e + 88, 0);
++    }
++    if (count) {
++      g_np.pending_search_id = results[0].session_id_hex;
++      std::memset(g_np.session_key, 0xA5, sizeof(g_np.session_key));
++      if (results[0].host_xnaddr.size() == 36)
++        std::memcpy(g_np.host_xnaddr, results[0].host_xnaddr.data(), 36);
++    }
++    REXKRNL_INFO("[netplay] search wrote {} result(s) to {:08X}", count, results_ptr);
++    return count;
++  };
++  (void)fill_search;
++
+   switch (message) {
+     case 0x000B0006: {
+       assert_true(!buffer_length || buffer_length == 24);
+@@ -81,6 +226,78 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+           "{:08X})",
+           session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
+           nonce_ptr);
++
++      // [netplay] Wire session creation to the broker. The HOST flag tells us
++      // whether this instance is hosting or (post-search) joining. We fill the
++      // guest XSESSION_INFO so the title's connect path has a real peer XNADDR.
++      //
++      // CRITICAL: the XDK XSESSION_INFO layout is
++      //   { XNKID sessionID[8]; XNADDR hostAddress[36]; XNKEY keyExchangeKey[16]; }
++      // i.e. the 8-byte session id comes FIRST (offset 0), the 36-byte XNADDR at
++      // +8, the 16-byte key at +44. The title reads sessionID.ab[0] to recognise
++      // an online session (must be 0xAE per XNKID_ONLINE); if that byte is wrong
++      // it concludes the session isn't a valid Xbox Live session and tears it
++      // down. (Earlier code wrote hostAddress at +0 / sessionID at +36 — swapped.)
++      auto& np = Netplay::Get();
++      if (np.enabled()) {
++        REXKRNL_INFO(
++            "[netplay] SessionCreate flags={:08X} pub={} priv={} user={:08X} "
++            "info_ptr={:08X} nonce_ptr={:08X} host={}",
++            flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr, nonce_ptr,
++            (flags & XSESSION_CREATE_HOST) ? 1 : 0);
++      }
++      if (np.enabled() && session_info_ptr) {
++        np.EnsureRegistered();
++        uint8_t* info = memory_->TranslateVirtual(session_info_ptr);  // XSESSION_INFO
++
++        if (flags & XSESSION_CREATE_HOST) {
++          // Hosting: mint an XNKID, publish to broker, advertise our XNADDR.
++          uint8_t xnkid[8];
++          GenXnkid(xnkid, np.instance());
++          std::string sid = BytesToHex(xnkid, 8);
++          std::memset(g_np.session_key, 0xA5, sizeof(g_np.session_key));
++          np.BuildSelfXnaddr(g_np.host_xnaddr);
++
++          std::memcpy(info + 0, xnkid, 8);                 // sessionID (XNKID)
++          std::memcpy(info + 8, g_np.host_xnaddr, 36);     // hostAddress (XNADDR)
++          std::memcpy(info + 44, g_np.session_key, 16);    // keyExchangeKey (XNKEY)
++
++          // The host session nonce is an OUTPUT of XSessionCreate — generate a
++          // non-zero one (the title carries it into Start/Arbitration/Delete).
++          if (nonce_ptr) {
++            uint64_t nonce =
++                ((uint64_t)std::chrono::steady_clock::now().time_since_epoch().count() << 16) ^
++                0x9E3779B97F4A7C15ull ^ ((uint64_t)(np.instance() + 1) * 0x100000001B3ull);
++            if (!nonce) nonce = 0x5350000000000001ull;
++            memory::store_and_swap<uint64_t>(memory_->TranslateVirtual(nonce_ptr), nonce);
++          }
++
++          g_np.active = true;
++          g_np.is_host = true;
++          g_np.session_id_hex = sid;
++          np.CreateSession(sid, flags, num_slots_public, num_slots_private, 7);
++          REXKRNL_INFO("[netplay] HOST session {} created (pub={}, priv={}); XSESSION_INFO={}", sid,
++                       num_slots_public, num_slots_private, BytesToHex(info, 60));
++        } else if (!g_np.pending_search_id.empty()) {
++          // Joining: a prior Search found a host. Write the host's XNKID/XNADDR
++          // into our local session info and register the join with the broker.
++          std::string sid = g_np.pending_search_id;
++          uint8_t xnkid[8];
++          // session_id_hex came from search; decode back to bytes
++          for (int i = 0; i < 8; ++i)
++            xnkid[i] = (uint8_t)std::stoul(sid.substr(i * 2, 2), nullptr, 16);
++          std::memcpy(info + 0, xnkid, 8);                 // sessionID (XNKID)
++          std::memcpy(info + 8, g_np.host_xnaddr, 36);     // hostAddress (XNADDR)
++          std::memcpy(info + 44, g_np.session_key, 16);    // keyExchangeKey (XNKEY)
++
++          std::vector<Netplay::SessionResult> peers;
++          np.Join(sid, peers);
++          g_np.active = true;
++          g_np.is_host = false;
++          g_np.session_id_hex = sid;
++          REXKRNL_INFO("[netplay] JOIN session {} (XSESSION_INFO={})", sid, BytesToHex(info, 60));
++        }
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B0011: {
+@@ -96,15 +313,55 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+     }
+     case 0x000B0012: {
+       assert_true(!buffer_length || buffer_length == 20);
+-      uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
+-      uint32_t user_count = memory::load_and_swap<uint32_t>(buffer + 4);
+-      uint32_t unk_0 = memory::load_and_swap<uint32_t>(buffer + 8);
+-      uint32_t user_index_array = memory::load_and_swap<uint32_t>(buffer + 12);
++      // XSessionJoin. XGI_SESSION_MANAGE { obj_ptr; array_count; xuid_array_ptr;
++      // indices_array_ptr; private_slots_array_ptr }. xuid_array_ptr==0 selects a
++      // LOCAL join (user-index array), otherwise a REMOTE join (xuid array).
++      uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
++      uint32_t array_count = memory::load_and_swap<uint32_t>(buffer + 4);
++      uint32_t xuid_array = memory::load_and_swap<uint32_t>(buffer + 8);
++      uint32_t indices_array = memory::load_and_swap<uint32_t>(buffer + 12);
+       uint32_t private_slots_array = memory::load_and_swap<uint32_t>(buffer + 16);
+-
+-      assert_zero(unk_0);
+-      REXKRNL_DEBUG("XGISessionJoinLocal({:08X}, {}, {}, {:08X}, {:08X})", session_ptr, user_count,
+-                    unk_0, user_index_array, private_slots_array);
++      bool join_local = (xuid_array == 0);
++
++      REXKRNL_DEBUG("XGISessionJoin({:08X}, {}, {:08X}, {:08X}, {:08X})", obj_ptr, array_count,
++                    xuid_array, indices_array, private_slots_array);
++      auto& np = Netplay::Get();
++      if (np.enabled()) {
++        REXKRNL_INFO(
++            "[netplay] SessionJoin{} count={} xuid_arr={:08X} idx_arr={:08X} slots={:08X}",
++            join_local ? "Local" : "Remote", array_count, xuid_array, indices_array,
++            private_slots_array);
++        // Fallback: if we searched and found a host but haven't joined yet (title
++        // issued JoinLocal without a non-HOST Create), commit the broker join.
++        if (!g_np.is_host && !g_np.active && !g_np.pending_search_id.empty()) {
++          std::vector<Netplay::SessionResult> peers;
++          np.Join(g_np.pending_search_id, peers);
++          g_np.active = true;
++          g_np.session_id_hex = g_np.pending_search_id;
++          REXKRNL_INFO("[netplay] JoinLocal -> broker join {}", g_np.session_id_hex);
++        }
++      }
++      return X_E_SUCCESS;
++    }
++    case 0x000B0013: {
++      assert_true(!buffer_length || buffer_length == 20);
++      // XSessionLeave (NOT JoinRemote — same XGI_SESSION_MANAGE layout as Join).
++      // xuid_array_ptr==0 => leaving local players. We acknowledge it but do NOT
++      // propagate to the broker: removing the broker session here would defeat
++      // matchmaking. (Before the XSESSION_INFO fix the title hit this immediately
++      // as part of its "CONNECTION FAILED" teardown.)
++      uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
++      uint32_t array_count = memory::load_and_swap<uint32_t>(buffer + 4);
++      uint32_t xuid_array = memory::load_and_swap<uint32_t>(buffer + 8);
++      uint32_t indices_array = memory::load_and_swap<uint32_t>(buffer + 12);
++      uint32_t private_slots_array = memory::load_and_swap<uint32_t>(buffer + 16);
++      bool leave_local = (xuid_array == 0);
++      if (Netplay::Get().enabled()) {
++        REXKRNL_INFO(
++            "[netplay] SessionLeave{} count={} xuid_arr={:08X} idx_arr={:08X} slots={:08X}",
++            leave_local ? "Local" : "Remote", array_count, xuid_array, indices_array,
++            private_slots_array);
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B0014: {
+@@ -146,6 +403,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
+                     user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
+                     results_buffer_size, search_results_ptr);
++      if (Netplay::Get().enabled())
++        fill_search(search_results_ptr, results_buffer_size, num_results);
+       return X_E_SUCCESS;
+     }
+     case 0x000B0018: {
+@@ -180,7 +439,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       REXKRNL_DEBUG("XSessionSearchEx({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X}, {})",
+                     proc_index, user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
+                     results_buffer_size, search_results_ptr, num_users);
+-
++      if (Netplay::Get().enabled())
++        fill_search(search_results_ptr, results_buffer_size, num_results);
+       return X_E_SUCCESS;
+     }
+     case 0x000B001D: {
+@@ -405,7 +665,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+           weighted_search_properties_ptr, weighted_search_contexts_ptr, num_props, num_ctx,
+           non_weighted_search_properties_ptr, non_weighted_search_contexts_ptr, results_buffer_size,
+           search_results_ptr, num_users, weighted_search);
+-
++      if (Netplay::Get().enabled())
++        fill_search(search_results_ptr, results_buffer_size, num_results);
+       return X_E_SUCCESS;
+     }
+     case 0x000B0071: {
+diff --git a/src/kernel/xam/netplay.cpp b/src/kernel/xam/netplay.cpp
+new file mode 100644
+index 0000000..fffe4d7
+--- /dev/null
++++ b/src/kernel/xam/netplay.cpp
+@@ -0,0 +1,442 @@
++/**
++ ******************************************************************************
++ * ReXGlue runtime — South Park: Let's Go Tower Defense online co-op
++ ******************************************************************************
++ * Netplay manager implementation. Talks to the local matchmaking broker
++ * (sp-netplay-server) over a tiny synchronous loopback HTTP client built on the
++ * host's winsock (independent of the guest XSocket layer). The broker speaks a
++ * compact line-based text protocol (fmt=text) so no JSON parser is needed here.
++ *
++ * All activity is gated on the --netplay_server cvar; when unset the title is
++ * unchanged (offline/single-player path untouched).
++ ******************************************************************************
++ */
++#pragma GCC diagnostic ignored "-Wunused-parameter"
++
++#include <rex/system/netplay.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <sstream>
++#include <thread>
++#include <unordered_map>
++#include <utility>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++#if defined(_WIN32)
++#define _WINSOCK_DEPRECATED_NO_WARNINGS
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#pragma comment(lib, "ws2_32.lib")
++#else
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#endif
++
++// --- cvars (online co-op is entirely behind these) -------------------------
++REXCVAR_DEFINE_STRING(netplay_server, "", "Netplay",
++                      "Matchmaking broker URL (e.g. http://127.0.0.1:17890). "
++                      "Empty = offline (default).");
++REXCVAR_DEFINE_INT32(netplay_instance, 0, "Netplay",
++                     "This instance's index on a shared host. Selects loopback "
++                     "IP 127.0.0.(1+N) and a unique online identity.");
++
++namespace rex {
++namespace system {
++
++namespace {
++
++std::string g_server_host;  // parsed from --netplay_server
++int g_server_port = 0;
++std::once_flag g_wsa_once;
++std::mutex g_cache_mu;
++std::unordered_map<std::string, std::pair<uint32_t, uint16_t>> g_peer_cache;
++std::atomic<bool> g_registered{false};
++std::atomic<bool> g_hb_started{false};
++std::atomic<uint16_t> g_game_port{1000};
++uint8_t g_online_key[20] = {};
++bool g_key_built = false;
++
++void EnsureWsa() {
++#if defined(_WIN32)
++  std::call_once(g_wsa_once, []() {
++    WSADATA d;
++    WSAStartup(MAKEWORD(2, 2), &d);
++  });
++#endif
++}
++
++// Parse "http://127.0.0.1:17890" (or "127.0.0.1:17890") into host + port.
++void ParseServer(const std::string& url) {
++  std::string s = url;
++  auto pos = s.find("://");
++  if (pos != std::string::npos) s = s.substr(pos + 3);
++  auto slash = s.find('/');
++  if (slash != std::string::npos) s = s.substr(0, slash);
++  auto colon = s.find(':');
++  if (colon != std::string::npos) {
++    g_server_host = s.substr(0, colon);
++    g_server_port = std::atoi(s.substr(colon + 1).c_str());
++  } else {
++    g_server_host = s;
++    g_server_port = 80;
++  }
++}
++
++std::string ToHex(const uint8_t* p, size_t n) {
++  static const char* d = "0123456789abcdef";
++  std::string out;
++  out.resize(n * 2);
++  for (size_t i = 0; i < n; ++i) {
++    out[i * 2] = d[p[i] >> 4];
++    out[i * 2 + 1] = d[p[i] & 0xF];
++  }
++  return out;
++}
++
++size_t FromHex(const std::string& hex, uint8_t* out, size_t max) {
++  size_t n = 0;
++  for (size_t i = 0; i + 1 < hex.size() && n < max; i += 2) {
++    auto hv = [](char c) -> int {
++      if (c >= '0' && c <= '9') return c - '0';
++      if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++      if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++      return 0;
++    };
++    out[n++] = (uint8_t)((hv(hex[i]) << 4) | hv(hex[i + 1]));
++  }
++  return n;
++}
++
++// Synchronous HTTP POST of a JSON body, returns response body text. Always
++// appends "fmt":"text" so the broker replies in the compact line protocol.
++// Returns false on any transport error (server down etc.).
++bool HttpPost(const std::string& path, const std::string& json_fields,
++              std::string& body_out) {
++#if defined(_WIN32)
++  EnsureWsa();
++  if (g_server_host.empty()) return false;
++
++  SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++  if (s == INVALID_SOCKET) return false;
++
++  DWORD tmo = 2000;  // 2s; a missing broker must never hang the game
++  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
++  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tmo, sizeof(tmo));
++
++  sockaddr_in addr = {};
++  addr.sin_family = AF_INET;
++  addr.sin_port = htons((u_short)g_server_port);
++  addr.sin_addr.s_addr = inet_addr(g_server_host.c_str());
++
++  if (::connect(s, (sockaddr*)&addr, sizeof(addr)) != 0) {
++    closesocket(s);
++    return false;
++  }
++
++  // Build the JSON body: { <fields>, "fmt":"text" }
++  std::string body = "{";
++  if (!json_fields.empty()) body += json_fields + ",";
++  body += "\"fmt\":\"text\"}";
++
++  std::ostringstream req;
++  req << "POST " << path << " HTTP/1.1\r\n"
++      << "Host: " << g_server_host << ":" << g_server_port << "\r\n"
++      << "Content-Type: application/json\r\n"
++      << "Content-Length: " << body.size() << "\r\n"
++      << "Connection: close\r\n\r\n"
++      << body;
++  std::string reqs = req.str();
++
++  size_t sent = 0;
++  while (sent < reqs.size()) {
++    int n = ::send(s, reqs.data() + sent, (int)(reqs.size() - sent), 0);
++    if (n <= 0) { closesocket(s); return false; }
++    sent += n;
++  }
++
++  std::string resp;
++  char buf[2048];
++  for (;;) {
++    int n = ::recv(s, buf, sizeof(buf), 0);
++    if (n <= 0) break;
++    resp.append(buf, n);
++  }
++  closesocket(s);
++
++  auto hdr_end = resp.find("\r\n\r\n");
++  if (hdr_end == std::string::npos) return false;
++  body_out = resp.substr(hdr_end + 4);
++  return true;
++#else
++  return false;
++#endif
++}
++
++// Quote a hex/string field as JSON.
++std::string J(const std::string& key, const std::string& val) {
++  return "\"" + key + "\":\"" + val + "\"";
++}
++std::string Jn(const std::string& key, long val) {
++  return "\"" + key + "\":" + std::to_string(val);
++}
++
++}  // namespace
++
++Netplay& Netplay::Get() {
++  static Netplay inst;
++  return inst;
++}
++
++bool Netplay::enabled() {
++  static std::once_flag parse_once;
++  std::call_once(parse_once, []() {
++    const std::string& url = REXCVAR_GET(netplay_server);
++    if (!url.empty()) ParseServer(url);
++  });
++  return !REXCVAR_GET(netplay_server).empty();
++}
++
++int Netplay::instance() { return REXCVAR_GET(netplay_instance); }
++
++std::string Netplay::instance_id() {
++  return "inst" + std::to_string(instance());
++}
++
++uint32_t Netplay::loopback_ip_net() {
++#if defined(_WIN32)
++  EnsureWsa();
++  return inet_addr(loopback_ip_str().c_str());
++#else
++  return 0;
++#endif
++}
++
++std::string Netplay::loopback_ip_str() {
++  return "127.0.0." + std::to_string(1 + instance());
++}
++
++uint32_t Netplay::advertised_ip_net() {
++#if defined(_WIN32)
++  EnsureWsa();
++  // A non-loopback, LAN-private, per-instance address. Real titles reject a
++  // loopback (127.x) as the online host address of a LIVE session; this is the
++  // address advertised in the XNADDR identity only — actual peer reachability is
++  // resolved via abOnline -> XNetXnAddrToInAddr -> loopback IP.
++  return inet_addr(("192.168.137." + std::to_string(20 + instance())).c_str());
++#else
++  return 0;
++#endif
++}
++
++const uint8_t* Netplay::online_key() {
++  if (!g_key_built) {
++    // Stable, unique-per-instance opaque identity. Layout is arbitrary; the
++    // broker treats it as an opaque key for matching.
++    std::memset(g_online_key, 0, sizeof(g_online_key));
++    g_online_key[0] = 'S'; g_online_key[1] = 'P';
++    g_online_key[2] = 'N'; g_online_key[3] = 'P';
++    g_online_key[4] = (uint8_t)instance();
++    uint32_t ip = loopback_ip_net();
++    std::memcpy(&g_online_key[5], &ip, 4);
++    g_key_built = true;
++  }
++  return g_online_key;
++}
++
++std::string Netplay::online_key_hex() { return ToHex(online_key(), 20); }
++
++uint16_t Netplay::game_port() { return g_game_port.load(); }
++void Netplay::set_game_port(uint16_t p) {
++  if (p) g_game_port.store(p);
++}
++
++void Netplay::BuildSelfXnaddr(uint8_t* out) {
++  std::memset(out, 0, 36);
++  uint32_t ip = advertised_ip_net();  // non-loopback online identity (see header)
++  std::memcpy(out + 0, &ip, 4);   // ina
++  std::memcpy(out + 4, &ip, 4);   // inaOnline
++  uint16_t p = htons(game_port());
++  std::memcpy(out + 8, &p, 2);    // wPortOnline (network order)
++  out[10] = 0x02; out[11] = 0x53; out[12] = 0x50;  // abEnet: locally-administered
++  out[13] = 0x00; out[14] = 0x00; out[15] = (uint8_t)(1 + instance());
++  std::memcpy(out + 16, online_key(), 20);          // abOnline
++}
++
++void Netplay::EnsureRegistered() {
++  if (!enabled() || g_registered.load()) return;
++
++  uint8_t xn[36];
++  BuildSelfXnaddr(xn);
++  std::string fields =
++      J("instanceId", instance_id()) + "," +
++      J("xnaddr", ToHex(xn, 36)) + "," +
++      J("onlineKey", online_key_hex()) + "," +
++      J("ip", loopback_ip_str()) + "," +
++      Jn("port", game_port()) + "," +
++      J("title", "south-park-lgtdp");
++  std::string resp;
++  if (HttpPost("/register", fields, resp) && resp.rfind("OK", 0) == 0) {
++    g_registered.store(true);
++    REXKRNL_INFO("[netplay] registered {} ip={} port={} key={}", instance_id(),
++                 loopback_ip_str(), game_port(), online_key_hex());
++  } else {
++    REXKRNL_WARN("[netplay] register failed (broker {}:{} reachable?)",
++                 g_server_host, g_server_port);
++  }
++
++  // Start a heartbeat thread once.
++  bool expected = false;
++  if (g_hb_started.compare_exchange_strong(expected, true)) {
++    std::thread([]() {
++      for (;;) {
++        std::this_thread::sleep_for(std::chrono::seconds(5));
++        auto& np = Netplay::Get();
++        if (!np.enabled()) continue;
++        std::string resp;
++        HttpPost("/heartbeat",
++                 J("instanceId", np.instance_id()) + "," + Jn("port", np.game_port()),
++                 resp);
++      }
++    }).detach();
++  }
++}
++
++bool Netplay::CreateSession(const std::string& session_id_hex, uint32_t flags,
++                            uint32_t pub, uint32_t priv, uint32_t game_type) {
++  if (!enabled()) return false;
++  EnsureRegistered();
++  uint8_t xn[36];
++  BuildSelfXnaddr(xn);
++  std::string fields =
++      J("instanceId", instance_id()) + "," +
++      J("sessionId", session_id_hex) + "," +
++      J("hostXnaddr", ToHex(xn, 36)) + "," +
++      Jn("flags", flags) + "," +
++      Jn("publicSlots", pub) + "," +
++      Jn("privateSlots", priv) + "," +
++      Jn("gameType", game_type);
++  std::string resp;
++  bool ok = HttpPost("/session/create", fields, resp) && resp.rfind("OK", 0) == 0;
++  REXKRNL_INFO("[netplay] CreateSession {} -> {}", session_id_hex,
++               ok ? "OK" : "FAIL");
++  return ok;
++}
++
++bool Netplay::Search(uint32_t game_type, std::vector<SessionResult>& out) {
++  out.clear();
++  if (!enabled()) return false;
++  EnsureRegistered();
++  std::string fields = J("instanceId", instance_id()) + "," + Jn("gameType", game_type);
++  std::string resp;
++  if (!HttpPost("/session/search", fields, resp)) return false;
++  std::istringstream iss(resp);
++  std::string line;
++  if (!std::getline(iss, line)) return false;
++  // header: "OK <n>"
++  if (line.rfind("OK", 0) != 0) return false;
++  int n = 0;
++  { std::istringstream h(line); std::string ok; h >> ok >> n; }
++  for (int i = 0; i < n && std::getline(iss, line); ++i) {
++    std::istringstream ls(line);
++    SessionResult r;
++    std::string ip, keyhex, xnhex;
++    int port = 0;
++    ls >> r.session_id_hex >> keyhex >> ip >> port >> r.open_pub >> r.open_priv >> xnhex;
++    if (keyhex != "-") r.host_online_key_hex = keyhex;
++    if (ip != "-") r.host_ip_net = inet_addr(ip.c_str());
++    r.host_port = (uint16_t)port;
++    if (xnhex != "-") {
++      r.host_xnaddr.resize(36);
++      FromHex(xnhex, r.host_xnaddr.data(), 36);
++    }
++    // cache for instant resolve
++    if (!r.host_online_key_hex.empty() && r.host_ip_net)
++      CachePeer(r.host_online_key_hex, r.host_ip_net, r.host_port);
++    out.push_back(std::move(r));
++  }
++  REXKRNL_INFO("[netplay] Search gameType={} -> {} session(s)", game_type, out.size());
++  return true;
++}
++
++bool Netplay::Join(const std::string& session_id_hex,
++                   std::vector<SessionResult>& peers_out) {
++  peers_out.clear();
++  if (!enabled()) return false;
++  EnsureRegistered();
++  uint8_t xn[36];
++  BuildSelfXnaddr(xn);
++  std::string fields = J("instanceId", instance_id()) + "," +
++                       J("sessionId", session_id_hex) + "," +
++                       J("xnaddr", ToHex(xn, 36));
++  std::string resp;
++  if (!HttpPost("/session/join", fields, resp)) return false;
++  std::istringstream iss(resp);
++  std::string line;
++  if (!std::getline(iss, line) || line.rfind("OK", 0) != 0) return false;
++  while (std::getline(iss, line)) {
++    if (line.empty()) continue;
++    std::istringstream ls(line);
++    std::string id, keyhex, ip, xnhex;
++    int port = 0;
++    ls >> id >> keyhex >> ip >> port >> xnhex;
++    SessionResult r;
++    if (keyhex != "-") r.host_online_key_hex = keyhex;
++    if (ip != "-") r.host_ip_net = inet_addr(ip.c_str());
++    r.host_port = (uint16_t)port;
++    if (!r.host_online_key_hex.empty() && r.host_ip_net)
++      CachePeer(r.host_online_key_hex, r.host_ip_net, r.host_port);
++    peers_out.push_back(std::move(r));
++  }
++  REXKRNL_INFO("[netplay] Join {} -> {} peer(s)", session_id_hex, peers_out.size());
++  return true;
++}
++
++bool Netplay::Leave(const std::string& session_id_hex) {
++  if (!enabled()) return false;
++  std::string fields = J("instanceId", instance_id()) + "," +
++                       J("sessionId", session_id_hex);
++  std::string resp;
++  return HttpPost("/session/leave", fields, resp);
++}
++
++bool Netplay::Resolve(const uint8_t* key20, uint32_t& out_ip_net, uint16_t& out_port) {
++  if (!enabled()) return false;
++  std::string keyhex = ToHex(key20, 20);
++  if (LookupPeer(keyhex, out_ip_net, out_port)) return true;
++  std::string resp;
++  if (!HttpPost("/resolve", J("onlineKey", keyhex), resp)) return false;
++  if (resp.rfind("OK", 0) != 0) return false;
++  std::istringstream ls(resp);
++  std::string ok, ip, id;
++  int port = 0;
++  ls >> ok >> ip >> port >> id;
++  out_ip_net = inet_addr(ip.c_str());
++  out_port = (uint16_t)port;
++  CachePeer(keyhex, out_ip_net, out_port);
++  REXKRNL_INFO("[netplay] Resolve {} -> {}:{}", keyhex.substr(0, 12), ip, port);
++  return true;
++}
++
++void Netplay::CachePeer(const std::string& key_hex, uint32_t ip_net, uint16_t port) {
++  std::lock_guard<std::mutex> lk(g_cache_mu);
++  g_peer_cache[key_hex] = {ip_net, port};
++}
++
++bool Netplay::LookupPeer(const std::string& key_hex, uint32_t& ip_net, uint16_t& port) {
++  std::lock_guard<std::mutex> lk(g_cache_mu);
++  auto it = g_peer_cache.find(key_hex);
++  if (it == g_peer_cache.end()) return false;
++  ip_net = it->second.first;
++  port = it->second.second;
++  return true;
++}
++
++}  // namespace system
++}  // namespace rex
+diff --git a/src/kernel/xam/xam_input.cpp b/src/kernel/xam/xam_input.cpp
+index 80c3634..1233ad5 100644
+--- a/src/kernel/xam/xam_input.cpp
++++ b/src/kernel/xam/xam_input.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/cvar.h>
+ #include <rex/input/input.h>
+ #include <rex/input/input_system.h>
+ #include <rex/kernel/xam/private.h>
+@@ -19,6 +20,20 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xtypes.h>
+ 
++#include <chrono>
++
++// [recomp: launcher autofire] Optional turbo/auto-repeat for the snowball/throw
++// button. The game throws once per A press (edge-triggered, no auto-repeat), so
++// holding A does nothing extra. With --autofire, while the masked button is held
++// we pulse it (press/release ~autofire_rate times/sec) so the game registers
++// repeated throws. Gated; default off (offline input unchanged).
++REXCVAR_DEFINE_BOOL(autofire, false, "Input",
++                    "Auto-repeat (turbo) the snowball/throw button while held");
++REXCVAR_DEFINE_INT32(autofire_rate, 20, "Input", "Auto-fire presses per second")
++    .range(1, 30);
++REXCVAR_DEFINE_UINT32(autofire_buttons, 0x1000, "Input",
++                      "Button mask to auto-fire (default 0x1000 = A)");
++
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
+ namespace rex {
+@@ -26,6 +41,10 @@ namespace kernel {
+ namespace xam {
+ using namespace rex::system;
+ 
++// [recomp-fix: cross-restart continue] defined in xam_user.cpp; OR the saved campaign
++// unlock flags into g_slots each frame so a restart shows the unlocked levels. See KB 56.
++void CampaignContinueRestore();
++
+ using rex::input::X_INPUT_CAPABILITIES;
+ using rex::input::X_INPUT_KEYSTROKE;
+ using rex::input::X_INPUT_STATE;
+@@ -92,7 +111,31 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
+ }
+ 
+ // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetstate(v=vs.85).aspx
++// While the masked button is held, blank it for the second half of each
++// 1/rate-second window so the guest sees repeated press edges (turbo).
++static void ApplyAutofire(X_INPUT_STATE* st) {
++  if (!st) return;
++  const uint16_t mask = static_cast<uint16_t>(REXCVAR_GET(autofire_buttons));
++  const uint16_t held = static_cast<uint16_t>(st->gamepad.buttons) & mask;
++  if (!held) return;
++  int rate = REXCVAR_GET(autofire_rate);
++  if (rate < 1) rate = 1;
++  const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                         std::chrono::steady_clock::now().time_since_epoch())
++                         .count();
++  const int64_t period = 1000 / rate;
++  const bool off_phase = period > 1 && (ms % period) >= (period / 2);
++  if (off_phase) {
++    st->gamepad.buttons =
++        static_cast<uint16_t>(static_cast<uint16_t>(st->gamepad.buttons) & ~held);
++  }
++}
++
+ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> input_state) {
++  // [recomp-fix: cross-restart continue] Per-frame: keep g_slots's campaign unlock flags
++  // at least the saved set, so the level-select shows unlocked levels after a restart.
++  CampaignContinueRestore();
++
+   // Games call this with a NULL state ptr, probably as a query.
+   static int call_count = 0;
+   if (++call_count <= 5) {
+@@ -112,7 +155,11 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
+   }
+ 
+   auto* is = input_system();
+-  return is->GetState(actual_user_index, input_state);
++  X_RESULT result = is->GetState(actual_user_index, input_state);
++  if (result == X_ERROR_SUCCESS && REXCVAR_GET(autofire)) {
++    ApplyAutofire(input_state);
++  }
++  return result;
+ }
+ 
+ // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
+diff --git a/src/kernel/xam/xam_msg.cpp b/src/kernel/xam/xam_msg.cpp
+index 704eb0c..292e475 100644
+--- a/src/kernel/xam/xam_msg.cpp
++++ b/src/kernel/xam/xam_msg.cpp
+@@ -29,11 +29,24 @@ namespace xam {
+ using namespace rex::system;
+ using namespace rex::system::xam;
+ 
++// [netplay] Trace what the title's session wrappers actually observe. Session XGI
++// messages (0x000B0010..0x000B001F) flow through these dispatch entry points; the
++// wrappers derive success from the return value AND the thread last_error
++// (sub_8244DC78). Log both for the session range so we can see why a "success"
++// handler still looks like a failure to the title.
++static inline bool NpIsSessionMsg(u32 app, u32 message) {
++  return app == 0xFB && message >= 0x000B0010 && message <= 0x000B001F;
++}
++
+ u32 XMsgInProcessCall_entry(u32 app, u32 message, u32 arg1, u32 arg2) {
+   auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageSync(app, message, arg1, arg2);
+   if (result == X_ERROR_NOT_FOUND) {
+     REXKRNL_ERROR("XMsgInProcessCall: app {:08X} undefined", app);
+   }
++  if (NpIsSessionMsg(app, message)) {
++    REXKRNL_INFO("[np-xmsg] InProcessCall msg={:08X} -> result={:08X} last_err={:08X}", message,
++                 (uint32_t)result, XThread::GetLastError());
++  }
+   return result;
+ }
+ 
+@@ -68,6 +81,11 @@ X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overla
+   if (result == X_ERROR_SUCCESS || result == X_ERROR_IO_PENDING) {
+     XThread::SetLastError(0);
+   }
++  if (NpIsSessionMsg(app, message)) {
++    REXKRNL_INFO(
++        "[np-xmsg] StartIORequest msg={:08X} ovl={:08X} -> result={:08X} last_err={:08X}", message,
++        overlapped_ptr, (uint32_t)result, XThread::GetLastError());
++  }
+   return result;
+ }
+ 
+diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
+index 12cec94..f31d240 100644
+--- a/src/kernel/xam/xam_net.cpp
++++ b/src/kernel/xam/xam_net.cpp
+@@ -24,6 +24,7 @@
+ #include <rex/types.h>
+ #include <rex/string.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/system/netplay.h>
+ #include <rex/system/xevent.h>
+ #include <rex/system/xsocket.h>
+ #include <rex/system/xthread.h>
+@@ -38,6 +39,7 @@
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
+ #include <sys/socket.h>
++using SOCKET = int;
+ #endif
+ 
+ namespace rex {
+@@ -296,6 +298,62 @@ u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket, ppc_ptr_t<XWSABUF> buffers_
+                              ppc_ptr_t<XSOCKADDR_IN> from_addr,
+                              ppc_ptr_t<XWSAOVERLAPPED> overlapped_ptr,
+                              mapped_void completion_routine_ptr) {
++  // [netplay] Real receive path. The original always returned -1 (never
++  // received). Implement a non-blocking single-datagram receive into the first
++  // WSABUF via the existing XSocket layer; a zero-timeout select() guard
++  // guarantees we never block the caller (returns WSAEWOULDBLOCK when idle),
++  // and we complete the overlapped event synchronously if one was supplied.
++  if (Netplay::Get().enabled()) {
++    auto sock = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket);
++    if (!sock) {
++      XThread::SetLastError(0x2736);  // WSAENOTSOCK
++      return (u32)-1;
++    }
++    if (buffer_count == 0) {
++      XThread::SetLastError(0x271E);  // WSAEFAULT
++      return (u32)-1;
++    }
++
++    // Never block: poll readability first.
++    fd_set rfds;
++    FD_ZERO(&rfds);
++    FD_SET((SOCKET)sock->native_handle(), &rfds);
++    timeval tv = {0, 0};
++    if (select(0, &rfds, nullptr, nullptr, &tv) <= 0) {
++      XThread::SetLastError(0x2733);  // WSAEWOULDBLOCK
++      return (u32)-1;
++    }
++
++    uint32_t buf_ptr = buffers_ptr[0].buf_ptr;
++    uint32_t buf_len = buffers_ptr[0].len;
++    uint8_t* dst = reinterpret_cast<uint8_t*>(REX_KERNEL_MEMORY()->TranslateVirtual(buf_ptr));
++
++    N_XSOCKADDR_IN native_from;
++    uint32_t nfromlen = sizeof(native_from);
++    uint32_t recv_flags = flags_ptr ? flags_ptr.value() : 0;
++    int ret = sock->RecvFrom(dst, buf_len, recv_flags, &native_from, &nfromlen);
++    if (ret < 0) {
++#if REX_PLATFORM_WIN32
++      XThread::SetLastError(WSAGetLastError());
++#endif
++      return (u32)-1;
++    }
++
++    if (num_bytes_recv) *num_bytes_recv = ret;
++    if (from_addr) {
++      from_addr->sin_family = native_from.sin_family;
++      from_addr->sin_port = native_from.sin_port;
++      from_addr->sin_addr = native_from.sin_addr;
++      std::memset(from_addr->x_sin_zero, 0, sizeof(from_addr->x_sin_zero));
++    }
++    if (overlapped_ptr && overlapped_ptr->event_handle) {
++      auto evt = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(overlapped_ptr->event_handle);
++      if (evt) evt->Set(0, false);
++    }
++    REXKRNL_DEBUG("[netplay] WSARecvFrom sock={:08X} got {} bytes", socket, ret);
++    return 0;
++  }
++
+   if (overlapped_ptr) {
+     // auto evt = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(
+     //    overlapped_ptr->event_handle);
+@@ -342,6 +400,12 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
+   }
+ 
+   N_XSOCKADDR_IN native_to(to_ptr);
++  if (Netplay::Get().enabled()) {
++    uint32_t a = (uint32_t)native_to.sin_addr;  // host-order view
++    REXKRNL_DEBUG("[netplay] WSASendTo sock={:08X} {} bytes -> {}.{}.{}.{}:{}",
++                  socket_handle, combined_buffer_size, (a >> 24) & 0xFF, (a >> 16) & 0xFF,
++                  (a >> 8) & 0xFF, a & 0xFF, (uint16_t)native_to.sin_port);
++  }
+   socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags, &native_to, to_len);
+ 
+   // TODO: Instantly complete overlapped
+@@ -432,6 +496,35 @@ struct XnAddrStatus {
+ };
+ 
+ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
++  // [netplay] When online co-op is active, advertise this instance's loopback
++  // identity (distinct 127.0.0.x per instance) and a stable 20-byte abOnline
++  // key, register with the broker, and report ONLINE so the title enters the
++  // Xbox Live co-op path. Otherwise fall through to the original loopback stub.
++  auto& np = Netplay::Get();
++  if (np.enabled()) {
++    np.EnsureRegistered();
++    // ina/inaOnline advertise a non-loopback "online" address (a real title
++    // rejects a loopback 127.x as a LIVE host address). Peer reachability is via
++    // abOnline -> XNetXnAddrToInAddr -> loopback, independent of this value.
++    uint32_t ip = np.advertised_ip_net();  // network order
++    addr_ptr->ina.s_addr = ip;
++    addr_ptr->inaOnline.s_addr = ip;
++    addr_ptr->wPortOnline = np.game_port();
++    addr_ptr->abEnet[0] = 0x02;  // locally administered MAC, unique per instance
++    addr_ptr->abEnet[1] = 0x53;
++    addr_ptr->abEnet[2] = 0x50;
++    addr_ptr->abEnet[3] = 0x00;
++    addr_ptr->abEnet[4] = 0x00;
++    addr_ptr->abEnet[5] = (uint8_t)(1 + np.instance());
++    std::memcpy(addr_ptr->abOnline, np.online_key(), 20);
++    REXKRNL_INFO("[netplay] XNetGetTitleXnAddr -> {} key={}",
++                 np.loopback_ip_str(), np.online_key_hex());
++    // Report a fully-connected online console (DHCP+gateway+DNS+online) rather
++    // than STATIC, so the title treats the link as internet-ready.
++    return XnAddrStatus::XNET_GET_XNADDR_DHCP | XnAddrStatus::XNET_GET_XNADDR_GATEWAY |
++           XnAddrStatus::XNET_GET_XNADDR_DNS | XnAddrStatus::XNET_GET_XNADDR_ONLINE;
++  }
++
+   // Just return a loopback address atm.
+   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
+   addr_ptr->inaOnline.s_addr = 0;
+@@ -476,6 +569,23 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
+ // subsequent socket calls (like a handle to a XNet address)
+ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
+                                     mapped_void in_addr) {
++  // [netplay] Resolve a peer's 20-byte abOnline identity to its loopback IP via
++  // the broker (cached after the first lookup). We hand the guest a REAL
++  // 127.0.0.x address it can sendto() directly -- no fake-IP rewriting needed
++  // because distinct loopback IPs already route between same-host instances.
++  auto& np = Netplay::Get();
++  if (np.enabled()) {
++    uint32_t ip_net = 0;
++    uint16_t port = 0;
++    if (np.Resolve(xn_addr->abOnline, ip_net, port)) {
++      std::memcpy(in_addr, &ip_net, 4);  // network-order IN_ADDR
++      REXKRNL_INFO("[netplay] XNetXnAddrToInAddr -> {}.{}.{}.{}",
++                   (ip_net) & 0xFF, (ip_net >> 8) & 0xFF, (ip_net >> 16) & 0xFF,
++                   (ip_net >> 24) & 0xFF);
++      return 0;  // success
++    }
++    REXKRNL_WARN("[netplay] XNetXnAddrToInAddr: peer not resolved");
++  }
+   return 1;
+ }
+ 
+@@ -555,6 +665,13 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
+ 
+ u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
+                                u32 flags) {
++  // [netplay] The host advertises a QoS listener so searchers can probe it. The
++  // stock stub failed, which can make the title consider the host unreachable.
++  // Accept it under netplay (peer reachability is guaranteed via loopback).
++  if (Netplay::Get().enabled()) {
++    REXKRNL_INFO("[netplay] XNetQosListen flags={:08X} -> OK", flags);
++    return 0;
++  }
+   return X_ERROR_FUNCTION_FAILED;
+ }
+ 
+@@ -666,6 +783,24 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
+   }
+ 
+   N_XSOCKADDR_IN native_name(name);
++
++  // [netplay] Two instances on one host can't both bind 0.0.0.0:<port>. Pin an
++  // INADDR_ANY bind to this instance's distinct loopback IP (127.0.0.x); the be<>
++  // field stores big-endian, so assign the host-order IP to get network-order
++  // bytes for the native bind. Also learn the port we bound for the broker.
++  auto& np = Netplay::Get();
++  uint16_t req_port = (uint16_t)native_name.sin_port;  // be<> get() -> host order
++  if (np.enabled()) {
++    uint32_t cur = (uint32_t)native_name.sin_addr;  // host-order view
++    if (cur == 0 /*INADDR_ANY*/) {
++      native_name.sin_addr = ntohl(np.loopback_ip_net());  // host-order loopback IP
++    }
++    if (req_port) np.set_game_port(req_port);
++    REXKRNL_INFO("[netplay] bind sock={:08X} -> {}:{} (was ANY={})", socket_handle,
++                 np.loopback_ip_str(), req_port, cur == 0);
++    np.EnsureRegistered();
++  }
++
+   X_STATUS status = socket->Bind(&native_name, namelen);
+   if (XFAILED(status)) {
+     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
+index a016440..9cf7d8c 100644
+--- a/src/kernel/xam/xam_user.cpp
++++ b/src/kernel/xam/xam_user.cpp
+@@ -13,6 +13,13 @@
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
+ #include <cstring>
++#include <cstdio>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <filesystem>
++#include <mutex>
++#include <thread>
+ 
+ #include <rex/cvar.h>
+ #include <rex/kernel/xam/private.h>
+@@ -20,8 +27,11 @@
+ #include <rex/math.h>
+ #include <rex/hook.h>
+ #include <rex/types.h>
++#include <rex/filesystem.h>
+ #include <rex/string/util.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/system/netplay.h>
++#include <rex/system/xam/content_manager.h>
+ #include <rex/system/xam/user_profile.h>
+ #include <rex/system/xenumerator.h>
+ #include <rex/system/xio.h>
+@@ -36,6 +46,110 @@ namespace xam {
+ using namespace rex::system;
+ using namespace rex::system::xam;
+ 
++// === [recomp-fix: cross-restart campaign continue] =========================
++// South Park LGTDP keeps campaign progress (per-level complete/unlock + scores) in the
++// in-memory global g_slots (guest 0x828EB348), in the active player's slot-0 block at
++// g_slots+2480..+2624 (diff-proven: winning Stan's House changes ~a dozen int fields
++// there, e.g. the "levels reached" counter at g_slots+2520 goes 1->3; this block is all
++// small ints/flags, NO pointers, and is what the level-select's level grid is built
++// from). On SAVE the game serializes it to the title-profile blob 63E83FFE (runtime
++// persists it fine). On a fresh boot the guest reads 63E83FFE back (PROF-RD is_set=true)
++// but never deserializes it into this g_slots block -> the block stays default ->
++// CAMPAIGN LEVEL SELECT shows only Stan's House after a restart. Pure-disk preservation
++// can't fix it (the grid is built from g_slots, not the disk). Fix: persist this g_slots
++// block to a side file on save, and restore it into g_slots every frame whenever the
++// live "levels reached" gate is LOWER than the saved one (i.e. a fresh/default block),
++// so the saved progress is in place before the level-select reads it. The gate makes it
++// monotonic: in-session wins (gate goes >= saved) are kept and grow the snapshot; a
++// reset/default block (gate < saved) is restored. Raw bytes -> format-agnostic. See KB
++// 56-continue-re-map.md.
++namespace {
++constexpr uint32_t kCampaignGSlots = 0x828EB348u;
++constexpr int kCampaignProgOff = 2480;  // campaign progress block in slot 0 (ints/flags, no pointers)
++constexpr int kCampaignProgLen = 144;   // g_slots+2480 .. +2624
++constexpr int kCampaignGateOff = 40;    // prog[40] == g_slots+2520 = monotonic "levels reached" gate
++std::array<uint8_t, kCampaignProgLen> g_campaign_snap{};
++std::mutex g_campaign_mtx;                  // guards g_campaign_snap + the side file
++std::atomic<bool> g_campaign_loaded{false};
++std::atomic<bool> g_campaign_thread{false};
++
++std::filesystem::path CampaignSidePath() {
++  return REX_KERNEL_STATE()->content_manager()->ResolveGameUserContentPath() / "gslots_campaign.bin";
++}
++uint8_t* CampaignProg() {
++  uint8_t* g = REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(kCampaignGSlots);
++  return g ? g + kCampaignProgOff : nullptr;
++}
++void CampaignWriteSideFileLocked() {  // caller holds g_campaign_mtx
++  auto path = CampaignSidePath();
++  std::error_code ec;
++  std::filesystem::create_directories(path.parent_path(), ec);
++  if (FILE* f = rex::filesystem::OpenFile(path, "wb")) {
++    fwrite(g_campaign_snap.data(), 1, g_campaign_snap.size(), f);
++    fclose(f);
++    REXKRNL_WARN("[CONT-FIX] saved campaign progress snapshot (gate={})",
++                 (int)g_campaign_snap[kCampaignGateOff]);
++  }
++}
++void CampaignEnsureLoaded() {
++  if (g_campaign_loaded.exchange(true)) return;
++  std::lock_guard<std::mutex> lk(g_campaign_mtx);
++  g_campaign_snap.fill(0);
++  if (FILE* f = rex::filesystem::OpenFile(CampaignSidePath(), "rb")) {
++    fread(g_campaign_snap.data(), 1, g_campaign_snap.size(), f);
++    fclose(f);
++    REXKRNL_WARN("[CONT-FIX] loaded campaign progress snapshot (gate={})",
++                 (int)g_campaign_snap[kCampaignGateOff]);
++  }
++}
++// Capture the live block IF it is more progressed than the snapshot. The campaign
++// progress block at g_slots+2480 is only populated TRANSIENTLY around a level win (it is
++// 0 at the menu), so this is polled at high frequency from a background thread to reliably
++// catch that brief window (the game's own profile-write clobbers progress to default, so
++// hooking it is useless). gate (g_slots+2520) = monotonic "levels reached".
++void CampaignCaptureIfGrew() {
++  uint8_t* prog = CampaignProg();
++  if (!prog) return;
++  int gate_cur = prog[kCampaignGateOff];
++  std::lock_guard<std::mutex> lk(g_campaign_mtx);
++  if (gate_cur > g_campaign_snap[kCampaignGateOff] && gate_cur <= 30) {
++    std::memcpy(g_campaign_snap.data(), prog, kCampaignProgLen);
++    CampaignWriteSideFileLocked();
++  }
++}
++void CampaignThreadFn() {
++  CampaignEnsureLoaded();
++  for (;;) {
++    CampaignCaptureIfGrew();
++    std::this_thread::sleep_for(std::chrono::milliseconds(20));
++  }
++}
++}  // namespace
++
++// Called per frame from XamInputGetState. Starts the capture thread once, then RESTORES
++// the saved progress into the live g_slots block whenever it reads as default/less
++// progressed (fresh boot, menu, level-select) so the campaign level grid is rebuilt with
++// the saved unlocks. Capture (catching the transient win state) is done by the thread.
++void CampaignContinueRestore() {
++  CampaignEnsureLoaded();
++  if (!g_campaign_thread.exchange(true)) {
++    std::thread(CampaignThreadFn).detach();
++  }
++  uint8_t* prog = CampaignProg();
++  if (!prog) return;
++  std::lock_guard<std::mutex> lk(g_campaign_mtx);
++  int gate_snap = g_campaign_snap[kCampaignGateOff];
++  if (gate_snap > 0 && prog[kCampaignGateOff] < gate_snap) {
++    std::memcpy(prog, g_campaign_snap.data(), kCampaignProgLen);  // restore saved progress
++  } else if (prog[kCampaignGateOff] > gate_snap && prog[kCampaignGateOff] <= 30) {
++    std::memcpy(g_campaign_snap.data(), prog, kCampaignProgLen);  // also capture here
++    CampaignWriteSideFileLocked();
++  }
++}
++
++// Backup capture on the game's profile-write.
++void CampaignContinueSnapshot() { CampaignCaptureIfGrew(); }
++
+ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
+   assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
+               type_mask == 7);
+@@ -71,6 +185,9 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
+     if (user_index == 0) {
+       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+       signin_state = user_profile->signin_state();
++      // [netplay] Report SignedInToLive (2) so the title enters the Xbox Live
++      // co-op path. Offline (cvar unset) keeps the default local state (1).
++      if (rex::system::Netplay::Get().enabled()) signin_state = 2;
+     }
+   }
+   return signin_state;
+@@ -99,6 +216,8 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+   info->xuid = user_profile->xuid();
+   info->signin_state = user_profile->signin_state();
++  // [netplay] Mirror XamUserGetSigninState: report Live when online co-op is on.
++  if (rex::system::Netplay::Get().enabled()) info->signin_state = 2;
+   rex::string::util_copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
+   return X_E_SUCCESS;
+ }
+@@ -260,6 +379,8 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+   for (uint32_t n = 0; n < setting_count; ++n) {
+     uint32_t setting_id = setting_ids[n];
+     auto setting = user_profile->GetSetting(setting_id);
++    REXKRNL_WARN("[PROF-RD] id={:08X} found={} is_set={}", setting_id,
++                 setting != nullptr, setting && setting->is_set);
+ 
+     std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
+     out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
+@@ -329,10 +450,10 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
+       continue;
+     }
+ 
+-    REXKRNL_DEBUG(
+-        "XamUserWriteProfileSettings: setting index [{}]:"
+-        " from={} setting_id={:08X} data.type={}",
+-        n, (uint32_t)setting.from, (uint32_t)setting.setting_id, setting.data.type);
++    REXKRNL_WARN(
++        "[PROF-WR] index [{}]: from={} setting_id={:08X} data.type={} bin.size={}",
++        n, (uint32_t)setting.from, (uint32_t)setting.setting_id, setting.data.type,
++        (uint32_t)setting.data.binary.size);
+ 
+     switch (setting_type) {
+       case UserProfile::Setting::Type::CONTENT:
+@@ -363,6 +484,12 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
+     };
+   }
+ 
++  // [recomp-fix: cross-restart continue] On the game's save, persist g_slots's campaign
++  // unlock flags (snapshot, monotonic), then OR them back so a "reset to default" write
++  // can't leave g_slots cleared for the level-select that follows.
++  CampaignContinueSnapshot();
++  CampaignContinueRestore();
++
+   if (overlapped) {
+     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(), X_ERROR_SUCCESS);
+     return X_ERROR_IO_PENDING;
+@@ -384,6 +511,10 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
+ 
+   // If we deny everything, games should hopefully not try to do stuff.
+   *out_value = 0;
++  // [netplay] Grant privileges (multiplayer sessions, communications, etc.) when
++  // online co-op is active so the title's "Xbox LIVE Gold required" gate passes.
++  // Offline (cvar unset) keeps everything denied.
++  if (rex::system::Netplay::Get().enabled()) *out_value = 1;
+   return X_ERROR_SUCCESS;
+ }
+ 
+diff --git a/src/system/xam/user_profile.cpp b/src/system/xam/user_profile.cpp
+index a77f5e6..df5615f 100644
+--- a/src/system/xam/user_profile.cpp
++++ b/src/system/xam/user_profile.cpp
+@@ -147,6 +147,10 @@ void UserProfile::LoadSetting(UserProfile::Setting* setting) {
+       fclose(file);
+       setting->Deserialize(serialized_data);
+       setting->loaded_title_id = kernel_state_->title_id();
++      REXSYS_WARN("[PROF-LOAD] id={:08X} LOADED {} bytes from disk", setting->setting_id,
++                  input_file_size);
++    } else {
++      REXSYS_WARN("[PROF-LOAD] id={:08X} no file on disk (fresh)", setting->setting_id);
+     }
+   } else {
+     // Unsupported for now.  Other settings aren't per-game and need to be
+@@ -165,6 +169,8 @@ void UserProfile::SaveSetting(UserProfile::Setting* setting) {
+     auto file = rex::filesystem::OpenFile(file_path, "wb");
+     fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
+     fclose(file);
++    REXSYS_WARN("[PROF-SAVE] id={:08X} WROTE {} bytes to disk", setting->setting_id,
++                (uint32_t)serialized_setting.size());
+   } else {
+     // Unsupported for now.  Other settings aren't per-game and need to be
+     // stored some other way.
+-- 
+2.54.0
+

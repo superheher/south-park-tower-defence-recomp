@@ -1,0 +1,347 @@
+From 0e7cbca75e0763fe04c321d50ea12ac5ae5e0ed3 Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sat, 30 May 2026 16:22:03 +0300
+Subject: [PATCH 11/13] system/loader: r1 stack headroom, entry override, boot
+ continuation, STFS direct mount
+
+
+diff --git a/src/filesystem/devices/host_path_entry.cpp b/src/filesystem/devices/host_path_entry.cpp
+index 56f5a97..e39c435 100644
+--- a/src/filesystem/devices/host_path_entry.cpp
++++ b/src/filesystem/devices/host_path_entry.cpp
+@@ -12,6 +12,12 @@
+ #include <rex/filesystem/devices/host_path_entry.h>
+ #include <rex/filesystem/devices/host_path_file.h>
+ 
++#include <algorithm>
++#include <cctype>
++#include <fstream>
++#include <string>
++
++#include <rex/cvar.h>
+ #include <rex/filesystem.h>
+ #include <rex/filesystem/device.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+@@ -20,6 +26,11 @@
+ #include <rex/memory/mapped_memory.h>
+ #include <rex/string.h>
+ 
++REXCVAR_DEFINE_BOOL(always_win, false, "Game",
++                    "Cheat: the base (school) becomes invincible so you can't lose a level "
++                    "(its defense health is continuously restored, so the engine never "
++                    "registers a defeat / GAME OVER)");
++
+ namespace rex::filesystem {
+ 
+ HostPathEntry::HostPathEntry(Device* device, Entry* parent, const std::string_view path,
+@@ -45,7 +56,68 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
+       entry->attributes_ |= kFileAttributeReadOnly;
+     }
+     entry->size_ = file_info.total_size;
+-    entry->allocation_size_ = rex::round_up(file_info.total_size, device->bytes_per_sector());
++
++    // [recomp always_win] When the cheat cvar is set, redirect the campaign's
++    // shared Lua (LevelGlobalFunctions.lua) to a temp copy with extra code that
++    // keeps the base's defense health topped up. The engine decides defeat itself
++    // (defense health <= 0 -> DefenseKilled -> GAME OVER), independent of the Lua
++    // lose sequence, so the only reliable way to block GAME OVER is to make the
++    // base unkillable. We redirect host_path_ (rather than patching reads) so it
++    // works for both ReadSync and memory-mapped loading.
++    if (REXCVAR_GET(always_win)) {
++      auto name_utf8 = rex::path_to_utf8(file_info.name);
++      std::string name_lower = name_utf8;
++      std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(),
++                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++      if (name_lower == "levelglobalfunctions.lua") {
++        try {
++          std::ifstream in(full_path, std::ios::binary);
++          std::string content((std::istreambuf_iterator<char>(in)),
++                              std::istreambuf_iterator<char>());
++          in.close();
++          if (!content.empty()) {
++            content +=
++                "\n-- [recomp always_win] Make the base invincible: a background task\n"
++                "-- restores the defense health whenever it drops, so the engine never\n"
++                "-- sees it reach 0 and never triggers a defeat. Started on the first\n"
++                "-- stage launch (the scheduler is live then) and runs for the session.\n"
++                "local __aw_LaunchStage = LaunchStage\n"
++                "function LaunchStage(s,p,c,d)\n"
++                "  __aw_maxhp = 0\n"
++                "  if not __aw_keepalive then\n"
++                "    __aw_keepalive = true\n"
++                "    Task(function()\n"
++                "      while true do\n"
++                "        local ok, h = pcall(GetDefenseHealth)\n"
++                "        if ok and h then\n"
++                "          if h > __aw_maxhp then __aw_maxhp = h end\n"
++                "          if h > 0 and h < __aw_maxhp then pcall(SetDefenseHealth, __aw_maxhp) end\n"
++                "        end\n"
++                "        Wait(0.1)\n"
++                "      end\n"
++                "    end)\n"
++                "  end\n"
++                "  __aw_LaunchStage(s,p,c,d)\n"
++                "end\n";
++            auto temp_path =
++                std::filesystem::temp_directory_path() / "rexglue_alwayswin_lgf.lua";
++            std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
++            out.write(content.data(), static_cast<std::streamsize>(content.size()));
++            out.close();
++            entry->host_path_ = temp_path;
++            entry->size_ = content.size();
++            REXFS_WARN(
++                "[always_win] redirected LevelGlobalFunctions.lua -> {} ({} bytes); "
++                "the base is now invincible (you can't lose a level)",
++                rex::path_to_utf8(temp_path), content.size());
++          }
++        } catch (const std::exception& e) {
++          REXFS_ERROR("[always_win] failed to inject invincibility: {}", e.what());
++        }
++      }
++    }
++
++    entry->allocation_size_ = rex::round_up(entry->size_, device->bytes_per_sector());
+   }
+   return entry;
+ }
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index f9eac23..fbd27ad 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -13,6 +13,7 @@
+ #include <rex/cvar.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/null_device.h>
++#include <rex/filesystem/devices/stfs_container_device.h>
+ #include <rex/filesystem/vfs.h>
+ #include <rex/logging.h>
+ #include <rex/perf/counter.h>
+@@ -264,19 +265,30 @@ bool Runtime::SetupVfs() {
+     return false;
+   }
+ 
+-  // Mount game_data_root as \Device\Harddisk0\Partition1
++  // Mount game_data_root as \Device\Harddisk0\Partition1. The game source may be
++  // EITHER a directory of extracted files (HostPathDevice) OR a single STFS package
++  // file straight from the user's own console dump (StfsContainerDevice). Auto-detect
++  // by file-vs-directory so no extraction step is required.
+   auto mount_path = "\\Device\\Harddisk0\\Partition1";
+-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(
+-      mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
++  std::unique_ptr<rex::filesystem::Device> device;
++  if (std::filesystem::is_directory(abs_game_root)) {
++    device = std::make_unique<rex::filesystem::HostPathDevice>(
++        mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
++  } else {
++    // A regular file: mount it as an STFS/SVOD container in place.
++    device = std::make_unique<rex::filesystem::StfsContainerDevice>(mount_path, abs_game_root);
++  }
+   if (!device->Initialize()) {
+-    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
++    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize game device for {}",
++                 abs_game_root.string());
+     return false;
+   }
+   if (!file_system_->RegisterDevice(std::move(device))) {
+-    REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");
++    REXSYS_ERROR("Runtime::SetupVfs: Failed to register game device");
+     return false;
+   }
+-  REXSYS_INFO("  Mounted {} at {}", abs_game_root.string(), mount_path);
++  REXSYS_INFO("  Mounted {} at {} ({})", abs_game_root.string(), mount_path,
++              std::filesystem::is_directory(abs_game_root) ? "host folder" : "STFS package");
+ 
+   // Register symbolic links for game: and D:
+   file_system_->RegisterSymbolicLink("game:", mount_path);
+diff --git a/src/system/thread_state.cpp b/src/system/thread_state.cpp
+index eb352a0..fb94c06 100644
+--- a/src/system/thread_state.cpp
++++ b/src/system/thread_state.cpp
+@@ -35,8 +35,16 @@ ThreadState::ThreadState(uint32_t thread_id, uint32_t stack_base, uint32_t pcr_a
+   // Initialize the PPCContext (context_ already points to context_storage_)
+   std::memset(context_, 0, sizeof(::PPCContext));
+ 
+-  // Set initial registers
+-  context_->r1.u64 = stack_base;    // Stack pointer
++  // Set initial registers.
++  // stack_base is the exclusive top of the guest stack and sits on a
++  // PAGE_NOACCESS guard page (usable RW stack is below it). A guest entry thunk
++  // with no prologue may immediately read its caller (loader) frame *above* r1
++  // (e.g. South Park LGTDP's xstart: `addi r1,r1,112; lwz r12,-8(r1)` reads
++  // [r1+104]). Starting r1 exactly at stack_base makes those reads fault on the
++  // guard. Reserve a small, 16-byte-aligned initial frame below stack_base so
++  // the loader-frame reads land in committed RW stack. Harmless for normal
++  // threads (whose functions have prologues).
++  context_->r1.u64 = (stack_base - 0x100) & ~UINT32_C(0xF);  // Stack pointer
+   context_->r13.u64 = pcr_address;  // PCR address
+ 
+   // Note(tomc): the rexglue abi passes memory base via 'base' parameter to each function call,
+diff --git a/src/system/user_module.cpp b/src/system/user_module.cpp
+index 6255e3c..32e1865 100644
+--- a/src/system/user_module.cpp
++++ b/src/system/user_module.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <vector>
++#include <cstdlib>
+ 
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
+@@ -211,6 +212,17 @@ X_STATUS UserModule::LoadXexContinue() {
+ 
+   // Cache some commonly used headers...
+   this->xex_module()->GetOptHeader(XEX_HEADER_ENTRY_POINT, &entry_point_);
++  // [bring-up experiment] Allow overriding the guest entry point via env var, to
++  // test starting at the real mainCRTStartup when the XEX entry is a stub. Set
++  // REX_ENTRY_OVERRIDE=0x82xxxxxx. See knowledge-base/.../35-entry-forensics.md.
++  if (const char* ov = std::getenv("REX_ENTRY_OVERRIDE")) {
++    uint32_t v = static_cast<uint32_t>(std::strtoul(ov, nullptr, 0));
++    if (v) {
++      REXSYS_WARN("Entry point OVERRIDDEN via REX_ENTRY_OVERRIDE: {:08X} -> {:08X}",
++                  entry_point_, v);
++      entry_point_ = v;
++    }
++  }
+   this->xex_module()->GetOptHeader(XEX_HEADER_DEFAULT_STACK_SIZE, &stack_size_);
+   is_dll_module_ = !!(header->module_flags & XEX_MODULE_DLL_MODULE);
+ 
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index db31ff4..65920f1 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -294,8 +294,13 @@ bool XThread::AllocateStack(uint32_t size) {
+   stack_limit_ = address + (padding / 2);
+   stack_base_ = stack_limit_ + size;
+ 
+-  // Initialize the stack with junk
+-  memory()->Fill(stack_alloc_base_, actual_size, 0xBE);
++  // Initialize the stack (patch 0006). Xenia *master* fills with 0xBE poison, which
++  // makes the XapiThreadStartup trampoline's blr jump to 0xBEBEBEBE and crash (this
++  // title returns through an unset kernel continuation slot). Xenia *canary* leaves the
++  // stack zeroed (heap-zeroed) and boots. Match canary: zero the stack so the entry's
++  // continuation reads 0 (handled by the boot-continuation reenter in
++  // FunctionDispatcher::Execute, patch 0005) instead of poison.
++  memory()->Fill(stack_alloc_base_, actual_size, 0x00);
+ 
+   // Setup the guard pages
+   heap->Protect(stack_alloc_base_, padding / 2, memory::kMemoryProtectNoAccess);
+@@ -629,6 +634,36 @@ void XThread::Execute() {
+   REXSYS_NOISY_DEBUG("XThread::Execute - Calling function at {:08X}", address);
+   func(*ctx, base);
+ 
++  // Boot continuation (patch 0005) — the executable entry is the XapiThreadStartup
++  // trampoline: ONE .pdata function (e.g. 0x824499A0..0x82449B58) that codegen split at
++  // its internal blr. The pre-prologue check (..+0x2C) returns via blr to a continuation
++  // the kernel/JIT seeds (the body / boot-driver is at +0x30); rexglue compiles each
++  // guest function in isolation, so that blr becomes a C++ return that unwinds here and
++  // the thread exits ("Execution complete"). Xenia's JIT instead carries control across
++  // the blr into the body; replicate it. Gate to the executable entry so worker/raw
++  // threads are unaffected: follow ctx.lr; a non-sentinel non-function target (0 /
++  // garbage, because we don't seed the kernel return slot) falls through to +0x30.
++  {
++    uint32_t exec_entry = 0;
++    if (auto exec_mod = kernel_state_->GetExecutableModule()) {
++      exec_entry = exec_mod->entry_point();
++    }
++    if (exec_entry != 0 && address == exec_entry) {
++      uint32_t cont = static_cast<uint32_t>(ctx->lr);
++      if (cont != 0xBCBCBCBC && !dispatcher->GetFunction(cont)) {
++        cont = address + 0x30;
++      }
++      while (cont != 0xBCBCBCBC) {
++        PPCFunc* next_fn = dispatcher->GetFunction(cont);
++        if (!next_fn) break;
++        REXSYS_WARN("Boot continuation: dispatching to {:08X} (from {:08X})", cont, address);
++        ctx->lr = 0xBCBCBCBC;
++        next_fn(*ctx, base);
++        cont = static_cast<uint32_t>(ctx->lr);
++      }
++    }
++  }
++
+   exit_code = static_cast<int>(ctx->r3.u32);
+ 
+   // If we got here it means the execute completed without an exit being called.
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 8abe75e..4506941 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -169,7 +169,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+     return false;
+   }
+-  if (!std::filesystem::is_directory(paths.game_data_root)) {
++  // game_data_root may be a directory of extracted files OR a single packaged
++  // container file (STFS) mounted in place by Runtime::SetupVfs. Accept either.
++  if (!std::filesystem::exists(paths.game_data_root)) {
+     auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
+     REXLOG_ERROR("{}", msg);
+     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+@@ -217,8 +219,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+   std::string xex_image = "game:\\default.xex";
+   OnLoadXexImage(xex_image);
+ 
+-  // Mirrors the game:\ / d:\ -> game_data_root mapping in Runtime::SetupVfs.
+-  {
++  // Pre-flight the entrypoint XEX as a host file ONLY when game_data_root is an
++  // extracted directory. For a packaged container (STFS) the XEX lives inside the
++  // package, not on the host filesystem, so let Runtime::LoadXexImage validate it
++  // through the VFS instead. Mirrors the game:\ / d:\ mapping in Runtime::SetupVfs.
++  if (std::filesystem::is_directory(paths.game_data_root)) {
+     constexpr std::string_view kGameDevice = "game:\\";
+     constexpr std::string_view kDDevice = "d:\\";
+     std::string_view tail = xex_image;
+diff --git a/src/ui/window_win.cpp b/src/ui/window_win.cpp
+index 09c44a3..fbc0161 100644
+--- a/src/ui/window_win.cpp
++++ b/src/ui/window_win.cpp
+@@ -36,6 +36,9 @@
+ #include <shellapi.h>
+ #include <tpcshrd.h>
+ 
++REXCVAR_DEFINE_STRING(window_icon, "", "UI/Window",
++                      "Path to a .ico file to use as the window/taskbar icon (empty = none).");
++
+ namespace {
+ 
+ uint32_t ResolveWindowWidth(uint32_t requested_width) {
+@@ -282,6 +285,35 @@ bool Win32Window::OpenImpl() {
+     SendMessageW(hwnd_, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon_));
+   }
+ 
++  // [recomp] Optional window/taskbar icon from a .ico file (e.g. the title's SouthPark.png
++  // converted to .ico), passed via --window_icon=<path>. LoadImageW handles a multi-size .ico.
++  {
++    const std::string& icon_path = REXCVAR_GET(window_icon);
++    if (!icon_path.empty()) {
++      int wlen =
++          MultiByteToWideChar(CP_UTF8, 0, icon_path.data(), int(icon_path.size()), nullptr, 0);
++      std::wstring wpath(size_t(wlen), L'\0');
++      MultiByteToWideChar(CP_UTF8, 0, icon_path.data(), int(icon_path.size()), wpath.data(), wlen);
++      HICON big = static_cast<HICON>(
++          LoadImageW(nullptr, wpath.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE));
++      HICON small_icon = static_cast<HICON>(
++          LoadImageW(nullptr, wpath.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
++                     GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
++      if (big) {
++        SendMessageW(hwnd_, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
++        SetClassLongPtrW(hwnd_, GCLP_HICON, reinterpret_cast<LONG_PTR>(big));
++      }
++      HICON small_for_title = small_icon ? small_icon : big;
++      if (small_for_title) {
++        SendMessageW(hwnd_, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_for_title));
++        SetClassLongPtrW(hwnd_, GCLP_HICONSM, reinterpret_cast<LONG_PTR>(small_for_title));
++      }
++      if (!big && !small_icon) {
++        REXLOG_WARN("window_icon: failed to load '{}'", icon_path);
++      }
++    }
++  }
++
+   // Move the window to the requested monitor before entering fullscreen so
+   // that MonitorFromWindow picks the correct display.
+   if (int32_t monitor_index = REXCVAR_GET(monitor); monitor_index > 0) {
+-- 
+2.54.0
+
