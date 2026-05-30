@@ -104,10 +104,13 @@ a heavy dip; DSO = 79 % librexruntime + 13 % RADV + 7 % libc) — the map for an
   `radv_bind_descriptor_sets` 0.7 %, `WriteTransientTextureBindings` 0.7 % — the draw-batch target.
 - **~3 % render-target/pipeline state** — `RenderTargetCache::Update`, `GetCurrentStateDescription`.
 - **~3.2 % pure waste — the GPU trace writer**: `TraceWriter::WritePacketStart`/`WritePacketEnd` are called
-  per PM4 packet even in normal play. They early-out on `if (!file_) return;` but are **non-inlined**, so the
-  per-packet call overhead alone costs ~3.2 % of CP on-cpu for nothing. A safe correct micro-opt (inline the
-  `is_open()` early-out / guard the hot call sites) reclaims it — ~0.5 ms/frame, floor-neutral; flagged for a
-  cleanup pass, not done here (small + cross-call-site churn, and floor-neutral).
+  per PM4 packet even in normal play. They early-out on `if (!file_) return;` but were **non-inlined**, so the
+  per-packet call overhead alone cost ~3.2 % of CP on-cpu for nothing. **Fixed this session (patch 0016):**
+  both bodies moved inline into `trace_writer.h` so the null-check folds to a load+branch with no call/ret.
+  Byte-identical behaviour; `.so`-only; **detdiff gate=pass/equivalent, mid-combat render pixel-correct**.
+  Floor-neutral (~0.5 ms/frame; the floor is the game's fixed-60Hz cost, not the CP) — kept as a CPU
+  efficiency win (same rationale as the audio de-spin). The remaining CP hotspots (register writes,
+  descriptors) each save < 4 ms even if fully eliminated, so none is a floor lever.
 
 ## Empirical "long-shot" attempt this session
 

@@ -1,0 +1,98 @@
+From 382500fe3e89c1e66cb8fcd88559e93a70b0ee2b Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sun, 31 May 2026 00:30:00 +0300
+Subject: [PATCH] perf(trace): inline TraceWriter::WritePacketStart/End (elide
+ per-packet call overhead)
+
+WritePacketStart/WritePacketEnd are invoked around EVERY PM4 packet by the CP hot loop. When not
+capturing a trace (file_ == nullptr, the normal-play case) they early-out, but out-of-line the bare
+call overhead costs ~3.2% of CP on-cpu in a heavy combat dip for nothing (measured: cp_oncpu_profile.sh
+top self-functions, WritePacketStart 1.63% + WritePacketEnd 1.55%). Move both bodies into trace_writer.h
+as inline members so the file_ null-check folds into the call site to a load+branch with no call/ret.
+
+Behaviour is byte-identical (same writes when a trace IS open). The header already includes <cstdio> +
+trace_protocol.h so no new dependency. .so-only. detdiff gate: pass/equivalent. Mid-combat render:
+pixel-correct (Stan's House, ginger-kid wave, 60fps, no errors). Floor-neutral (~0.5ms/frame; the
+combat floor is the title's own fixed-60Hz cost, not the CP) -- kept as a CPU/power efficiency win, same
+rationale as the audio de-spin (patch 15). See ../docs/FLOOR-STRUCTURAL-CONCLUSION-REPORT.md.
+---
+ include/rex/graphics/trace_writer.h | 28 ++++++++++++++++++++++++++--
+ src/graphics/trace_writer.cpp       | 23 +----------------------
+ 2 files changed, 27 insertions(+), 24 deletions(-)
+
+diff --git a/include/rex/graphics/trace_writer.h b/include/rex/graphics/trace_writer.h
+index 202c23f..efd036c 100644
+--- a/include/rex/graphics/trace_writer.h
++++ b/include/rex/graphics/trace_writer.h
+@@ -36,8 +36,32 @@ class TraceWriter {
+   void WritePrimaryBufferEnd();
+   void WriteIndirectBufferStart(uint32_t base_ptr, uint32_t count);
+   void WriteIndirectBufferEnd();
+-  void WritePacketStart(uint32_t base_ptr, uint32_t count);
+-  void WritePacketEnd();
++  // [perf: trace-writer per-packet call elision] Invoked around EVERY PM4 packet by the CP hot loop.
++  // When not capturing a trace (file_ == nullptr, the normal-play case) they must be free; out-of-line
++  // they cost ~3.2% of CP on-cpu in a heavy combat dip purely in call overhead (cp_oncpu_profile.sh).
++  // Inlined here the file_ null-check folds to a load+branch with no call/ret; behaviour is identical
++  // (same writes when tracing). The header already includes <cstdio> + trace_protocol.h.
++  void WritePacketStart(uint32_t base_ptr, uint32_t count) {
++    if (!file_) {
++      return;
++    }
++    PacketStartCommand cmd = {
++        TraceCommandType::kPacketStart,
++        base_ptr,
++        count,
++    };
++    fwrite(&cmd, 1, sizeof(cmd), file_);
++    fwrite(membase_ + base_ptr, 4, count, file_);
++  }
++  void WritePacketEnd() {
++    if (!file_) {
++      return;
++    }
++    PacketEndCommand cmd = {
++        TraceCommandType::kPacketEnd,
++    };
++    fwrite(&cmd, 1, sizeof(cmd), file_);
++  }
+   void WriteMemoryRead(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr);
+   void WriteMemoryReadCached(uint32_t base_ptr, size_t length);
+   void WriteMemoryReadCachedNop(uint32_t base_ptr, size_t length);
+diff --git a/src/graphics/trace_writer.cpp b/src/graphics/trace_writer.cpp
+index 2a35689..1bccff5 100644
+--- a/src/graphics/trace_writer.cpp
++++ b/src/graphics/trace_writer.cpp
+@@ -128,28 +128,7 @@ void TraceWriter::WriteIndirectBufferEnd() {
+   fwrite(&cmd, 1, sizeof(cmd), file_);
+ }
+ 
+-void TraceWriter::WritePacketStart(uint32_t base_ptr, uint32_t count) {
+-  if (!file_) {
+-    return;
+-  }
+-  PacketStartCommand cmd = {
+-      TraceCommandType::kPacketStart,
+-      base_ptr,
+-      count,
+-  };
+-  fwrite(&cmd, 1, sizeof(cmd), file_);
+-  fwrite(membase_ + base_ptr, 4, count, file_);
+-}
+-
+-void TraceWriter::WritePacketEnd() {
+-  if (!file_) {
+-    return;
+-  }
+-  PacketEndCommand cmd = {
+-      TraceCommandType::kPacketEnd,
+-  };
+-  fwrite(&cmd, 1, sizeof(cmd), file_);
+-}
++// WritePacketStart / WritePacketEnd are now inline in trace_writer.h (per-packet call elision).
+ 
+ void TraceWriter::WriteMemoryRead(uint32_t base_ptr, size_t length, const void* host_ptr) {
+   if (!file_) {
+-- 
+2.54.0
+

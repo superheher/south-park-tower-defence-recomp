@@ -38,8 +38,9 @@ elision); a subtle bug corrupts combat rendering and the detdiff gate may not ca
 
 ## Environment / discipline (unchanged)
 Repo `/home/h/src/recomp/rexglue-recomps` (super, `main`) + submodule `south-park-recomp` (port, `main`);
-SDK edits = `patches/0*.patch` on the upstream gitlink. Kept binary: exe `848f191c` (`south_park_td.cppfence6`)
-+ `.so` `8d2bf92e` (audiofix). Identity `superheher <heh@vivaldi.net>`, commit (NOT push), no Co-Authored-By.
+SDK edits = `patches/0*.patch` on the upstream gitlink. Kept binary: exe `848f191c` (`south_park_td.cppfence6`,
+unchanged) + `.so` `1dd98fdb` (audiofix + patch-0016 trace-writer inline; was `8d2bf92e`).
+Identity `superheher <heh@vivaldi.net>`, commit (NOT push), no Co-Authored-By.
 Host i9-8950HK + RX 460/RADV, governor=performance, sudo `<redacted>`, NOT thermally throttled. New tools in
 `tools/perf/`: `cp_offcpu_stacks.sh`, `quant_diag.sh`, `gpu_busy_probe.sh`, `cold_cache_probe.sh`,
 `slack_probe.sh`, `guest_profile.sh`. Harness: never batch tool calls after a Bash that can exit non-zero;
