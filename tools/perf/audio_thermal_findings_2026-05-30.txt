@@ -1,0 +1,91 @@
+== AUDIO + THERMAL/SATURATION INVESTIGATION (2026-05-30, on elis1: exe 848f191c + .so 5276a282) ==
+
+NEW ANGLE never investigated in 6 prior floor sessions: the audio threads + CPU thermal/saturation state.
+TWO of my initial hypotheses were REFUTED by on-machine data. Recording the corrections honestly.
+
+--- heavydip perf (cycles:u, --call-graph lbr, --percent-limit 1.2), heavy combat dip fps~16-20 ---
+Top self-time (whole-proc %):
+  10.68%  Main XThread    south_park_td     __imp__sub_821B9270            (guest spin; already backoff-parked, 2ms granular)
+   8.56%  Audio Worker    libc.so.6         pthread_mutex_trylock
+   6.39%  GPU Commands    librexruntime.so  VulkanCommandProcessor::WriteRegister
+   5.71%  Audio Worker    libc.so.6         __pthread_mutex_unlock_full     (CONTENDED robust-mutex slow path)
+   3.12%  Audio Worker    librexruntime.so  PosixConditionBase::WaitMultiple
+   3.03%  GPU Commands    librexruntime.so  ExecutePacketType0
+   2.45%  Audio Worker    librexruntime.so  PosixCondition<Semaphore>::signaled
+   2.29%  GPU Commands    librexruntime.so  ExecutePacket
+   1.38%  GPU Commands    libvulkan_radeon  radv_UpdateDescriptorSets
+   1.36%  GPU Commands    librexruntime.so  ExecutePacketType3
+   1.24%  GPU Commands    librexruntime.so  CommandProcessor::WriteRegister
+  => Audio Worker busy-poll ~= 19.8% whole-proc (trylock+unlock_full+WaitMultiple+signaled). REAL.
+  => CP thread ~= 14.3%.
+DSO share: librexruntime 47.0%, libc 22.4% (≈ the audio mutex churn), south_park_td 20.9%, libvulkan 5.6%.
+
+--- per-core frequency under load (load_probe.sh, scaling_cur_freq, no sudo) ---
+IDLE  (no game): all 12 logical cores ~4200-4300 MHz (full all-core turbo). zone2 64-83C.
+IN-DIP (fps 16-23): all cores ~4099-4200 MHz (STILL full all-core turbo). zone2 87-92C.
+  *** HYPOTHESIS REFUTED: the CPU is NOT thermally throttled under combat. Cores hold ~4.2GHz (the
+      i9-8950HK all-core turbo) right through the dip; temps are high (87-92C) but below the throttle
+      knee. My earlier "throttled to 3.0GHz" note was an ASSUMPTION written before this data and is WRONG.
+
+--- per-thread CPU during dip (ps -L pcpu = lifetime-avg, understates instantaneous) ---
+  GPU Commands (CP)   36-42%
+  Audio Worker        31-37%   <= the trylock-storm thread (real)
+  Main XThread        17-30%
+  XMA Decoder          1.4-2.2%   <= COLD. (My earlier "99.5%" was an ERROR/fabrication.)
+  hot-thread summary: sum_pcpu=135%, threads>5%=4, threads>20%=3, loadavg ~4.2  (on 6c/12t).
+  *** HYPOTHESIS REFUTED: the machine is NOT CPU-saturated. ~1.35 of 12 logical cores are busy during the
+      dip; 11 cores are ~idle. So removing the audio spin frees a core that was ALREADY mostly spare.
+
+--- XMA Decoder: already correct, NOT a spin ---
+  xma_decoder.cpp:140-164 WorkerThreadMain: loops contexts, does context.Work(); if NO work this pass it
+  blocks on rex::thread::Wait(work_event_) until WriteRegister(kick) Sets the event. Proper block-on-signal.
+  ps confirms it's cold (1.4-2.2%). It is NOT a problem. (My workflow prompt wrongly called it "99.5% pegged".)
+
+--- The ONE real audio waste: Audio Worker WaitMultiple busy-poll ---
+  audio_system.cpp:95 WorkerThreadMain -> WaitAny(9 handles=8 client semaphores + shutdown, 500ms) ->
+  threading_posix.cpp:291 PosixConditionBase::WaitMultiple (UPSTREAM Xenia code; only vblank-backoff was
+  port-added to this file). Each pass: pthread_mutex_trylock ALL 9 handles; on contention with the SDL
+  callback thread it yield-spins with NO backoff (~336-340); when idle it sleeps only 1ms then re-scans.
+  The mutexes are PTHREAD_MUTEX_ROBUST (ctor ~243) so every unlock takes glibc __pthread_mutex_unlock_full.
+
+REVISED READ OF THE FLOOR:
+  * Not thermal, not saturation. With 11 spare cores at full turbo, removing ~20% whole-proc of audio spin
+    almost certainly just idles a spare core => FLOOR-NEUTRAL, consistent with the 6 prior de-spin sessions
+    and the standing "floor = CP serial translation throughput; CPU-side cuts have low floor-elasticity".
+  * The ONLY plausible non-neutral mechanism: the contended ROBUST-mutex storm between Audio Worker and the
+    SDL callback thread (note the 5.71% in the *contended* unlock_full path) generates kernel futex traffic
+    / scheduler churn that could perturb the scheduling latency of the CP/present threads on the critical
+    path. In a latency-bound (not compute-bound) floor, that tail perturbation could matter. UNTESTED.
+  * Also notable: during the dip the CP thread is only ~36-42% (ps) / 50-81% of one core (top -H 1s) -- it
+    is NOT pegged at 100%. So the floor is at least partly LATENCY-bound (CP blocked waiting), not purely
+    CP CPU-throughput. That's consistent with "serial pipeline latency" more than "CP compute throughput".
+
+DECISION: do the Audio Worker de-spin anyway -- it is a real, safe, .so-only CPU/power efficiency win (the
+  user runs this on a laptop) regardless of floor, exactly as elision1 was kept for being the correct form.
+  Measure the floor honestly: detdiff gate + mid-combat screenshots + ab_both p10 vs bothfix. Keep-as-floor
+  only if median p10 > +1.0; otherwise keep as efficiency win, document floor-neutral, and move to the real
+  throughput levers (bulk-constant memcmp-skip / draw batching). Do NOT touch the XMA decoder (it's fine).
+
+--- DECISIVE: CP off-cpu / scheduling probe (cp_offcpu.sh, perf sched, 10s dip window) ---
+perf sched latency (runtime = on-cpu ms over ~10s wall; count = context switches):
+  south_park_td:(11 guest threads)  17707 ms   149994 switches   avg sched-delay 0.006ms  max 7.18ms
+  GPU Commands (CP)  1638804          4969 ms   144058 switches   avg sched-delay 0.005ms  max 7.11ms
+  Audio Worker       1638803          4148 ms   118723 switches   avg sched-delay 0.005ms  max 5.95ms
+  Xenia Timer Th                        36 ms     2257 switches
+INTERPRETATION (the single most important new fact this session):
+  * CP on-cpu ~4969ms/10s = ~50% of one core AGGREGATE (the 10s spans heavy dips AND 60fps recovery; during
+    genuinely heavy frames top-H showed CP ~80% of a core). So the CP is NOT pegged: it spends a large
+    fraction blocked/off-cpu.
+  * CP avg scheduling DELAY = 0.005 ms (5 microseconds). i.e. whenever the CP becomes runnable it gets a
+    core within ~5us. THE CORES ARE FREE. The floor is therefore NOT CPU-core-contention bound, and NOT
+    helped by freeing a spare core. => removing the Audio Worker's 41%-of-a-core spin will almost certainly
+    be FLOOR-NEUTRAL (it idles a spare core; it does not give the CP a core it was being denied).
+  * CP context-switches 144k/10s (~14k/s): the CP runs in tiny bursts, blocking constantly -- classic
+    "drain ring, block until guest produces more / until GPU/present fence" pattern. The floor is the SERIAL
+    PIPELINE LATENCY (guest-sim -> CP-translate -> GPU -> present, with sync waits), with every stage partly
+    idle (CP ~50%, GPU 17-26% idle per prior reports, Main partly spinning on the vblank fence). This refines
+    "CP throughput" to "serial pipeline round-trip latency + per-heavy-frame CP translate work".
+CONCLUSION: audio de-spin = correct & safe EFFICIENCY win (do it, confirm floor-neutral, keep regardless).
+  The real FLOOR levers remain throughput/latency-side: (1) cut per-heavy-frame CP translate work further
+  (bulk-constant memcmp-skip in WriteRegistersFromMem), (2) draw batching to shorten the CP critical path,
+  (3) overlap/pipeline CP-translate with GPU-exec (the GPU is 17-26% idle, starved by the serial CP burst).

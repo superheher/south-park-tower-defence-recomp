@@ -1,0 +1,81 @@
+From 8b2760852f82de9d70af4ed41dda5a84a7876aab Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sat, 30 May 2026 21:00:00 +0300
+Subject: [PATCH] perf(despin): block the audio-worker multi-wait contention
+ spin (no hot-yield storm)
+
+PosixConditionBase::WaitMultiple takes an all-or-nothing trylock over every handle each pass; when any
+one mutex is briefly held by another thread (the SDL audio callback raising a client semaphore contends
+with the Audio Worker's WaitAny over its 8 client semaphores) the lock-all fails and the upstream code
+hot-yields and retries immediately with no backoff. Under sustained combat-audio contention this spins a
+whole core in pthread_mutex_trylock / __pthread_mutex_unlock_full -- measured ~20% of the entire process
+on the Audio Worker during a heavy-combat dip (the largest libc consumer; libc DSO share 22%->10%).
+
+Replace the hot-yield on the contention path with a brief (200us) park on a process-global condition
+variable that every signal-raising semaphore Release() notifies, so a real semaphore release wakes the
+waiter promptly instead of after a yield-storm. The park is time-bounded, so a missed notify only costs
+up to 200us and the loop self-heals; wait/timeout semantics are unchanged (it never adds a lock nor
+changes which handle satisfies the wait), so guest KeWaitForMultipleObjects behavior is identical.
+
+.so-only (no codegen/exe change). detdiff gate: pass/equivalent. Mid-combat render: pixel-correct, 0
+errors. heavydip: the Audio Worker's trylock/unlock_full/WaitMultiple entries (~20% combined) drop out
+of the top-30 hot functions entirely. Floor A/B vs bothfix: neutral (cores are free; the floor is serial
+render-pipeline latency, not CPU contention) -- kept as a CPU/power efficiency win. See
+docs/FLOOR-AUDIO-DESPIN-REPORT.md.
+---
+ src/core/threading_posix.cpp | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 47e346b..6e1c1bb 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -170,6 +170,20 @@ void SyncMemory() {
+ namespace {
+ std::mutex g_vblank_backoff_mutex;
+ std::condition_variable g_vblank_backoff_cv;
++
++// [perf despin: audio-worker multi-wait contention] PosixConditionBase::WaitMultiple takes an
++// all-or-nothing trylock over EVERY handle each pass; if any one mutex is briefly held by another
++// thread (commonly the SDL audio callback inside PosixCondition<Semaphore>::Release, contending with
++// the Audio Worker's WaitAny over its 8 client semaphores) the lock-all fails and the upstream code
++// hot-yields and retries IMMEDIATELY with no backoff -- spinning a whole core in pthread_mutex_trylock
++// / __pthread_mutex_unlock_full (measured ~20% of the entire process on the Audio Worker during heavy
++// combat). We park briefly on this shared CV on the contention path instead of hot-yielding, and every
++// signal-raising semaphore Release() notifies it so a real signal wakes the waiter promptly. Correctness
++// does NOT depend on the notify coverage: the park is time-bounded (200us), so the loop self-heals on
++// any missed wakeup and the wait/timeout semantics are unchanged. This only converts a busy-yield into a
++// short blocking wait; it never adds a lock nor changes which handle satisfies the wait.
++std::mutex g_wait_notify_mutex;
++std::condition_variable g_wait_notify_cv;
+ }  // namespace
+ 
+ void VblankBackoffWait() {
+@@ -335,7 +349,12 @@ class PosixConditionBase {
+ 
+       if (!all_locked) {
+         locks.clear();
+-        std::this_thread::yield();
++        // [perf despin] Park briefly instead of hot-yielding (see g_wait_notify_cv note above). A
++        // signal-raising semaphore Release() notifies g_wait_notify_cv, so a real signal wakes us
++        // promptly; the bounded 200us wait self-heals on any missed wakeup, leaving wait/timeout
++        // semantics unchanged.
++        std::unique_lock<std::mutex> notify_lock(g_wait_notify_mutex);
++        g_wait_notify_cv.wait_for(notify_lock, std::chrono::microseconds(200));
+         continue;
+       }
+ 
+@@ -455,6 +474,10 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+     }
+     count_ += release_count;
+     cond_.notify_all();
++    // [perf despin] Wake any WaitMultiple parked on the contention path immediately on a real
++    // semaphore release (the Audio Worker waits on its 8 client semaphores this way; the SDL audio
++    // callback raises them). Optimization only -- the parked wait is bounded and self-heals if missed.
++    g_wait_notify_cv.notify_all();
+     return true;
+   }
+ 
+-- 
+2.54.0
+
