@@ -1,0 +1,268 @@
+From 64516bdd6fcf605d3f20372833af696e90804f5f Mon Sep 17 00:00:00 2001
+From: superheher <heh@vivaldi.net>
+Date: Sun, 31 May 2026 01:30:00 +0300
+Subject: [PATCH] perf(trace): inline the hot TraceWriter methods (per-hot-path
+ call elision)
+
+The CP hot loop calls TraceWriter hooks around every PM4 packet, indirect/primary buffer, and guest
+memory read/write (the WAIT_REG_MEM fence poll + per-draw texture reads). All early-out on
+file_==nullptr in normal play, but out-of-line the bare call overhead is wasted CPU -- WritePacketStart/
+End alone measured ~3.2% of CP on-cpu in a heavy combat dip (cp_oncpu_profile.sh), and the buffer/memory
+hooks are the same pattern. Move all of them inline into trace_writer.h so the null-check folds to a
+load+branch with no call/ret. WriteMemoryCommand stays out-of-line (only runs when a trace is open).
+
+Byte-identical behaviour; .so-only; detdiff gate=pass/equivalent (validated for both the packet-only and
+the full set). Re-profile confirms WritePacketStart/End dropped out of the CP top-30. Floor-neutral
+(~0.5ms/frame; the combat floor is the title's own fixed-60Hz cost) -- kept as a CPU efficiency win, same
+rationale as the audio de-spin (patch 15). New kept .so 1a3f6076 (exe 848f191c unchanged).
+---
+ include/rex/graphics/trace_writer.h | 113 +++++++++++++++++++++++++---
+ src/graphics/trace_writer.cpp       | 108 +-------------------------
+ 2 files changed, 106 insertions(+), 115 deletions(-)
+
+diff --git a/include/rex/graphics/trace_writer.h b/include/rex/graphics/trace_writer.h
+index 202c23f..0403002 100644
+--- a/include/rex/graphics/trace_writer.h
++++ b/include/rex/graphics/trace_writer.h
+@@ -32,16 +32,109 @@ class TraceWriter {
+   void Flush();
+   void Close();
+ 
+-  void WritePrimaryBufferStart(uint32_t base_ptr, uint32_t count);
+-  void WritePrimaryBufferEnd();
+-  void WriteIndirectBufferStart(uint32_t base_ptr, uint32_t count);
+-  void WriteIndirectBufferEnd();
+-  void WritePacketStart(uint32_t base_ptr, uint32_t count);
+-  void WritePacketEnd();
+-  void WriteMemoryRead(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr);
+-  void WriteMemoryReadCached(uint32_t base_ptr, size_t length);
+-  void WriteMemoryReadCachedNop(uint32_t base_ptr, size_t length);
+-  void WriteMemoryWrite(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr);
++  // [perf: trace-writer call elision] All the per-buffer / per-packet / per-memory-op trace hooks are
++  // invoked from the CP hot loop and early-out on file_ == nullptr in normal play; inlined here that
++  // early-out folds to a load+branch with no call/ret (see WritePacketStart/End below — the measured
++  // 3.2% win — these others are the same pattern, completed for thoroughness). Behaviour identical.
++  void WritePrimaryBufferStart(uint32_t base_ptr, [[maybe_unused]] uint32_t count) {
++    if (!file_) {
++      return;
++    }
++    PrimaryBufferStartCommand cmd = {
++        TraceCommandType::kPrimaryBufferStart,
++        base_ptr,
++        0,
++    };
++    fwrite(&cmd, 1, sizeof(cmd), file_);
++  }
++  void WritePrimaryBufferEnd() {
++    if (!file_) {
++      return;
++    }
++    PrimaryBufferEndCommand cmd = {
++        TraceCommandType::kPrimaryBufferEnd,
++    };
++    fwrite(&cmd, 1, sizeof(cmd), file_);
++  }
++  void WriteIndirectBufferStart(uint32_t base_ptr, [[maybe_unused]] uint32_t count) {
++    if (!file_) {
++      return;
++    }
++    IndirectBufferStartCommand cmd = {
++        TraceCommandType::kIndirectBufferStart,
++        base_ptr,
++        0,
++    };
++    fwrite(&cmd, 1, sizeof(cmd), file_);
++  }
++  void WriteIndirectBufferEnd() {
++    if (!file_) {
++      return;
++    }
++    IndirectBufferEndCommand cmd = {
++        TraceCommandType::kIndirectBufferEnd,
++    };
++    fwrite(&cmd, 1, sizeof(cmd), file_);
++  }
++  // [perf: trace-writer per-packet call elision] Invoked around EVERY PM4 packet by the CP hot loop.
++  // When not capturing a trace (file_ == nullptr, the normal-play case) they must be free; out-of-line
++  // they cost ~3.2% of CP on-cpu in a heavy combat dip purely in call overhead (cp_oncpu_profile.sh).
++  // Inlined here the file_ null-check folds to a load+branch with no call/ret; behaviour is identical
++  // (same writes when tracing). The header already includes <cstdio> + trace_protocol.h.
++  void WritePacketStart(uint32_t base_ptr, uint32_t count) {
++    if (!file_) {
++      return;
++    }
++    PacketStartCommand cmd = {
++        TraceCommandType::kPacketStart,
++        base_ptr,
++        count,
++    };
++    fwrite(&cmd, 1, sizeof(cmd), file_);
++    fwrite(membase_ + base_ptr, 4, count, file_);
++  }
++  void WritePacketEnd() {
++    if (!file_) {
++      return;
++    }
++    PacketEndCommand cmd = {
++        TraceCommandType::kPacketEnd,
++    };
++    fwrite(&cmd, 1, sizeof(cmd), file_);
++  }
++  void WriteMemoryRead(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr) {
++    if (!file_) {
++      return;
++    }
++    WriteMemoryCommand(TraceCommandType::kMemoryRead, base_ptr, length, host_ptr);
++  }
++  void WriteMemoryReadCached(uint32_t base_ptr, size_t length) {
++    if (!file_) {
++      return;
++    }
++    // HACK: length is guaranteed to be within 32-bits (guest memory)
++    uint64_t key = uint64_t(base_ptr) << 32 | uint64_t(length);
++    if (cached_memory_reads_.find(key) == cached_memory_reads_.end()) {
++      WriteMemoryCommand(TraceCommandType::kMemoryRead, base_ptr, length);
++      cached_memory_reads_.insert(key);
++    }
++  }
++  void WriteMemoryReadCachedNop(uint32_t base_ptr, size_t length) {
++    if (!file_) {
++      return;
++    }
++    // HACK: length is guaranteed to be within 32-bits (guest memory)
++    uint64_t key = uint64_t(base_ptr) << 32 | uint64_t(length);
++    if (cached_memory_reads_.find(key) == cached_memory_reads_.end()) {
++      cached_memory_reads_.insert(key);
++    }
++  }
++  void WriteMemoryWrite(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr) {
++    if (!file_) {
++      return;
++    }
++    WriteMemoryCommand(TraceCommandType::kMemoryWrite, base_ptr, length, host_ptr);
++  }
+   void WriteEdramSnapshot(const void* snapshot);
+   void WriteEvent(EventCommand::Type event_type);
+   void WriteRegisters(uint32_t first_register, const uint32_t* register_values,
+diff --git a/src/graphics/trace_writer.cpp b/src/graphics/trace_writer.cpp
+index 2a35689..870f27b 100644
+--- a/src/graphics/trace_writer.cpp
++++ b/src/graphics/trace_writer.cpp
+@@ -84,111 +84,9 @@ void TraceWriter::Close() {
+   }
+ }
+ 
+-void TraceWriter::WritePrimaryBufferStart(uint32_t base_ptr, uint32_t count) {
+-  if (!file_) {
+-    return;
+-  }
+-  PrimaryBufferStartCommand cmd = {
+-      TraceCommandType::kPrimaryBufferStart,
+-      base_ptr,
+-      0,
+-  };
+-  fwrite(&cmd, 1, sizeof(cmd), file_);
+-}
+-
+-void TraceWriter::WritePrimaryBufferEnd() {
+-  if (!file_) {
+-    return;
+-  }
+-  PrimaryBufferEndCommand cmd = {
+-      TraceCommandType::kPrimaryBufferEnd,
+-  };
+-  fwrite(&cmd, 1, sizeof(cmd), file_);
+-}
+-
+-void TraceWriter::WriteIndirectBufferStart(uint32_t base_ptr, uint32_t count) {
+-  if (!file_) {
+-    return;
+-  }
+-  IndirectBufferStartCommand cmd = {
+-      TraceCommandType::kIndirectBufferStart,
+-      base_ptr,
+-      0,
+-  };
+-  fwrite(&cmd, 1, sizeof(cmd), file_);
+-}
+-
+-void TraceWriter::WriteIndirectBufferEnd() {
+-  if (!file_) {
+-    return;
+-  }
+-  IndirectBufferEndCommand cmd = {
+-      TraceCommandType::kIndirectBufferEnd,
+-  };
+-  fwrite(&cmd, 1, sizeof(cmd), file_);
+-}
+-
+-void TraceWriter::WritePacketStart(uint32_t base_ptr, uint32_t count) {
+-  if (!file_) {
+-    return;
+-  }
+-  PacketStartCommand cmd = {
+-      TraceCommandType::kPacketStart,
+-      base_ptr,
+-      count,
+-  };
+-  fwrite(&cmd, 1, sizeof(cmd), file_);
+-  fwrite(membase_ + base_ptr, 4, count, file_);
+-}
+-
+-void TraceWriter::WritePacketEnd() {
+-  if (!file_) {
+-    return;
+-  }
+-  PacketEndCommand cmd = {
+-      TraceCommandType::kPacketEnd,
+-  };
+-  fwrite(&cmd, 1, sizeof(cmd), file_);
+-}
+-
+-void TraceWriter::WriteMemoryRead(uint32_t base_ptr, size_t length, const void* host_ptr) {
+-  if (!file_) {
+-    return;
+-  }
+-  WriteMemoryCommand(TraceCommandType::kMemoryRead, base_ptr, length, host_ptr);
+-}
+-
+-void TraceWriter::WriteMemoryReadCached(uint32_t base_ptr, size_t length) {
+-  if (!file_) {
+-    return;
+-  }
+-
+-  // HACK: length is guaranteed to be within 32-bits (guest memory)
+-  uint64_t key = uint64_t(base_ptr) << 32 | uint64_t(length);
+-  if (cached_memory_reads_.find(key) == cached_memory_reads_.end()) {
+-    WriteMemoryCommand(TraceCommandType::kMemoryRead, base_ptr, length);
+-    cached_memory_reads_.insert(key);
+-  }
+-}
+-
+-void TraceWriter::WriteMemoryReadCachedNop(uint32_t base_ptr, size_t length) {
+-  if (!file_) {
+-    return;
+-  }
+-
+-  // HACK: length is guaranteed to be within 32-bits (guest memory)
+-  uint64_t key = uint64_t(base_ptr) << 32 | uint64_t(length);
+-  if (cached_memory_reads_.find(key) == cached_memory_reads_.end()) {
+-    cached_memory_reads_.insert(key);
+-  }
+-}
+-
+-void TraceWriter::WriteMemoryWrite(uint32_t base_ptr, size_t length, const void* host_ptr) {
+-  if (!file_) {
+-    return;
+-  }
+-  WriteMemoryCommand(TraceCommandType::kMemoryWrite, base_ptr, length, host_ptr);
+-}
++// WritePrimaryBufferStart/End, WriteIndirectBufferStart/End, WritePacketStart/End, WriteMemoryRead,
++// WriteMemoryReadCached/Nop and WriteMemoryWrite are now inline in trace_writer.h (per-hot-path trace
++// call elision — they early-out on file_==nullptr in normal play). WriteMemoryCommand stays out-of-line.
+ 
+ #if REX_TRACE_USE_SNAPPY
+ class SnappySink : public snappy::Sink {
+-- 
+2.54.0
+

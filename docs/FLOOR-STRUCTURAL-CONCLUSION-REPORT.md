@@ -106,11 +106,13 @@ a heavy dip; DSO = 79 % librexruntime + 13 % RADV + 7 % libc) — the map for an
 - **~3.2 % pure waste — the GPU trace writer**: `TraceWriter::WritePacketStart`/`WritePacketEnd` are called
   per PM4 packet even in normal play. They early-out on `if (!file_) return;` but were **non-inlined**, so the
   per-packet call overhead alone cost ~3.2 % of CP on-cpu for nothing. **Fixed this session (patch 0016):**
-  both bodies moved inline into `trace_writer.h` so the null-check folds to a load+branch with no call/ret.
-  Byte-identical behaviour; `.so`-only; **detdiff gate=pass/equivalent, mid-combat render pixel-correct**.
-  **Validated by re-profile** (`cp_oncpu_profile.sh` on the new `.so` `1dd98fdb`): `WritePacketStart`/
+  moved inline into `trace_writer.h` — first `WritePacketStart`/`WritePacketEnd` (the measured 3.2 %), then
+  extended to all the hot per-buffer / per-memory-op trace hooks (same pattern) for completeness, so the
+  null-check folds to a load+branch with no call/ret. Byte-identical behaviour; `.so`-only; **detdiff gate=
+  pass/equivalent (both the packet-only `.so` `1dd98fdb` and the full set `1a3f6076`), mid-combat render
+  pixel-correct**. **Validated by re-profile** (`cp_oncpu_profile.sh`): `WritePacketStart`/
   `WritePacketEnd` dropped **out of the CP on-cpu top-30 entirely** (were 3.2%, now absent — folded into
-  callers). **Floor A/B** (`ab_both.sh 60 6`): kept median p10 **19.3** vs patch-0016 **19.8** (+0.5, inside
+  callers). **Floor A/B** (`ab_both.sh 60 6`, on the packet-only subset): kept median p10 **19.3** vs **19.8** (+0.5, inside
   the ±2 noise → floor-neutral, no regression; patch-0016's samples never dipped below 19.7 vs kept's 16.4,
   so the heaviest frames are marginally more stable). Kept as a CPU efficiency win (same rationale as the
   audio de-spin). The remaining CP hotspots (register writes ~23 %, descriptors ~7 %) are genuine work, each
