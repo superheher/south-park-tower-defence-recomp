@@ -108,10 +108,18 @@ index ef36b6a..babd005 100644
  
  //=============================================================================
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
-index 6998a45..af1546f 100644
+index 6998a45..4951cd3 100644
 --- a/include/rex/graphics/command_processor.h
 +++ b/include/rex/graphics/command_processor.h
-@@ -37,6 +37,15 @@ class ByteStream;
+@@ -12,6 +12,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <condition_variable>
+ #include <cstring>
+ #include <functional>
+ #include <memory>
+@@ -37,6 +38,15 @@ class ByteStream;
  
  namespace rex::graphics {
  
@@ -127,7 +135,7 @@ index 6998a45..af1546f 100644
  class GraphicsSystem;
  class Shader;
  
-@@ -87,6 +96,9 @@ class CommandProcessor {
+@@ -87,6 +97,9 @@ class CommandProcessor {
  
    uint32_t counter() const { return counter_; }
    void increment_counter() { counter_++; }
@@ -137,13 +145,20 @@ index 6998a45..af1546f 100644
  
    Shader* active_vertex_shader() const { return active_vertex_shader_; }
    Shader* active_pixel_shader() const { return active_pixel_shader_; }
-@@ -270,6 +282,9 @@ class CommandProcessor {
+@@ -270,6 +283,16 @@ class CommandProcessor {
    std::vector<uint32_t> me_bin_;
  
    uint32_t counter_ = 0;
 +  // [recomp fix] Last EVENT_WRITE_SHD GPU-vblank-counter fence target, refreshed each vblank.
 +  uint32_t vblank_fence_addr_ = 0;
 +  xenos::Endian vblank_fence_endian_ = xenos::Endian::kNone;
++  // [recomp fix: block-on-signal] When the CP's WAIT_REG_MEM polls the GPU vblank-counter fence
++  // (vblank_fence_addr_), the value is advanced ONLY by the vsync thread (RefreshVblankFence, 60 Hz)
++  // while the CP is parked here -- so the CP can block on this CV instead of spin-polling it. The
++  // vsync thread notify_all()s it the instant it advances counter_, so the CP wakes promptly at
++  // ~zero CPU. This is the "runtime GPU-fence write-back" the WAIT_REG_MEM comment asks for.
++  std::mutex vblank_fence_mutex_;
++  std::condition_variable vblank_fence_cv_;
  
    uint32_t primary_buffer_ptr_ = 0;
    uint32_t primary_buffer_size_ = 0;
@@ -272,8 +287,27 @@ index 3b8f739..e4bfa97 100644
  /// Initialize SEH signal handlers (POSIX only, no-op on Windows).
  void seh_initialize();
  
+diff --git a/include/rex/thread.h b/include/rex/thread.h
+index 30b207d..9bf4843 100644
+--- a/include/rex/thread.h
++++ b/include/rex/thread.h
+@@ -111,6 +111,14 @@ void MaybeYield();
+ // Memory barrier (request - may be ignored).
+ void SyncMemory();
+ 
++// [recomp fix: block-on-signal] Park the current thread until the next guest vblank (or a short
++// timeout), for use as the long-spin backoff in recompiled guest spin-waits (REX_SPIN_BACKOFF): a
++// guest thread waiting on a GPU/vblank fence (which only advances on a vblank) frees its core instead
++// of pause-spinning. NotifyVblank() is called by the GPU vsync thread (MarkVblank) each vblank to wake
++// parked waiters. The waiter re-checks its guest condition on return, so this changes no guest result.
++void VblankBackoffWait();
++void NotifyVblank();
++
+ // Sleeps the current thread for at least as long as the given duration.
+ void Sleep(std::chrono::microseconds duration);
+ template <typename Rep, typename Period>
 diff --git a/resources/templates/codegen/init_h.inja b/resources/templates/codegen/init_h.inja
-index 8449a0b..40f395e 100644
+index 8449a0b..64ad409 100644
 --- a/resources/templates/codegen/init_h.inja
 +++ b/resources/templates/codegen/init_h.inja
 @@ -9,14 +9,19 @@
@@ -302,15 +336,19 @@ index 8449a0b..40f395e 100644
  #define REX_IMAGE_BASE {{ image_base }}ull
  #define REX_IMAGE_SIZE {{ image_size }}ull
  #define REX_CODE_BASE {{ code_base }}ull
-@@ -36,6 +41,7 @@
+@@ -34,17 +39,56 @@
+ #include <rex/logging.h>
+ #include <rex/chrono/clock.h>
  #include <rex/perf/counter.h>
++#include <rex/thread.h>
  #include <rex/thread/mutex.h>
  #include <rex/system/mmio_handler.h>
 +#include <rex/platform/exceptions.h>  // SEH_TRY/SEH_CATCH_ALL for generate_exception_handlers
  
  #include <atomic>
  #include <cassert>
-@@ -43,8 +49,29 @@
++#include <chrono>
+ #include <csetjmp>
  #include <cstdlib>
  #include <stdexcept>
  #include <string_view>
@@ -332,15 +370,30 @@ index 8449a0b..40f395e 100644
 +#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 +  __builtin_ia32_pause();
 +#endif
++  // After a long spin (the thread has clearly been parked on a cross-thread / GPU condition -- e.g.
++  // the guest Main thread's post-frame GPU vblank-fence wait, which otherwise pegs a host core at
++  // ~5.3 G insn/s), PARK BRIEFLY instead of just yielding. std::this_thread::yield() does NOT
++  // deschedule the thread when it is the only runnable one on its core, so the spinner keeps stealing
++  // CPU from the very threads (CP / render / sim) that will satisfy the wait. A short sleep frees the
++  // core; the guest loop re-checks the same condition on return, so there is NO guest-visible change
++  // -- only the busy-wait stops hogging the core. Short guest locks resolve far below this threshold
++  // (they only ever hit the PAUSE), so they keep their microsecond latency. See FLOOR-OVEREXEC report.
 +  static thread_local unsigned rex_sb_ctr = 0;
-+  if ((++rex_sb_ctr & 0x3FFFu) == 0u) std::this_thread::yield();
++  if ((++rex_sb_ctr & 0x0FFFu) == 0u) {
++    // Park until the next guest vblank (or a 2 ms timeout) instead of just yielding/pausing. A
++    // GPU/vblank fence the guest spins on only advances on a vblank, so parking here frees the host
++    // core for the full inter-vblank gap (vs pause-spinning ~34% of all combat-dip cycles in the
++    // fence predicate) and the guest loop re-checks the same condition on wake -- no guest-visible
++    // change. Short guest locks resolve far below this threshold (they only hit the PAUSE above).
++    rex::thread::VblankBackoffWait();
++  }
 +}
 +#define REX_SPIN_BACKOFF() rex_spin_backoff()
 +
  //=============================================================================
  // Image Info
  //=============================================================================
-@@ -64,6 +91,13 @@ extern PPCFuncMapping PPCFuncMappings[];
+@@ -64,6 +108,13 @@ extern PPCFuncMapping PPCFuncMappings[];
    __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name); \
    REX_EXTERN(__imp__##name)
  
@@ -354,7 +407,7 @@ index 8449a0b..40f395e 100644
  //=============================================================================
  // Function Prologue
  //=============================================================================
-@@ -318,3 +352,9 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
+@@ -318,3 +369,9 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
  
  {% for fn in functions %}DECLARE_REX_FUNC({{ fn.name }});
  {% endfor %}
@@ -932,6 +985,49 @@ index 9fc4763..42d55da 100644
  [[noreturn]] void seh_rethrow() {
    uint32_t code = tls_seh_state.code;
    ULONG_PTR info[2] = {tls_seh_state.info[0], tls_seh_state.info[1]};
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index e10e30b..47e346b 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -16,9 +16,11 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <atomic>
+ #include <array>
+ #include <cerrno>
++#include <condition_variable>
+ #include <cstddef>
+ #include <ctime>
+ #include <deque>
++#include <mutex>
+ #include <limits>
+ #include <memory>
+ 
+@@ -157,6 +159,26 @@ void SyncMemory() {
+   __sync_synchronize();
+ }
+ 
++// [recomp fix: block-on-signal] Global guest-vblank parking signal. A recompiled guest spin-wait on a
++// GPU/vblank fence (the value only advances on a vblank) calls VblankBackoffWait() once it has clearly
++// been spinning a while (REX_SPIN_BACKOFF threshold), parking the thread until the GPU vsync thread's
++// next MarkVblank() -> NotifyVblank(), instead of pause-spinning a host core (measured: the Main
++// thread otherwise burns ~34% of all combat-dip cycles in the fence predicate). The waiter re-checks
++// its guest condition on return, and the 2 ms timeout bounds any lost wakeup, so this can never
++// deadlock and changes no guest-visible result -- it only stops the busy-wait from stealing CPU from
++// the CP/render/sim threads that actually advance the frame.
++namespace {
++std::mutex g_vblank_backoff_mutex;
++std::condition_variable g_vblank_backoff_cv;
++}  // namespace
++
++void VblankBackoffWait() {
++  std::unique_lock<std::mutex> lk(g_vblank_backoff_mutex);
++  g_vblank_backoff_cv.wait_for(lk, std::chrono::milliseconds(2));
++}
++
++void NotifyVblank() { g_vblank_backoff_cv.notify_all(); }
++
+ void Sleep(std::chrono::microseconds duration) {
+   timespec rqtp = DurationToTimeSpec(duration);
+   timespec rmtp = {};
 diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
 index 5cfea05..d8b786f 100644
 --- a/src/core/timer_queue.cpp
@@ -1064,7 +1160,7 @@ index 56f5a97..e39c435 100644
    return entry;
  }
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 60efcd3..7ed8470 100644
+index 60efcd3..fae013e 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,6 +10,7 @@
@@ -1096,7 +1192,7 @@ index 60efcd3..7ed8470 100644
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
  REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
-@@ -406,6 +416,17 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
+@@ -406,6 +416,23 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
    write_ptr_index_event_->Set();
  }
  
@@ -1108,13 +1204,19 @@ index 60efcd3..7ed8470 100644
 +  if (vblank_fence_addr_) {
 +    memory::store(memory_->TranslatePhysical(vblank_fence_addr_),
 +                  GpuSwap(counter_, vblank_fence_endian_));
++    // [recomp fix: block-on-signal] Wake the CP if it is parked in WAIT_REG_MEM on this fence.
++    // We just advanced the value it is waiting for; notify it so it re-checks immediately instead
++    // of burning a core spin-polling (the ~17%-CP-cycles sched_yield wall in a heavy combat dip).
++    // notify_all without holding vblank_fence_mutex_ is fine: the waiter uses a bounded timeout and
++    // re-reads the value in its loop, so a lost wakeup can only delay it by that timeout, never hang.
++    vblank_fence_cv_.notify_all();
 +  }
 +}
 +
  uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
    if (index < RegisterFile::kRegisterCount) {
      return register_file_->values[index];
-@@ -429,8 +450,17 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+@@ -429,8 +456,20 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
  
    // Volatile for the WAIT_REG_MEM loop.
    const_cast<volatile uint32_t&>(regs.values[index]) = value;
@@ -1126,15 +1228,18 @@ index 60efcd3..7ed8470 100644
 +  // command-processor thread -- a per-frame co-bottleneck under combat load.
 +  // Gate the lookup on the log level so the hot path skips it entirely; behavior
 +  // is unchanged when gpu debug logging is enabled.
-+  if (auto* gpu_log = ::rex::GetLoggerRaw(::rex::log::gpu());
-+      gpu_log && gpu_log->should_log(spdlog::level::debug)) {
++  // [perf] Cache the logger pointer: GetLoggerRaw() itself was ~3% of all CP cycles during a combat
++  // dip (called on EVERY register write just to test the debug level). The logger object is stable
++  // for the process, so look it up once; should_log() is a cheap atomic load. Behavior unchanged.
++  static auto* const gpu_log = ::rex::GetLoggerRaw(::rex::log::gpu());
++  if (gpu_log && gpu_log->should_log(spdlog::level::debug)) {
 +    if (!regs.GetRegisterInfo(index)) {
 +      REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
 +    }
    }
  
    // Scratch register writeback.
-@@ -721,6 +751,17 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -721,6 +760,17 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
        assert_always();
        break;
      }
@@ -1152,7 +1257,7 @@ index 60efcd3..7ed8470 100644
    } while (reader.read_count());
  
    OnPrimaryBufferEnd();
-@@ -1068,6 +1109,51 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+@@ -1068,6 +1118,51 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
                                                    uint32_t count) {
    SCOPE_profile_cpu_f("gpu");
  
@@ -1204,18 +1309,26 @@ index 60efcd3..7ed8470 100644
  #ifdef REXGLUE_ENABLE_PERF_COUNTERS
    {
      static uint64_t last_frame_tick = 0;
-@@ -1128,6 +1214,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1128,6 +1223,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
    bool is_memory = (wait_info & 0x10) != 0;
  
    bool matched = false;
 +  uint32_t spin_count = 0;  // [diag] detect a WAIT_REG_MEM that never satisfies
++  // [recomp fix: block-on-signal] Wall-clock start of CP-vblank-fence blocking, for a deadlock
++  // backstop independent of the CV timeout granularity (0 = not yet blocking on the fence CV).
++  uint64_t cv_block_start_tick = 0;
    do {
      uint32_t value = 0;
      if (is_memory) {
-@@ -1169,21 +1256,56 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1169,22 +1268,81 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
          break;
      }
      if (!matched) {
+-      // Wait.
+-      if (wait >= 0x100) {
+-        PrepareForWait();
+-        if (!REXCVAR_GET(vsync)) {
+-          // User wants it fast and dangerous.
 +      // [diag] Surface a stuck WAIT_REG_MEM: log poll target + live value once it
 +      // has clearly failed to satisfy, then periodically to see if it ever moves.
 +      // Only log fences that exceed the fast-poll budget (genuinely slow); fences resolving within
@@ -1232,54 +1345,76 @@ index 60efcd3..7ed8470 100644
 +      // fence deadlock). After a large spin budget, proceed anyway -- in the stuck cases the GPU
 +      // work it gates is already complete. Verify post-reboot; the real fix is runtime GPU-fence
 +      // write-back. See knowledge-base/titles/south-park-lgtdp/60-boot-present-deadlock.md.
-+      if (spin_count > 500000u) {
++      // [recomp fix: block-on-signal] The CV-blocking path below sleeps up to a few ms per spin, so
++      // the spin_count==500k backstop (≈1 s of fast-poll) would take many minutes to trip. Add a
++      // wall-clock deadline so a fence that genuinely never resolves still escapes in ≈1 s, matching
++      // the fast-poll backstop. counter_ is advanced every vblank, so a vblank-fence wait virtually
++      // always resolves; this only guards the pathological hang.
++      bool cv_escape = cv_block_start_tick != 0 &&
++                       (rex::chrono::Clock::QueryHostTickCount() - cv_block_start_tick) >
++                           rex::chrono::Clock::QueryHostTickFrequency();
++      if (spin_count > 500000u || cv_escape) {
 +        REXGPU_WARN(
 +            "WAIT_REG_MEM escape: proceeding after {} spins (poll=0x{:08X} func=0x{:X} "
 +            "ref=0x{:08X} mask=0x{:08X})",
 +            spin_count, poll_reg_addr, wait_info & 0x7, ref, mask);
 +        break;
 +      }
-       // Wait.
-       if (wait >= 0x100) {
--        PrepareForWait();
--        if (!REXCVAR_GET(vsync)) {
--          // User wants it fast and dangerous.
-+        // [recomp fix] Fast-poll (memory sync + yield, NO 1 ms sleep) for a short budget before
-+        // falling back to sleeping. The original slept ~1 ms on every unmatched poll, so a fence
-+        // that takes many polls to resolve makes the CP crawl and fall far behind the guest's frame
-+        // pacing -> the guest's post-frame fence wait never sees the CP catch up (the boot intro
-+        // freeze after the first presented frame). MaybeYield lets the guest thread run to write the
-+        // fence and lets the CP be rescheduled immediately, so fast fences resolve in microseconds
-+        // and the CP keeps step. Same waits, just not throttled -> rendering stays correct.
-+        if (spin_count < 8000u) {
++      // [recomp fix: block-on-signal -- the "runtime GPU-fence write-back" the WAIT_REG_MEM comment
++      // asks for] In a heavy combat dip the CP pegs a core spin-polling this fence (~37% of cycles,
++      // ~17% of them in the sched_yield of the old fast-poll) while the guest sim/render threads
++      // starve -> the frame quantizes to 60/N. The awaited fences resolve only at vblank cadence:
++      // the vblank-counter fence is advanced by the vsync thread (RefreshVblankFence, 60 Hz), and
++      // the EOP "cleared-to-0" fence (the combat poll 0x..C9B004, func=equal ref=0) is cleared by
++      // the guest *after* the vsync tick wakes its own frame loop. So a CP parked here can only make
++      // progress on a vsync tick. Therefore: after a brief pure-pause poll (catch sub-~100us fences
++      // with no syscall and no core release), BLOCK on the fence CV. RefreshVblankFence
++      // notify_all()s it every vsync tick and a short timeout re-reads the value (the do-while), so
++      // a parked CP wakes at ~zero CPU within a vsync (or the 1 ms timeout), never deadlocks
++      // (counter_ always advances; worker_running_ and the wall-clock escape are backstops), and the
++      // freed core goes to the guest's real work -> lifts the floor. Replaces the old 8000x
++      // sched_yield fast-poll (the kernel wall) + 1 ms Sleep fallback.
++      if (REXCVAR_GET(vsync) && wait >= 0x100) {
++        if (spin_count < 512u) {
++          // Brief tight poll: pure x86 PAUSE, NO sched_yield syscall -> genuinely-fast fences still
++          // resolve in microseconds without parking, and this alone removes the ~17% kernel wall.
 +          rex::thread::SyncMemory();
++#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
++          __builtin_ia32_pause();
++#else
            rex::thread::MaybeYield();
++#endif
          } else {
 -          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
--        }
--        rex::thread::SyncMemory();
--        ReturnFromWait();
++          if (cv_block_start_tick == 0) {
++            cv_block_start_tick = rex::chrono::Clock::QueryHostTickCount();
++          }
 +          PrepareForWait();
-+          if (!REXCVAR_GET(vsync)) {
-+            // User wants it fast and dangerous.
-+            rex::thread::MaybeYield();
-+          } else {
-+            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
++          {
++            std::unique_lock<std::mutex> lk(vblank_fence_mutex_);
++            vblank_fence_cv_.wait_for(lk, std::chrono::milliseconds(1));
 +          }
 +          rex::thread::SyncMemory();
 +          ReturnFromWait();
- 
--        if (!worker_running_) {
--          // Short-circuited exit.
--          return false;
 +          if (!worker_running_) {
 +            // Short-circuited exit.
 +            return false;
 +          }
          }
++      } else if (wait >= 0x100) {
++        // vsync off: keep the original fast-and-dangerous tight poll (user opted out of pacing).
+         rex::thread::SyncMemory();
+-        ReturnFromWait();
+-
+-        if (!worker_running_) {
+-          // Short-circuited exit.
+-          return false;
+-        }
++        rex::thread::MaybeYield();
        } else {
          rex::thread::MaybeYield();
-@@ -1347,7 +1469,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+       }
+@@ -1347,7 +1505,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
    // Writeback initiator.
    WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
    uint32_t data_value;
@@ -1289,7 +1424,7 @@ index 60efcd3..7ed8470 100644
      // Write counter (GPU vblank counter?).
      data_value = counter_;
    } else {
-@@ -1356,6 +1479,15 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+@@ -1356,6 +1515,15 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
    }
    auto endianness = static_cast<xenos::Endian>(address & 0x3);
    address &= ~0x3;
@@ -1306,10 +1441,10 @@ index 60efcd3..7ed8470 100644
    memory::store(memory_->TranslatePhysical(address), data_value);
    trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 3877b1a..b147398 100644
+index 3877b1a..677283d 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
-@@ -332,6 +332,10 @@ void GraphicsSystem::MarkVblank() {
+@@ -332,7 +332,16 @@ void GraphicsSystem::MarkVblank() {
    // Increment vblank counter (so the game sees us making progress).
    if (command_processor_) {
      command_processor_->increment_counter();
@@ -1318,8 +1453,14 @@ index 3877b1a..b147398 100644
 +    // where the guest waits forever for the counter target the fence was never refreshed to).
 +    command_processor_->RefreshVblankFence();
    }
++  // [recomp fix: block-on-signal] Wake any guest thread parked in REX_SPIN_BACKOFF's
++  // VblankBackoffWait() on its GPU/vblank-fence spin: we just advanced the vblank counter / fence, so
++  // its wait may now be satisfied. This lets the guest Main thread BLOCK on the fence (freeing its
++  // core) instead of pause-spinning ~34% of all combat-dip cycles in the fence predicate.
++  rex::thread::NotifyVblank();
  
    // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
+   //     something wrong and the CP will block waiting for code that
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
 index c7c824e..e17dd2f 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
@@ -1667,6 +1808,33 @@ index 333becb..e06de3d 100644
      dirty_blocks_mask |= uint32_t(1) << (i >> 6);
    }
    gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index a40436e..de3a8c9 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -2137,6 +2137,22 @@ void VulkanCommandProcessor::ShutdownContext() {
+ }
+ 
+ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
++  // [perf] Skip unchanged float / bool / loop shader-constant writes. These registers are PURE GPU
++  // state with no write side effect, so re-writing the value the register already holds is a no-op
++  // for the base store AND for the constant-buffer dirty-mark below (the GPU already has it). Heavy
++  // combat re-sets large constant ranges every draw, much of it identical, and WriteRegister was the
++  // single hottest CP function during a dip (~11% of all cycles) -- so skipping the redundant ones
++  // cuts real PM4->Vulkan translation time (the measured combat-floor bottleneck). The fetch-constant
++  // range is intentionally NOT short-circuited: its writes have side effects (texture cache /
++  // vertex-buffer residency invalidation) that must run even on an unchanged value.
++  if (index < RegisterFile::kRegisterCount &&
++      ((index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
++       (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
++        index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31)) &&
++      register_file_->values[index] == value) {
++    return;
++  }
++
+   CommandProcessor::WriteRegister(index, value);
+ 
+   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
 index 91ac08f..8b98d5e 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
