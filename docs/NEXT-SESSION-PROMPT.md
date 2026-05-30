@@ -23,11 +23,17 @@
 ## The ONLY remaining theoretical lever (and why it needs YOU present)
 **Draw-call batching / CP-translate reduction.** A heavy 2-vbl frame ≈ guest-logic(~16 ms) + CP-render(~17 ms),
 serial, GPU idle. In the **deep 15 fps dip** (4 vbl/66 ms, render ~34 ms), *halving* the CP render could
-reach < 50 ms ⇒ 20 fps (+5 swaps — a real boundary cross). It is the one lever with headroom. BUT it is a
-large, risky change (coalescing draws / cutting `radv_UpdateDescriptorSets` ~7.5% / descriptor-set re-bind
-elision); a subtle bug corrupts combat rendering and the detdiff gate may not catch a wrong-state glitch.
-**Do this only with the user available to eyeball mid-combat rendering**, and gate hard. Even then it only
-*might* cross one boundary; it will not reach 60 fps.
+reach < 50 ms ⇒ 20 fps (+5 swaps — a real boundary cross). **MEASURED HEADROOM (`drawstream_probe.sh`,
+heavy 15fps dip): ~1700 draws/FRAME, ~240 pipeline-changes/frame ⇒ batch_ratio ≈ 7** (avg run of 7
+consecutive same-pipeline draws; max ~1750 draws/frame). So the CP records ~1700 draws + their descriptor
+updates per heavy frame — collapsing the same-pipeline runs (instancing / dynamic-indexed textures) could
+cut the draw count up to ~7× and is a genuine, large lever (this REFUTES an earlier "per-sprite textures ⇒
+not batchable" guess — the runs are real). The likely biggest source is per-glyph/per-sprite text+UI draws
+(same font pipeline). NEXT STEP for a supervised session: instrument descriptor/texture changes WITHIN the
+same-pipeline runs to find the *achievable* batch size (same-pipeline ≠ same-texture), then batch the
+same-texture runs first (trivially instanceable). BUT it is a large, risky change; a subtle bug corrupts
+combat rendering and the detdiff gate may not catch a wrong-state glitch. **Do this with the user available
+to eyeball mid-combat rendering**, gate hard, and verify across several combat states.
 
 ## Constructive work that IS achievable
 1. **Fresh-install transient smoothness** (the OTHER lag regime): on a cold machine the first playthrough

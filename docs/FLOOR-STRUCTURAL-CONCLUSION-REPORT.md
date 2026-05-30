@@ -84,9 +84,13 @@ the game's own per-frame work.
 A heavy 2-vblank frame ≈ 33 ms = guest-logic (~16 ms) + render (~17 ms), serial; the GPU is idle, so
 "render" is CP translate + handshake (CPU), not GPU. To cross **one** vblank boundary you must cut **≥16 ms**:
 - 33 ms → < 16.6 ms (60 fps) needs render → ~0 (impossible; the CP must translate the draws).
-- 66 ms (deep dip) → < 50 ms (20 fps) needs ~16 ms off; halving the render (~34→17) *might* reach it, but
-  draw-batching is a large, risky change and the GPU-idle data says the bottleneck is CP-serial + the
-  round-trip, not GPU.
+- 66 ms (deep dip) → < 50 ms (20 fps) needs ~16 ms off; halving the render (~34→17) *might* reach it via
+  **draw-call batching** — and `drawstream_probe.sh` (heavy 15fps dip) measured **~1700 draws/frame with
+  ~240 pipeline-changes ⇒ batch_ratio ≈ 7** (runs of ~7 consecutive same-pipeline draws; max ~1750/frame),
+  so there IS real batching headroom (collapsing the runs could cut the draw count + its per-draw descriptor
+  work up to ~7×). This refutes the earlier "per-sprite textures ⇒ not batchable" guess. BUT it is a large,
+  risky change (instancing / dynamic-indexed textures; same-pipeline ≠ same-texture so the *achievable*
+  batch is a subset), and it needs the user present to verify mid-combat rendering — see NEXT-SESSION-PROMPT.
 - The guest logic and render **cannot be overlapped**: the guest is single-threaded fixed-timestep and
   waits (sub_821B9270) for its own render before the next frame.
 
