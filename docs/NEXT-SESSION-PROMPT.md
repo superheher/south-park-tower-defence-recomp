@@ -1,141 +1,97 @@
-# South Park recomp — next-session runbook: the combat floor is GUEST OVER-EXECUTION (busy-waits /
-# frame-sync spin-polling), NOT the CPU. The remaining floor fix is runtime GPU-fence write-back.
+# South Park recomp — next-session LAUNCH PROMPT: fix the combat-floor drops = runtime GPU-fence write-back
 
-> **⚠ THIS SUPERSEDES ALL PRIOR "the floor is a CPU/codegen limit" FRAMINGS** (front-end-capacity,
-> back-end-bound, etc. — all were measuring the cost of a SPIN LOOP, not a real bottleneck). The
-> 2026-05-30 session, prompted by the user's killer data point (**Sonic Unleashed Recompiled, a full 3D
-> game, runs great on this SAME machine while our 2D TD drops hard**), proved the floor is **guest
-> OVER-EXECUTION**: the Main thread burns **5.3 G instr/s even while PAUSED** (`tools/perf/pausetest.sh`,
-> 99% of running). There are **three busy-wait layers**; two are fixed, the third IS the floor. Read
-> `docs/FLOOR-OVEREXEC-REPORT.md` first, plus memory `sp_floor_overexec`. The big lesson: **do NOT do
-> codegen/µop/layout work for the floor — it's a spin, not compute.**
+> **THE FLOOR IS GUEST OVER-EXECUTION (busy-waits / frame-sync spin-polling), NOT the CPU.** Proven
+> 2026-05-30 (`tools/perf/pausetest.sh`): the guest-sim (Main) thread burns **5.3 G instr/s even while the
+> game is PAUSED** (99% of running). Triggered by the user's killer data point — **Sonic Unleashed
+> Recompiled (a full 3D game) runs great on this SAME i9 while our 2D tower-defense drops hard.** So the
+> CPU is plenty fast; we *waste* it spinning. **READ FIRST:** `docs/FLOOR-OVEREXEC-REPORT.md` + memory
+> `sp_floor_overexec`. **BIG LESSON: do NOT do codegen / µop / layout / flag work for the floor** — that's
+> all measuring the cost of a spin loop (every such lever, 6 prior sessions, was floor-neutral; see DEAD
+> ENDS). The lever is making the spins **block on a signal** instead of polling.
 
-## The 3 over-execution layers (see the report for detail)
-1. ✅ FIXED — Main thread guest spin on the GPU vblank fence (`sub_821C6E58`/`sub_821B9270`); the Xenon
-   spin idiom `cctpl`/`db16cyc`/`cctpm` was no-op'd. Now `db16cyc`→`REX_SPIN_BACKOFF()` (pause + periodic
-   yield): −25× insn-rate, gate PASS.
-2. ✅ FIXED — Timer thread `spin_wait_strategy` (16.6% of all cycles) → `blocking_wait_strategy` (+ a
-   disruptorplus arg-order bugfix); gate PASS.
-3. 🔎 THE FLOOR — GPU CommandProcessor spin-polls `WAIT_REG_MEM` (`command_processor.cpp` ~1230) with
-   `sched_yield` syscalls (~17% of CP cycles in kernel), AND the Main thread spins on the GPU fence; the
-   frame quantizes to vblank (p10 ≈ 15 = 60/4). GPU HW is 17–26% IDLE + libvulkan 2.4% ⇒ NOT GPU-bound.
-
-## Goal / the real lever
-Lift the combat floor. **The fix is runtime GPU-fence write-back** (the SDK's own stated fix,
-`command_processor.cpp:1273`): when the Vulkan GPU work that a WAIT_REG_MEM / the guest post-frame fence
-gates completes, write the awaited value to guest memory/register promptly (via a Vulkan
-fence/semaphore-completion hook) so both waits resolve on a SIGNAL instead of spin-polling. Moderate,
-RISKY rework (the pacing area has had fixes tried+reverted — validate the boot present/vsync path hard).
-Cheaper partial first: WAIT_REG_MEM fast-poll `sched_yield`-per-spin → `_mm_pause` + periodic yield
-(cut the ~17% CP kernel overhead). Also check the Audio Worker (13.6% mutex-spin = likely 4th busy-wait).
-Verify any fix with `pausetest.sh` (insn-rate must stay low) + `ab.sh` floor + detdiff gate.
-
----
-# (ARCHIVED below: the prior front-end-capacity runbook — kept for the dead-end list only; its
-#  "floor is a CPU limit" premise is WRONG per above. The arch-flags/rlwinm/nonvol/ThinLTO/HT/OS
-#  dead-ends remain valid as "don't retry codegen for the floor".)
-
-> Prior header: "the combat floor is FRONT-END-DELIVERY + RETIRING bound" — measured the spin, not a wall.
-> See `docs/FLOOR-FRONTEND-REBASELINE-REPORT.md` / memory `sp_floor_frontend_bound` for those (now-moot
-> for the floor) codegen dead-ends.
+## The three over-execution layers (two FIXED this session, the third IS the floor)
+1. ✅ **FIXED — Main thread guest spin on the GPU vblank fence.** `sub_821C6E58` (back-edge guest
+   `0x821C6F10`) polls a guest-memory word the GPU command-processor advances via `EVENT_WRITE_SHD`,
+   calling predicate `sub_821B9270`. The guest's Xenon spin idiom `cctpl`(prio-low)/`db16cyc`(backoff)/
+   `cctpm` was emitted as **no-ops** → it spun at full speed/priority. Fix: `build_db16cyc`
+   (`builders/system.cpp`) now emits `REX_SPIN_BACKOFF()` (helper in `init_h.inja` = x86 `pause` + a
+   periodic `std::this_thread::yield`). **−25× insn-rate** (5.3→0.2 G/s), detdiff gate PASS, floor-neutral.
+2. ✅ **FIXED — Timer thread busy-spin.** `TimerQueue::TimerThreadMain` was **16.6% of ALL CPU cycles**
+   spinning in disruptorplus `spin_wait_strategy`. Fix: `core/timer_queue.cpp` → `blocking_wait_strategy`
+   (+ fixed a real arg-order bug in `thirdparty/disruptorplus/.../blocking_wait_strategy.hpp`:
+   `wait_until(lock, pred, time)` → `(lock, time, pred)`). Gate PASS.
+3. 🔎 **THE FLOOR (your task) — GPU CommandProcessor spin-polls `WAIT_REG_MEM` + Main spins on the fence.**
+   In a heavy dip: Main thread 42% of cycles (pausing on the fence) + **GPU CP 37% pegged on a core**, of
+   which ~19.7% is user PM4 parse/`WriteRegister` and **~17% is kernel `sched_yield` syscalls** from
+   `ExecutePacketType3_WAIT_REG_MEM` (`command_processor.cpp` ~1230: while unmatched, up to 8000×
+   `SyncMemory()`+`MaybeYield()`=`sched_yield`, then `Sleep`). **GPU HARDWARE is 17–26% IDLE, libvulkan
+   2.4%** ⇒ NOT GPU-bound. It's **CPU-side frame synchronization done as MUTUAL SPIN-POLLING**, and the
+   frame quantizes to vblank (floor p10 ≈ 15 = 60/4; 20 = 60/3; 30 = 60/2). This is the "sinusoid" pacing.
 
 ## Where we are
 Static recompilation (rexglue-sdk) of South Park: Let's Go Tower Defense Play! (XBLA) → native
 Linux/Vulkan, fully playable (boot→match→win). Repo `/home/h/src/recomp/rexglue-recomps` (super, `main`)
-+ submodule `south-park-recomp` (port, `main`). SDK edits = working-tree patch
-`patches/rexglue-sdk-current-full.patch`. Identity `superheher <heh@vivaldi.net>`, on `main`, **NO
-Co-Authored-By trailer**, **commit, do NOT push** unless asked. Host: i9-8950HK (6c/12t, HT siblings
-0/6…5/11, ~12 MB L3, ~1.5K-uop DSB, ~4K-entry BTB), governor=performance, sudo `<redacted>`, disposable bench.
++ submodule `south-park-recomp` (port, `main`). **SDK edits = working-tree patch
+`patches/rexglue-sdk-current-full.patch`** (the SDK submodule is kept dirty; regenerate the patch with
+`git -C ../third_party/rexglue-sdk diff > patches/rexglue-sdk-current-full.patch` before committing).
+Identity `superheher <heh@vivaldi.net>`, on `main`, **NO Co-Authored-By trailer**, **commit, do NOT push**
+unless asked. Host: i9-8950HK (6c/12t), governor=performance, sudo `<redacted>`, disposable bench.
 
-**Best-known-good (UNCHANGED — no lever this session was worth keeping):** `south_park_td` md5
-`bef1b65c` (`-mcmodel=medium`, `.text` 18,653,832), `librexruntime.so` md5 `47323bf2`
-(`-mcmodel=medium`). Floor p10 ≈ 15.1 on `ab.sh 90 5` (deep-dip windows).
+**Current working binary (= the 2 fixes above, gate PASS, over-execution hugely reduced, floor still ~15):**
+`south_park_td` md5 **`d4b0f50b`**, `librexruntime.so` md5 **`605ce3ee`** — staged as
+`out/build/linux-amd64-release/south_park_td.bothfix` + `librexruntime.so.bothfix`. The PRE-fix BKG (for
+A/B base) is `south_park_td.mcmodel_medium` (`bef1b65c`) + `librexruntime.so.so_medium` (`47323bf2`).
+Floor p10 ≈ 15 (= 60/4) on `ab.sh 90 5`.
 
-## The settled diagnosis (MEASURED, not inferred)
-The Main/guest-sim thread during heavy combat (topdown.sh): **Frontend 39 % + Retiring 50 %**, Backend
-10 %, mem-stall 9.8 %, **L1 hit 99.9 %**, **uop source 87 % MITE / 13 % DSB**, uops_executed ≈ 2.5/4
-(back-end has spare capacity). `perf annotate` of the #1 hot fn `sub_821B9270` (12–16 %): cycles
-**smeared ~evenly across ~35 instructions** incl. trivial ones & branches = the front-end-starvation
-signature; **~21 % of it is ctx-struct loads/stores** (`%r14`-relative guest-register traffic).
-The 39 % front-end decomposes (resteer.sh, current BKG) into **three Coffee-Lake CAPACITY walls**, none
-codegen-reducible: **(a) BTB capacity** — BACLEARS 3.56 B fetch-resteers (4 K-entry BTB can't cover
-~157 K branch sites); **(b) RSB capacity** — returns mispredict **~22 %** (448 M of 598 M total
-mispredicts; conditional only 2 %, near_call 6 % post-mcmodel) because the 16-entry return-stack-buffer
-overflows on combat's deep guest call chains (guest `blr` IS a clean host `ret`, tail-calls ARE TCO'd —
-this is *not* a codegen defect); **(c) DSB capacity** — 87 % MITE (1.5 K-µop uop-cache too small).
-**Why every lever (this + prior session) is neutral:** all attack code size / layout / per-insn count,
-but the binding limits are the *count* of branches/calls/stack-depth the hot path touches, which exceeds
-this CPU's front-end structures — and you can't reduce that without deleting guest control flow. clang -O3
-already minimizes per-insn codegen; the only reducible *retiring* bulk is ctx-register traffic (~21 %),
-which is SEH/ABI-blocked AND wouldn't touch the BTB/RSB walls.
+## THE TASK — runtime GPU-fence write-back (lift the floor)
+The SDK's own comment states the fix (`command_processor.cpp:1273`): *"the real fix is runtime GPU-fence
+write-back."* Concretely: the guest's `WAIT_REG_MEM` packets and its post-frame fence wait (the Main-thread
+spin, layer 1) are GPU→CPU sync points — the guest waits for the GPU to finish work / reach a vblank. On
+real Xenon the GPU writes those values and the waits resolve on hardware. In our recomp the awaited values
+are written **late / only via polling fallbacks**, so both sides spin. **Make the Vulkan side SIGNAL them
+promptly:**
+- When the Vulkan work that a fence gates COMPLETES (Vulkan fence/semaphore/timeline-semaphore completion,
+  or queue-submit callback), **write the awaited guest value to guest memory/register immediately** so the
+  CP's `WAIT_REG_MEM` poll and the Main thread's fence wait see it at once and exit. Wire it to a host
+  condition variable so the waiters BLOCK and wake on signal instead of polling.
+- Key code to study: `ExecutePacketType3_WAIT_REG_MEM` (~1230), `RefreshVblankFence` (~419) + `MarkVblank`,
+  `ExecutePacketType3_EVENT_WRITE_SHD` (~1469, where `counter_` is the fence written), the `vblank_fence_*`
+  machinery (~1474-1490), and `XE_SWAP` present pacing (~1108). The vblank counter the guest polls must
+  advance at a steady 60 Hz independent of present (RefreshVblankFence already tries to push it "between"
+  EVENT_WRITE points — check it actually fires often/steadily enough).
+- **CHEAPER PARTIAL TO TRY FIRST (low-risk, bounded):** in the `WAIT_REG_MEM` fast-poll, replace the
+  per-spin `sched_yield` (`MaybeYield`) with `_mm_pause()` + a *periodic* yield (e.g. every 64 spins). This
+  cuts the ~17% CP kernel overhead without the big rework; measure if it lifts the floor at all. Also: the
+  **Audio Worker thread was 13.6% of cycles in `pthread_mutex_trylock`** = a likely **4th busy-wait** worth
+  a look (the SDL/XAudio mixer spinning on a mutex).
+- **Reference (research lead):** how XenonRecomp / Unleashed Recompiled (hedge-dev) map guest GPU fences /
+  vsync to host blocking — that's the known-good pattern this game's recomp is missing.
 
-## Goal
-Move the combat-floor p10. **Keep-bar: detdiff gate PASSES, boots, median p10 > +1.0 swaps/s on
-`ab.sh` (≥5 reps).** The honest assessment after 6 sessions: on THIS i9-8950HK the floor (~15 p10) is at
-the front-end **capacity** limit for this recompilation approach; no codegen/layout/flag/LTO lever moves
-it. The two remaining moves, in priority:
+## RISK / validation discipline (mandatory — the present/vsync path is fragile)
+This is the pacing area where fixes have been "tried + reverted" and where a boot present/vsync **deadlock**
+once froze the CP forever (see `knowledge-base/titles/south-park-lgtdp/60-boot-present-deadlock.md` + the
+`[recomp fix]`/`[recomp stop-gap]` comments around WAIT_REG_MEM). So:
+- `tools/perf/detdiff.sh gate <label> 40` must be `status=pass` (ranks above fps). Then a **long playable
+  soak** (boot→match→win, not just the 40s harness) — a missed fence wakeup deadlocks the CP.
+- `tools/perf/pausetest.sh <label>` — the over-execution detector: the Main-thread (and ideally CP-thread)
+  insn-rate must STAY LOW / collapse if the spin is now blocking. This is the decisive "did it work" signal.
+- Floor A/B: `bash /tmp/sp/bothfix_ab.sh 6` style (swaps BOTH exe+so since a fix may touch both); base =
+  `bef1b65c`+`47323bf2`, cand = the new build. **Keep-bar: median p10 > +1.0 swaps/s, ≥5 heavy reps.**
+- `tools/perf/regen_build.sh full` after an SDK change (rebuilds the .so + regenerates + builds the exe).
+- HOST GOTCHAS: (a) the harness BLOCKS a literal `sleep` token in a Bash command string → put waits in a
+  SCRIPT FILE and run `bash tools/perf/<x>.sh`; (b) the game is reaped when its launching shell ends → boot
+  AND measure in ONE script; (c) ONE game instance only; (d) `gamectl kill` auto-cleans the /dev/shm leak.
 
-## P1 (DO FIRST) — Cross-CPU check (cheap, decisive, no code change)
-Run the SAME `bef1b65c`+`47323bf2` binary's `ab.sh 90 5` + `resteer.sh` on a Zen4 / recent-Core desktop
-(far larger BTB, deeper RSB, bigger op-cache). If it floors **materially higher** → the floor is
-this-CPU-front-end-capacity-bound, **not a recompiler defect** (the "it's an i9, absurd" intuition —
-answer is "newer CPU"), and further in-tree codegen work is pointless. If it floors the **same** → the
-bound is guest-work volume and only P2 can help. This host can't self-test; needs a second machine.
-
-## P2 (large, partial, blocked) — GPR-as-local + SEH state-save redesign
-Keep guest GPRs in host **locals** instead of the ctx struct → cuts the ~21 % ctx *retiring* traffic +
-shrinks code. CAVEAT: it attacks the **Retiring** half, NOT the BTB/RSB capacity walls (branch/call
-*count*), so it's **partial** — and the prior cr/xer/ctr-as-local (−16 % .text) was already floor-neutral,
-cautioning that even a big size/retiring cut may not move this capacity-bound floor. Also refuted by a
-**boot crash** (setjmp/longjmp SEH restores guest state from ctx; `(ctx,base)` ABI passes args via ctx) →
-needs locals↔ctx sync only at setjmp/landing-pad/call-arg points. Real multi-session engineering; only
-worth it if the cross-CPU check shows the i9 is the outlier AND retiring is confirmed to matter. If you
-attempt it, do NOT leave the tree half-changed — it boot-crashes when partial. Measure with `topdown.sh`
-(Frontend % + uops/insn must DROP) + `uops.sh`, not just fps. See `sp_aslocal_plan`/`sp_gpr_aslocal_nogo`.
-
-## DEAD ENDS — do NOT re-try (MEASURED this session + prior)
-- **Arch flags `-mmovbe -mbmi -mbmi2 -mlzcnt -mpopcnt` on the exe:** RAISES Main-thread uops +10 %
-  (movbe forces byteswaps clang had elided for eq-compares/store-back, and defeats load-folding into
-  ALU ops). `tools/perf/uops.sh` proved it. Wrong direction.
-- **rlwinm/rlwnm/rlwimi shift-mask special-casing:** ZERO headroom — clang -O3 already canonicalizes
-  `rotl64(dup)&mask` to identical `shl`/`shr`/`and` asm (micro-tested). Same for CR-fusion, dest-width,
-  and addressing-fuse levers — all optimizer-redundant.
-- **Non-volatile guest RAM** (drop `volatile` from REX_LOAD/STORE): neutral perf (hot-fn instruction
-  count *rose*; guest loads rarely provably-alias so little CSE) AND **fails the gate** (sync/lwsync/
-  eieio are no-ops, so volatile is the only barrier; removal hoists polling loads → boot/nav hang).
-  The proper non-volatile+`atomic_signal_fence`-at-sync version would boot but perf is still neutral.
-- **ThinLTO on the exe** (`-flto=thin`): cross-TU inlining of the hot mid-size call chain works +
-  gate-passes, but floor-neutral (+0.3 over 8 reps = within noise) at +5.2 % .text + slower build.
-  Same branch-removal-vs-code-growth wash as leaf-inline. Only useful for avg-smoothness, not the floor.
-- **HT contention:** REJECTED — `affinity_test.sh` no-HT (6 physical cores) vs default (12 logical) is
-  neutral-to-worse (−0.8). The 39 % front-end is the code's own MITE starvation, not a stolen sibling
-  front-end. TimerThread's 17 % CPU is wasteful but runs on spare cores; doesn't gate the floor.
-- **Switching OS (Win10/macOS) / disabling mitigations:** REJECTED (research + on-machine). BTB/RSB/DSB are
-  fixed silicon (OS-independent); IBRS is cleared in user-space + "RSB filling" is per-context-switch not
-  per-syscall, so mitigations don't touch the guest-sim thread's prediction; `uksplit.sh` measured the
-  Main thread at **97.9 % user / 2.1 % kernel** → `mitigations=off` upper bound ≤ ~2 % (won't clear +1.0).
-  Win codegen is worse (`REX_PHYS_HOST_OFFSET` per access); macOS needs MoltenVK + a big port. Only the
-  cross-CPU check (P1) is worth it. (Cheapest falsification: `mitigations=off` cmdline + reboot + ab.sh.)
-- **All prior front-end/layout levers** (mcmodel done+kept, leaf-inline, PGO, BOLT/ICF/AS_LOCAL/
-  outliner): floor-neutral. They don't reduce host-instruction count or fit the DSB.
-
-## Discipline (mandatory)
-- `detdiff.sh gate <label> 40` must be `status=pass`. Ranks above fps.
-- Floor A/B: `TARGET=$GAME/south_park_td tools/perf/ab.sh 90 5 base south_park_td.mcmodel_medium cand
-  <new>` (≥5 reps; floor noise large + boot-flakes ~⅓, run enough). `.so` change → `TARGET=$GAME/librexruntime.so`.
-- For any codegen change: characterize with `tools/perf/topdown.sh` (the bottleneck-class re-baseline),
-  `uops.sh` (Main-thread uops/insn + DSB-vs-MITE), and `annotate.sh` (per-insn cycles). **resteer/DSB
-  wins ≠ floor wins** (proven). The metric that matters now: **Frontend % and Main-thread uops/insn DOWN.**
-- `regen_build.sh full` after a codegen/emitter change; `regen_build.sh port` after a header/flag-only
-  change (faster). HOST GOTCHAS: (a) harness BLOCKS a literal `sleep` token in a Bash string → waits go
-  in script files; (b) game reaped when its launching shell ends → boot+measure in ONE script;
-  (c) ONE game instance only; (d) `gamectl kill` auto-cleans the /dev/shm leak; (e) `bash tools/perf/<x>.sh`.
+## DEAD ENDS — do NOT retry CODEGEN for the floor (it's a spin, not compute; all measured neutral)
+arch-flags (`-mmovbe…`, +10% uops), rlwinm/CR/width special-casing (clang already optimal), non-volatile
+RAM (↑insns + fails gate), ThinLTO (+0.3 = noise), HT-contention (−0.8), OS-switch / `mitigations=off`
+(≤~2%, BTB/RSB/DSB are fixed silicon), GPR-as-local (SEH-blocked + the −16%-.text as-local was neutral),
+mcmodel/leaf-inline/PGO/BOLT/ICF/outliner (all floor-neutral). Full detail + measurements:
+`docs/FLOOR-FRONTEND-REBASELINE-REPORT.md` (the now-MOOT-for-floor codegen rebaseline) + its memos. These
+remain valid as "codegen can't move the floor" — the floor was a spin all along.
 
 ## Tools (tools/perf/)
-NEW this session: `topdown.sh` (Main-thread TMA/stall/load/port — the re-baseline measurement),
-`uops.sh` (uops/insn + MITE/DSB triage), `annotate.sh` (per-insn cycle attribution), `affinity_test.sh`
-(HT/affinity floor A/B). Plus prior: `{resteer,floor_rootcause,branch_breakdown,detdiff,ab,regen_build}.sh`.
-
-## Separate, independent issue (do NOT conflate with the floor)
-The **"sinusoid"** (sim speed oscillates) is a pacing bug (`command_processor.cpp` `XE_SWAP`,
-`++counter_` per swap, IMMEDIATE present). Only touch if asked.
+NEW (over-execution): `pausetest.sh` (running-vs-paused insn-rate = the spin detector), `spinprofile.sh`
+(paused = pure-spin profile), `heavydip.sh` / `gpucp3.sh` (per-thread + per-comm dip profiling),
+`threads.sh` (per-thread %CPU). Codegen-era (still useful): `topdown.sh`, `uops.sh`, `annotate.sh`,
+`resteer.sh`, `affinity_test.sh`, `uksplit.sh`, `detdiff.sh`, `ab.sh`, `regen_build.sh`.
