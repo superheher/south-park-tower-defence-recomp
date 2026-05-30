@@ -81,6 +81,12 @@ attempt it, do NOT leave the tree half-changed — it boot-crashes when partial.
 - **HT contention:** REJECTED — `affinity_test.sh` no-HT (6 physical cores) vs default (12 logical) is
   neutral-to-worse (−0.8). The 39 % front-end is the code's own MITE starvation, not a stolen sibling
   front-end. TimerThread's 17 % CPU is wasteful but runs on spare cores; doesn't gate the floor.
+- **Switching OS (Win10/macOS) / disabling mitigations:** REJECTED (research + on-machine). BTB/RSB/DSB are
+  fixed silicon (OS-independent); IBRS is cleared in user-space + "RSB filling" is per-context-switch not
+  per-syscall, so mitigations don't touch the guest-sim thread's prediction; `uksplit.sh` measured the
+  Main thread at **97.9 % user / 2.1 % kernel** → `mitigations=off` upper bound ≤ ~2 % (won't clear +1.0).
+  Win codegen is worse (`REX_PHYS_HOST_OFFSET` per access); macOS needs MoltenVK + a big port. Only the
+  cross-CPU check (P1) is worth it. (Cheapest falsification: `mitigations=off` cmdline + reboot + ab.sh.)
 - **All prior front-end/layout levers** (mcmodel done+kept, leaf-inline, PGO, BOLT/ICF/AS_LOCAL/
   outliner): floor-neutral. They don't reduce host-instruction count or fit the DSB.
 

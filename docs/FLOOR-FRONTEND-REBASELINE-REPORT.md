@@ -122,8 +122,32 @@ The TimerThread's 17 % is wasteful but runs on spare cores and does not gate the
 (The absolute p10 in this session's combat ran ~20–21 on 60 s windows vs ~15 on ab.sh's 90 s windows —
 load drifts between sessions; the *internal* A/B is what's valid.)
 
+### OS-switch & CPU-mitigation hypothesis — TESTED (research + on-machine) and REJECTED
+"Would Windows 10 / native macOS / disabling Linux mitigations move the floor?" Answer: **no** — the
+BTB/RSB/DSB are fixed on-die structures (RSB 16 entries, BTB 128+4096, DSB 1536 µops — Agner Fog §3.8,
+Chips-and-Cheese, WikiChip/uops.info), **identical under any OS**; no kernel can enlarge them, so the
+capacity overflow point is OS-independent. The only OS-level front-end lever is CPU security mitigations,
+and they **do not touch user-space prediction**:
+- This box runs `spectre_v2=IBRS` + `retbleed=IBRS` + "RSB filling". Per the kernel Spectre doc, **legacy
+  IBRS is cleared on exit to user-space**, so the guest-sim thread runs with IBRS=0 (full BTB/RSB); IBRS
+  structurally can't restrict same-predictor-mode (intra-process) branches (Intel spec); STIBP/IBPB are
+  "conditional" (opt-in, not requested). "RSB filling" is on **context-switch, not per-syscall**, so timer
+  ticks don't corrupt the user RSB. ⇒ the 22 % return-mispredict is genuine RSB-capacity, not a mitigation.
+- **On-machine upper bound (`tools/perf/uksplit.sh`): the Main thread is 97.9 % user / 2.1 % kernel cycles.**
+  Mitigation cost lives entirely in that 2.1 % (it scales with syscall rate, not branch density), so
+  `mitigations=off` can recover **≤ ~2 %** (realistically ~0.5–1 %) — far under the +1.0 bar. Real Phoronix
+  data on this CPU class agrees (`mitigations=off` ≈ 0–3 % on compute; the big wins are syscall/IPC/net).
+- **Windows 10:** same silicon + kernel-only mitigations (retpoline is for kernel binaries, not the app)
+  AND the recomp's Windows codegen is *worse* — `REX_PHYS_HOST_OFFSET` adds a conditional offset to every
+  guest memory access (it's 0 on Linux). **macOS:** same silicon; default mitigations don't even disable
+  HT; but no native Vulkan (MoltenVK→Metal) + a large port for **zero** structural floor payoff.
+- Cheapest remaining on-Linux test (strict upper bound): add `mitigations=off` to the kernel cmdline,
+  reboot, rerun `ab.sh 90 5` on BKG. If the floor doesn't move under `mitigations=off`, **no OS swap can
+  move it either.** Expected ~0.5–1 %; do it only to falsify, not as a real lever.
+
 ## New tools (tools/perf/)
 - `topdown.sh` — Main-thread TMA L1 + stall-decomposition + load-hit + port-pressure during heavy combat (the measurement that re-baselined the diagnosis).
+- `uksplit.sh` — Main-thread user-vs-kernel cycle split (bounds any CPU-mitigation gain; measured 97.9 % user).
 - `uops.sh` — Main-thread + whole-proc uops_retired / insn / DSB-vs-MITE mix (the µop-delta triage that killed movbe/nonvol fast).
 - `annotate.sh` — per-instruction cycle attribution of the hottest recompiled function.
 - `affinity_test.sh` — interleaved floor A/B under different CPU affinities (HT-contention test).
@@ -137,4 +161,8 @@ load drifts between sessions; the *internal* A/B is what's valid.)
 - **ThinLTO on the exe** (`-flto=thin -fuse-ld=lld`): floor-neutral (+0.3 over 8 reps, within noise),
   +5.2 % .text, slower build. Cross-TU inlining works + gate-passes but doesn't move the floor — same
   branch-removal-vs-code-growth wash as leaf-inline. Don't re-add unless the goal is avg-smoothness.
+- **Switching OS (Windows 10 / macOS) or disabling Linux mitigations:** the BTB/RSB/DSB are fixed silicon
+  (OS-independent); mitigations don't touch user-space prediction (Main thread is 97.9 % user, so
+  `mitigations=off` ≤ ~2 %). Windows codegen is *worse* (`REX_PHYS_HOST_OFFSET`); macOS adds MoltenVK +
+  a big port for zero floor payoff. The real lever is a newer CPU (bigger front-end), not a different OS.
 - All per-instruction "emit better C++" codegen levers generally: clang -O3 already minimizes.
