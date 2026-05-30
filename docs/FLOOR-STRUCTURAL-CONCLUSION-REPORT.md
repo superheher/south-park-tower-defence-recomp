@@ -95,6 +95,20 @@ GPR-as-local / de-spin / block-on-signal / write-elision — 7 sessions) saves *
 cross a boundary; the off-cpu/guest data shows the residual is the game's own serial work. **Confirmed
 structural.**
 
+**Where the CP render (~17 ms) actually goes** (`cp_oncpu_profile.sh`, CP "GPU Commands" thread on-cpu in
+a heavy dip; DSO = 79 % librexruntime + 13 % RADV + 7 % libc) — the map for any future CP-reduction session:
+- **~23 % register writes** — `VulkanCommandProcessor::WriteRegister` 13.8 % + base `WriteRegister` 2.5 % +
+  `ExecutePacketType0` 6.7 %. patch-0014 already skips *unchanged* writes; the residual is changed-value
+  writes through the big register switch (optimizable but render-affecting → risky).
+- **~7 % descriptor/binding** — `UpdateBindings` 2.5 %, `radv_UpdateDescriptorSets` 3.1 %,
+  `radv_bind_descriptor_sets` 0.7 %, `WriteTransientTextureBindings` 0.7 % — the draw-batch target.
+- **~3 % render-target/pipeline state** — `RenderTargetCache::Update`, `GetCurrentStateDescription`.
+- **~3.2 % pure waste — the GPU trace writer**: `TraceWriter::WritePacketStart`/`WritePacketEnd` are called
+  per PM4 packet even in normal play. They early-out on `if (!file_) return;` but are **non-inlined**, so the
+  per-packet call overhead alone costs ~3.2 % of CP on-cpu for nothing. A safe correct micro-opt (inline the
+  `is_open()` early-out / guard the hot call sites) reclaims it — ~0.5 ms/frame, floor-neutral; flagged for a
+  cleanup pass, not done here (small + cross-call-site churn, and floor-neutral).
+
 ## Empirical "long-shot" attempt this session
 
 Per the user's request to try the game-logic/wait path directly, one latency experiment was run:
