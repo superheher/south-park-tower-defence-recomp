@@ -23,17 +23,16 @@
 ## The ONLY remaining theoretical lever (and why it needs YOU present)
 **Draw-call batching / CP-translate reduction.** A heavy 2-vbl frame ≈ guest-logic(~16 ms) + CP-render(~17 ms),
 serial, GPU idle. In the **deep 15 fps dip** (4 vbl/66 ms, render ~34 ms), *halving* the CP render could
-reach < 50 ms ⇒ 20 fps (+5 swaps — a real boundary cross). **MEASURED HEADROOM (`drawstream_probe.sh`,
-heavy 15fps dip): ~1700 draws/FRAME, ~240 pipeline-changes/frame ⇒ batch_ratio ≈ 7** (avg run of 7
-consecutive same-pipeline draws; max ~1750 draws/frame). So the CP records ~1700 draws + their descriptor
-updates per heavy frame — collapsing the same-pipeline runs (instancing / dynamic-indexed textures) could
-cut the draw count up to ~7× and is a genuine, large lever (this REFUTES an earlier "per-sprite textures ⇒
-not batchable" guess — the runs are real). The likely biggest source is per-glyph/per-sprite text+UI draws
-(same font pipeline). NEXT STEP for a supervised session: instrument descriptor/texture changes WITHIN the
-same-pipeline runs to find the *achievable* batch size (same-pipeline ≠ same-texture), then batch the
-same-texture runs first (trivially instanceable). BUT it is a large, risky change; a subtle bug corrupts
-combat rendering and the detdiff gate may not catch a wrong-state glitch. **Do this with the user available
-to eyeball mid-combat rendering**, gate hard, and verify across several combat states.
+reach < 50 ms ⇒ 20 fps (+5 swaps — a real boundary cross). **MEASURED (`drawbatch_probe.sh`, heavy combat):
+~700–1700 draws/FRAME, ~100–240 pipeline-changes ⇒ pipe_ratio ≈ 7** (runs of ~7 consecutive same-pipeline
+draws) **BUT tex_ratio ≈ 1.0** — i.e. **every draw rebinds the pixel textures (a distinct texture per
+draw)**. So the ~7-draw same-pipeline runs are NOT trivially instanceable (each draw has its own texture);
+the ~7× draw-count headroom is real but capturing it needs **texture-array / bindless batching** (bind all
+textures, index per-instance) + shader changes — the HARD version, a major risky change, not a quick
+instancing win. The big draw source is per-glyph/sprite text+UI (one font pipeline, but per-glyph regions
+⇒ distinct sampler bindings). **Verdict: draw-batching is the one lever with real floor headroom, but it is
+a large texture-array rewrite** — do it ONLY with the user present to eyeball mid-combat rendering across
+several combat states, and gate hard (a wrong-state glitch may slip the deterministic gate).
 
 ## Constructive work that IS achievable
 1. **Fresh-install transient smoothness** (the OTHER lag regime): on a cold machine the first playthrough
