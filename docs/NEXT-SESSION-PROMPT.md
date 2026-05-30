@@ -1,73 +1,71 @@
-# South Park recomp — next-session LAUNCH PROMPT: the floor is CP TRANSLATION throughput, cut it
+# South Park recomp — next-session LAUNCH PROMPT: the floor is CP translation THROUGHPUT; the per-register-write levers are exhausted
 
-> **THE FLOOR IS THE GPU COMMAND-PROCESSOR'S SINGLE-THREADED PM4→VULKAN TRANSLATION, NOT spin/CPU.**
-> Proven 2026-05-30 by per-frame instrumentation (`[frame-diag]`): in a heavy combat dip the CP burns
-> **~29 ms/frame translating the command stream** (≈72 % of the heavy-frame wall-clock); present is
-> ~3 ms, frame-sync wait ~8 ms, the GPU HW is 17–26 % IDLE (starved by the serial CP). **READ FIRST:**
-> `docs/FLOOR-CP-TRANSLATION-REPORT.md` + memory `sp_floor_cp_translation`.
-> **BIG LESSON: do NOT do block-on-signal / de-spin / codegen for the floor.** Two MORE thesis-killers
-> landed this session: de-spinning BOTH busy-wait layers (CP `WAIT_REG_MEM` → CV block; guest Main
-> `sub_821B9270` 34 %→9.6 % via a vblank-park) is **floor-NEUTRAL** (it only raised avg/ceiling). The
-> floor only moved when we cut real translation work (skip-unchanged-constants: p10 +0.3, min +2).
-
-## THE TASK — cut heavy-frame CP translation (~29 ms → <22 ms gets 30 fps; keep-bar p10 > +1.0, ≥5 heavy reps)
-The CP is `librexruntime.so` runtime code (NOT recompiled guest code — a fresh, untouched surface). Levers,
-easiest→hardest:
-1. **Extend redundant-write elision.** `vulkan/command_processor.cpp:WriteRegister` already skips
-   unchanged float/bool/loop shader constants (the proof-of-concept, +0.3 p10/+2 min). The title re-sets
-   redundant state per draw. Safely skip unchanged writes for the OTHER pure-state registers — but FIRST
-   enumerate the side-effect set that must NOT be skipped: scratch (`SCRATCH_REG0..7`), `DC_LUT_*`, gamma,
-   `COHER_STATUS_HOST`, the fetch constants (`SHADER_CONSTANT_FETCH_*` → texture-cache/vertex-residency
-   invalidation), and anything in `CommandProcessor::WriteRegister`'s special switch. **Verify rendering
-   with MID-COMBAT screenshots** (`gamectl shot`), not just the determinism gate (the gate is behavioral,
-   it won't catch a subtle constant glitch).
-2. **Devirtualize / bulk the register path.** `WriteRegister` is `virtual`, called per-register in loops
-   (`RestoreRegisters`, TYPE0 ranges). Bulk-store the range + batch the dirty-mark once.
-3. **Draw batching / instancing** for the many small sprites — the diffuse remainder of the 29 ms is draw
-   issue (pipeline lookup + descriptor sets + command-buffer recording, `radv_UpdateDescriptorSets` etc.).
-4. **(Hard) parallelize CP translation** — the GPU is idle, starved by the serial CP thread.
-**Re-instrument first:** re-add the `[frame-diag]` split (it was removed; see the report) AND add a
-per-register-index write-count + unchanged-count histogram to TARGET the highest-redundancy registers
-before optimizing blindly.
+> **THE FLOOR IS THE GPU COMMAND-PROCESSOR'S SINGLE-THREADED PM4→VULKAN TRANSLATION THROUGHPUT.**
+> This session closed the **per-register-write** lever class. Generic redundant-write elision (skip every
+> unchanged-value write to a pure-state register, ~90% of ALL per-register writes) is now in and clears the
+> +1.0 keep-bar vs bothfix. A follow-on virtual-dispatch skip was floor-neutral. **READ FIRST:**
+> `docs/FLOOR-CP-ELISION-REPORT.md` (+ `FLOOR-CP-TRANSLATION-REPORT.md`) and memory `sp_floor_cp_elision`.
 
 ## Where we are
 Static recompilation (rexglue-sdk) of South Park: Let's Go Tower Defense Play! (XBLA) → native
 Linux/Vulkan, fully playable (boot→match→win). Repo `/home/h/src/recomp/rexglue-recomps` (super, `main`)
-+ submodule `south-park-recomp` (port, `main`). **SDK edits = working-tree patch
-`patches/rexglue-sdk-current-full.patch`** (regenerate with
-`git -C ../third_party/rexglue-sdk diff > patches/rexglue-sdk-current-full.patch` before committing).
-Identity `superheher <heh@vivaldi.net>`, on `main`, **NO Co-Authored-By trailer**, **commit, do NOT push**
-unless asked. Host: i9-8950HK (6c/12t), governor=performance, sudo `<redacted>`, disposable bench.
++ submodule `south-park-recomp` (port, `main`). **SDK edits = granular patch series in
+`patches/0*.patch`** (the submodule gitlink stays on upstream `e8ce24f`; `git am` the series to apply —
+see `patches/README.md`). Identity `superheher <heh@vivaldi.net>`, on `main`, **NO Co-Authored-By
+trailer**, **commit, do NOT push** unless asked. Host: i9-8950HK (6c/12t), governor=performance, sudo
+`<redacted>`, disposable bench.
 
-**Current working binary (kept this session — de-spun + GetLoggerRaw cache + constant-skip, gate PASS,
-render-verified):** exe `848f191c` (`south_park_td.cpfence6`) + `librexruntime.so` `f1d86a27`
-(`librexruntime.so.cpfence6`). The PRE-this-session base (for A/B) is `bothfix`: exe `d4b0f50b`
-(`south_park_td.bothfix`) + `.so` `605ce3ee` (`librexruntime.so.bothfix`). Floor p10 ≈ 15.
+**Current working binary (kept this session — elis1, gate PASS, render-verified, +1.0 keep-bar cleared):**
+exe `848f191c` (`south_park_td.cpfence6`, UNCHANGED — the elision is .so-only) + `librexruntime.so`
+`5276a282` (`librexruntime.so.elision1`). The +1.0 keep-bar reference base is **bothfix**: exe `d4b0f50b`
+(`south_park_td.bothfix`) + `.so` `605ce3ee` (`librexruntime.so.bothfix`). Floor p10 ≈ 15 (base) → ≈ 17-18
+(elis1).
 
-## Validation discipline (mandatory — the constant-skip touches the render path)
-- `tools/perf/detdiff.sh gate <label> 40` must be `status=pass` (behavioral fingerprint).
-- **MID-COMBAT screenshots** (`gamectl play` then `gamectl press 1000`/`shot`) — the gate will NOT catch a
-  wrong-constant rendering glitch; eyeball the sprites/colors/transforms.
-- Floor A/B: `tools/perf/ab_both.sh 90 5 base <bothfix exe> <bothfix so> cand <new exe> <new so>` (swaps
-  BOTH binaries; a translation change is in the .so, but keep the both-swap harness for consistency).
-  **Keep-bar: median p10 > +1.0 swaps/s, ≥5 heavy reps.**
-- `tools/perf/regen_build.sh full` after an init_h.inja/header change (new exe); for a pure SDK `.cpp`
-  edit, `cmake --build third_party/rexglue-sdk/out/build/linux-amd64 --target install` then copy
-  `out/install/linux-amd64/lib64/librexruntime.so` into the port build dir (~18–30 s, exe unchanged).
-- HOST GOTCHAS: (a) the harness BLOCKS a literal `sleep` token in a Bash command string → put waits in a
-  SCRIPT FILE; (b) the game is reaped when its launching shell ends, but `gamectl play` uses `setsid` so
-  it survives; (c) ONE game instance only; (d) `gamectl kill` + `rm -f /dev/shm/xenia_memory_*` cleans the leak.
+## THE TASK — cut heavy-frame CP translation THROUGHPUT further (the per-register-write lever is DONE)
+The new heavydip CP-thread profile (`tools/perf/heavydip_cpfence6_2026-05-30.txt`) showed the dip is
+dominated by the register-write dispatch — that is now ~90% elided. **Re-profile the CURRENT elis1 binary
+first** (`heavydip.sh`) to see the NEW hot set, then attack the remaining translate work, easiest→hardest:
+1. **Bulk-constant path** (`VulkanCommandProcessor::WriteRegistersFromMem`). The big float/fetch ranges go
+   through `memory::copy_and_swap` + a single dirty-mark — already efficient, but check whether the title
+   sends large UNCHANGED constant ranges that could be memcmp-skipped before the copy + dirty-mark.
+2. **Draw batching / instancing** for the many small sprites (tower-defense = many similar units). The
+   diffuse remainder of translate is draw issue — pipeline lookup + descriptor sets (`radv_UpdateDescriptorSets`
+   was ~1.35%) + command-buffer recording. Coalesce identical-state draws.
+3. **(Hard) parallelize the CP translation.** The GPU HW is 17-26% idle, starved by the serial CP thread.
+   This is the only lever with headroom to actually break the throughput floor.
+
+## Validation discipline (mandatory)
+- `tools/perf/detdiff.sh gate <label> 40` must be `status=pass`.
+- **MID-COMBAT screenshots** (`gamectl play`, escalate with `press 1000`, then `shot`) — the gate will NOT
+  catch a wrong-state rendering glitch; eyeball sprites/colors/transforms. (`tools/perf/smoke_shot.sh <tag>` does
+  play→escalate→3 shots.)
+- Floor A/B: `tools/perf/ab_both.sh 90 6 base <bothfix exe> <bothfix so> cand <new exe> <new so>` (swaps
+  BOTH binaries). **Keep-bar: median p10 > +1.0 swaps/s vs bothfix, ≥5 heavy reps.** NOTE the floor is
+  noisy run-to-run (~±2 on the de-spun binaries; base is the stable ~15.0 anchor) — interleave + ≥6 reps.
+- `.so`-only change: `cmake --build third_party/rexglue-sdk/out/build/linux-amd64 --target install` then
+  `cp out/install/linux-amd64/lib64/librexruntime.so` into the port build dir (~20s, exe unchanged).
+  `tools/perf/regen_build.sh full` only if an init_h.inja/header change (new exe).
+- HOST GOTCHAS: (a) the harness BLOCKS a literal `sleep` token in a Bash string → put waits in a SCRIPT
+  FILE (`tools/perf/wait_for.sh <file> <marker> <timeout>` polls a log); (b) `gamectl play` uses `setsid` so the
+  game survives the launching shell; (c) ONE game instance only; (d) `gamectl kill` + `rm -f
+  /dev/shm/xenia_memory_*` cleans the shm leak. **NEVER build/launch the game while an A/B is swapping
+  binaries.**
 
 ## DEAD ENDS — do NOT retry for the floor (all measured neutral)
-- **De-spin / block-on-signal** (THIS session): CP `WAIT_REG_MEM`→CV block AND guest Main→vblank-park —
-  both floor-NEUTRAL (avg/ceiling win only). The floor is not CPU-contention.
+- **Per-register-write micro-opt is EXHAUSTED** (this session): generic unchanged-write elision (~90% of
+  writes) clears the bar but its *marginal over the constant-skip* is +0.2 (noise); the TYPE0 virtual-
+  dispatch skip on top is strictly floor-neutral (removing ~millions/sec of indirect calls didn't move it
+  → the floor is NOT branch-prediction-bound here). The body-elision was the last worthwhile bite.
+- **De-spin / block-on-signal** (prior): CP `WAIT_REG_MEM`→CV block AND guest Main→vblank-park — both
+  floor-neutral (avg/ceiling win only). Not CPU-contention.
 - **Codegen / µop / layout / flags / mcmodel / PGO / BOLT / ICF / outliner / ThinLTO / GPR-as-local**
-  (6 prior sessions) — all floor-neutral; they profiled a spin or the wrong target. See
-  `docs/FLOOR-FRONTEND-REBASELINE-REPORT.md` + `docs/FLOOR-OVEREXEC-REPORT.md` (both now superseded for
-  the floor by the CP-translation finding).
+  (6 prior sessions) — all floor-neutral. See `FLOOR-FRONTEND-REBASELINE-REPORT.md` + `FLOOR-OVEREXEC-REPORT.md`.
+**The floor is CP serial-translation THROUGHPUT. Only cutting real translation work, or parallelizing it,
+can move it — and CPU-side cuts have low floor-elasticity (this session: −4% whole-proc CPU for +0.2 p10).**
 
 ## Tools (tools/perf/)
-NEW: `ab_both.sh` (both-exe+so floor A/B). The `[frame-diag]` XE_SWAP split + a WAIT_REG_MEM address diag
-were used then removed — re-add per the report when re-instrumenting. Also: `pausetest.sh`,
-`spinprofile.sh`, `heavydip.sh`/`gpucp3.sh` (per-thread/per-comm dip profiling), `detdiff.sh`, `ab.sh`,
-`floor.sh`, `regen_build.sh`.
+`heavydip.sh` (per-thread/per-comm dip profile — the decisive measurement), `ab_both.sh` (both-exe+so A/B),
+`detdiff.sh` (gate), `floor.sh`, `regen_build.sh`. This session's artifacts: `reghist_2026-05-30.txt`
+(per-register write/unchanged histogram — re-add the `[reg-hist]` diag at the top of
+`VulkanCommandProcessor::WriteRegister` to regenerate), `heavydip_cpfence6_2026-05-30.txt`,
+`ab_elision{1,2}_2026-05-30.txt`.

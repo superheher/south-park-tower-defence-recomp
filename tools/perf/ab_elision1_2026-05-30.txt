@@ -1,0 +1,24 @@
+## AB_BOTH 2026-05-30 17:03:11  SECS=90 REPS=6  variants=base cpf6 elis1
+  [base r1 exe=d4b0f50b so=605ce3ee] FLOOR n=45 min=13.1 p10=15.1 avg=29.3 max=52.0 heavy=yes status=ok
+  [cpf6 r1 exe=848f191c so=f1d86a27] FLOOR n=45 min=14.0 p10=17.7 avg=35.2 max=60.0 heavy=yes status=ok
+  [elis1 r1 exe=848f191c so=5276a282] FLOOR n=46 min=14.6 p10=18.5 avg=35.0 max=60.0 heavy=yes status=ok
+  [base r2 exe=d4b0f50b so=605ce3ee] FLOOR n=45 min=11.7 p10=14.9 avg=30.0 max=54.2 heavy=yes status=ok
+  [cpf6 r2 exe=848f191c so=f1d86a27] FLOOR n=44 min=12.5 p10=16.4 avg=34.3 max=60.0 heavy=yes status=ok
+  [elis1 r2 exe=848f191c so=5276a282] FLOOR n=45 min=14.6 p10=16.1 avg=34.5 max=60.0 heavy=yes status=ok
+  [base r3 exe=d4b0f50b so=605ce3ee] FLOOR n=45 min=12.0 p10=15.0 avg=30.7 max=54.5 heavy=yes status=ok
+  [cpf6 r3 exe=848f191c so=f1d86a27] FLOOR n=46 min=14.0 p10=15.9 avg=34.4 max=60.0 heavy=yes status=ok
+  [elis1 r3 exe=848f191c so=5276a282] FLOOR n=45 min=13.9 p10=16.6 avg=34.4 max=60.0 heavy=yes status=ok
+  [base r4 exe=d4b0f50b so=605ce3ee] FLOOR n=45 min=12.2 p10=15.0 avg=30.8 max=53.7 heavy=yes status=ok
+  [cpf6 r4 exe=848f191c so=f1d86a27] FLOOR n=45 min=14.4 p10=17.0 avg=34.2 max=60.0 heavy=yes status=ok
+  [elis1 r4 exe=848f191c so=5276a282] FLOOR n=45 min=13.0 p10=16.0 avg=34.0 max=56.6 heavy=yes status=ok
+  [base r5 exe=d4b0f50b so=605ce3ee] FLOOR n=45 min=11.9 p10=15.0 avg=30.5 max=53.1 heavy=yes status=ok
+  [cpf6 r5 exe=848f191c so=f1d86a27] FLOOR n=45 min=14.3 p10=15.5 avg=34.4 max=60.0 heavy=yes status=ok
+  [elis1 r5 exe=848f191c so=5276a282] FLOOR n=45 min=12.1 p10=15.0 avg=32.0 max=57.1 heavy=yes status=ok
+  [base r6 exe=d4b0f50b so=605ce3ee] FLOOR n=44 min=12.1 p10=15.0 avg=30.5 max=53.1 heavy=yes status=ok
+  [cpf6 r6 exe=848f191c so=f1d86a27] FLOOR n=44 min=13.0 p10=15.0 avg=34.6 max=60.0 heavy=yes status=ok
+  [elis1 r6 exe=848f191c so=5276a282] FLOOR n=45 min=14.6 p10=19.0 avg=35.4 max=60.0 heavy=yes status=ok
+## medians (p10, heavy windows only):
+   base: median_p10=15.0   (samples: 15.1 14.9 15.0 15.0 15.0 15.0 )
+   cpf6: median_p10=15.9   (samples: 17.7 16.4 15.9 17.0 15.5 15.0 )
+   elis1: median_p10=16.1   (samples: 18.5 16.1 16.6 16.0 15.0 19.0 )
+

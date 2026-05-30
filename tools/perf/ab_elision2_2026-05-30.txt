@@ -1,0 +1,24 @@
+## AB_BOTH 2026-05-30 18:00:55  SECS=90 REPS=6  variants=base elis1 elis2
+  [base r1 exe=d4b0f50b so=605ce3ee] FLOOR n=45 min=12.0 p10=14.9 avg=30.8 max=58.0 heavy=yes status=ok
+  [elis1 r1 exe=848f191c so=5276a282] FLOOR n=45 min=14.3 p10=17.7 avg=34.6 max=60.0 heavy=yes status=ok
+  [elis2 r1 exe=848f191c so=10909a56] FLOOR n=45 min=15.5 p10=18.8 avg=36.4 max=60.0 heavy=yes status=ok
+  [base r2 exe=d4b0f50b so=605ce3ee] FLOOR n=45 min=10.1 p10=14.3 avg=29.2 max=55.1 heavy=yes status=ok
+  [elis1 r2 exe=848f191c so=5276a282] FLOOR n=45 min=14.7 p10=18.8 avg=35.4 max=60.1 heavy=yes status=ok
+  [elis2 r2 exe=848f191c so=10909a56] FLOOR n=45 min=15.0 p10=17.1 avg=36.1 max=60.0 heavy=yes status=ok
+  [base r3 exe=d4b0f50b so=605ce3ee] FLOOR n=46 min=12.0 p10=15.0 avg=30.7 max=54.6 heavy=yes status=ok
+  [elis1 r3 exe=848f191c so=5276a282] FLOOR n=45 min=14.8 p10=18.2 avg=34.8 max=59.5 heavy=yes status=ok
+  [elis2 r3 exe=848f191c so=10909a56] FLOOR n=45 min=15.4 p10=18.7 avg=36.1 max=60.0 heavy=yes status=ok
+  [base r4 exe=d4b0f50b so=605ce3ee] FLOOR n=45 min=10.7 p10=12.8 avg=28.5 max=55.5 heavy=yes status=ok
+  [elis1 r4 exe=848f191c so=5276a282] FLOOR n=45 min=14.9 p10=16.9 avg=34.4 max=60.0 heavy=yes status=ok
+  [elis2 r4 exe=848f191c so=10909a56] FLOOR n=46 min=12.7 p10=15.7 avg=32.1 max=60.0 heavy=yes status=ok
+  [base r5 exe=d4b0f50b so=605ce3ee] FLOOR n=44 min=12.0 p10=15.0 avg=30.3 max=57.1 heavy=yes status=ok
+  [elis1 r5 exe=848f191c so=5276a282] FLOOR n=45 min=14.9 p10=18.2 avg=35.4 max=60.0 heavy=yes status=ok
+  [elis2 r5 exe=848f191c so=10909a56] FLOOR n=45 min=13.4 p10=15.9 avg=34.0 max=59.5 heavy=yes status=ok
+  [base r6 exe=d4b0f50b so=605ce3ee] FLOOR n=45 min=11.8 p10=15.0 avg=30.5 max=55.0 heavy=yes status=ok
+  [elis1 r6 exe=848f191c so=5276a282] FLOOR n=45 min=14.3 p10=18.4 avg=35.6 max=60.0 heavy=yes status=ok
+  [elis2 r6 exe=848f191c so=10909a56] FLOOR n=45 min=15.2 p10=17.7 avg=35.7 max=60.0 heavy=yes status=ok
+## medians (p10, heavy windows only):
+   base: median_p10=14.9   (samples: 14.9 14.3 15.0 12.8 15.0 15.0 )
+   elis1: median_p10=18.2   (samples: 17.7 18.8 18.2 16.9 18.2 18.4 )
+   elis2: median_p10=17.1   (samples: 18.8 17.1 18.7 15.7 15.9 17.7 )
+
