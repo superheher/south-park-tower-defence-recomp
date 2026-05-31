@@ -81,10 +81,17 @@ statements already in `generated/default/south_park_td_recomp.*.cpp`. Match Xeno
 TOML schema (see its README §"Jump Tables" / the SWA example). Re-run the recompile; commit.
 **Done-criteria:** the `mtctr;bctr` sites that RexGlue resolves are resolved here too (spot-check a few).
 
-### TASK 3 — compile-check the generated C++
-Verify `varianta/ppc/*.cpp` is syntactically sound: `clang++ -std=c++20 -fsyntax-only -I<ppc dir> ppc/ppc_recomp.0.cpp`
-(it includes `ppc_context.h` + `ppc_config.h`; link will need the runtime, but syntax must be clean).
-Fix any emitter bugs surfaced. Commit. **Done-criteria:** all generated TUs pass `-fsyntax-only`.
+### TASK 3 — keep the generated C++ syntax-clean
+Already VERIFIED clean today (gaps compile as traps). Exact command (note the simde include — the
+generated `ppc_context.h` pulls `<x86/avx.h>` from XenonRecomp's thirdparty/simde):
+```
+cd south-park-recomp/varianta; XR=../../third_party/XenonRecomp
+for f in ppc/ppc_recomp.*.cpp ppc/ppc_func_mapping.cpp; do
+  clang++ -std=c++20 -fsyntax-only -I ppc -I "$XR/XenonUtils" -I "$XR/thirdparty/simde" "$f" || echo "FAIL $f"
+done
+```
+Re-run after TASK 1/2 to catch any emitter bug your new cases introduce; fix + commit. **Done-criteria:**
+all TUs pass `-fsyntax-only`.
 
 ### TASK 4 — scaffold the host runtime (only if 1–3 are done; this is the large remaining phase)
 Stand up a CMake project skeleton that compiles the generated `ppc/` against a runtime, cribbing
