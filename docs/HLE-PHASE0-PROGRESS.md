@@ -106,7 +106,39 @@ correlate the dominant pixel shader with the exact inline-draw instruction(s) in
 `sub_821BEF00`/`sub_821CC830` render path (CP `IM_LOAD` ucode-addr logging + the kick-backtrace
 RVA that falls inside `sub_821CC830`).
 
+## Draw-site histogram (extends the probe; in the patch)
+
+Histogramming the call-chain frames across many sampled mid-loop kicks (heavy combat, fps≈25)
+gives the common render orchestration but not a single dominant inner site:
+
+- The **render orchestration cluster `sub_82249638 → sub_82249678 → sub_82249970 → sub_82249AD0`**
+  (under main loop `sub_824497B8`) is common to all mid-loop kicks.
+- Below it the draws spread across multiple render passes (`sub_82150970` → `sub_8212DFB8` →
+  `sub_821BEF00` → `sub_821CC830`, and siblings) — **no single inner function dominated** at the
+  sampling resolution used (256-kick sampling; denser sampling trips the boot GPU-fence deadlock).
+
+⚠ **The async/inline wall is fundamental.** Both candidate ways to pin the *exact* 72.5%-group
+instruction — kick-stack histogramming and CP shader-bind (`IM_LOAD`) correlation — are limited by
+the same fact: the shader-set and the draws are built **inline** on the guest thread and parsed
+**async** by the CP, so neither gives a clean synchronous shader→site mapping. The kick-backtrace
+is the best available signal and it localizes to the `sub_821CC830`/`sub_821BEF00` render path.
+
 ## Next steps
+
+**The variant-B hook target is the render pass `sub_821CC830`** (central per-frame pass, does the
+inline draw loop). The next phase is the actual native-renderer work, and it is large:
+
+1. **Reimplement `sub_821CC830`'s pass natively.** Override it (strong symbol, proven) and, instead
+   of letting it build PM4, read its draw inputs from guest memory and drive the existing Vulkan
+   backend directly with the ported `SPHud`/`SPTextured` shader. Because the stub test showed it is
+   frame-critical, the reimplementation must reproduce the whole pass (or be done behind a per-draw
+   mid-asm hook for incremental partial migration).
+2. **Benchmark** heavy-frame FPS native-vs-PM4 — the commit-or-fallback datum (report §7).
+3. If finer granularity is needed first, densify the kick-site histogram (carefully — it starves the
+   guest thread) or RE `sub_821CC830`'s inline loop to place a `[[midasm_hook]]` at the dominant
+   draw site.
+
+### Earlier next-step notes (still valid context)
 
 1. **Confirm the dominant render function.** Either (a) histogram the render frame across many
    mid-loop kick stacks (the dominant group's fn appears in the most), or (b) instrument the
