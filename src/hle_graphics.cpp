@@ -4,8 +4,8 @@
 // statically-linked XDK Direct3D builds PM4 packets into a ring buffer that a single-threaded
 // command processor re-translates to Vulkan every frame (~72% of a heavy combat frame; GPU
 // 17-26% idle). The escape (docs/HLE-GRAPHICS-SPIKE-REPORT.md) is to stop emulating the GPU and
-// render natively by intercepting the title's Direct3D entry points — overriding guest functions
-// with host C++ that drives the existing Vulkan backend directly.
+// render natively by intercepting the title's render functions — overriding guest functions with
+// host C++ that drives the existing Vulkan backend directly.
 //
 // This file is the host-side HLE shim layer. It is built INTO the south_park_td executable
 // alongside the recompiled guest code, so a strong symbol here replaces the generated *weak*
@@ -15,13 +15,11 @@
 // direct `bl` callers AND indirect/vtable dispatch). The original body stays reachable as
 // `__imp__<name>`, so we can pass through to it (true incremental hybrid: migrated funcs render
 // natively, everything else stays on the PM4 path, reversible per-function).
-//
-// Including the generated init header pulls in PPCContext, the REX_* function macros, the
-// `__imp__<name>` declarations (DECLARE_REX_FUNC), and <rex/logging.h> (REXLOG_INFO -> run.log).
 #include "generated/default/south_park_td_init.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -35,76 +33,141 @@ const bool g_trace_present = std::getenv("REX_HLE_PRESENT_TRACE") != nullptr;
 // Frame counter, observed host-side to confirm the override actually sits on the per-frame path.
 std::atomic<uint64_t> g_present_count{0};
 
+// Reference: skipping sub_821CC830's body blanks the WHOLE frame + stops swaps — it is the D3D
+// frame-begin (allocates 7 command-buffer ring segments via sub_821C5BA8, emits one setup packet),
+// NOT the dominant draw group. Kept gated for reference. See docs/HLE-PHASE0-PROGRESS.md.
+const bool g_stub_cc830 = std::getenv("REX_HLE_STUB_CC830") != nullptr;
+
 }  // namespace
 
 // ============================================================================================
-// Phase-0 increment 2 (TEMP DIAGNOSTIC) — draw-provenance probe.
+// Phase-1 — render-pass attribution probe (guest-side, deterministic; sidesteps the async wall).
 //
-// Goal: find the guest function(s) that issue the dominant 72.5% draw group so they can be
-// rendered natively (report step 3). The command processor is asynchronous (a worker thread
-// parses the PM4 ring), the CP_RB_WPTR doorbell is coarse (segment-flush, not per-draw), and the
-// guest CPU profile is spin-dominated (sub_821B9270 = 55%) — so none of those isolate the draw
-// call. The clean signal is RUNTIME CALL FREQUENCY: the D3D draw is invoked ~1700x per heavy
-// frame (all groups) / ~729x for the dominant group (docs/DRAW-GROUP-BREAKDOWN.md), far above any
-// ordinary function. Static call-site count is a poor predictor (a high-fan-in function is a leaf
-// util — e.g. sub_8242BF10 is memcpy — not a draw loop), so we count at runtime.
-//
-// Method: the doorbell-RIP + kick-backtrace probe (graphics_system.cpp) walked the mid-draw-loop
-// kick stack and mapped the render call tree: render fn -> sub_821CC830 (XDK packet EMITTER) ->
-// sub_821C6D58 (reserve/flush-check) -> ... -> sub_821C6600 (kick/doorbell). sub_821CC830 is the
-// per-packet emitter called by the title's render functions, so histogramming ctx.lr at its entry
-// (the recomp sets ctx.lr to the caller's guest return address before each `bl`) ranks the render
-// functions by packet volume — the DOMINANT draw group's render function is the top caller. Map
-// the winning lr to its enclosing sub_<addr> offline. Temporary — removed once draw is identified.
+// Goal: localize the guest function that emits the dominant 72.5% draw group, so it can be
+// overridden and rendered natively (the variant-B escape). RE established that draws are inline
+// PM4 stores (no per-draw guest call) and sub_821CC830 is only frame-begin — so the hook target
+// is a higher-level RENDER PASS, not a per-draw function. The clean guest-side signal: every
+// command-buffer segment flush writes the CP_RB_WPTR doorbell via sub_821C6600 (the "kick";
+// the provenance probe measured 100% of doorbell writes come from it, on the render thread,
+// synchronously). So the kick-count accrued *during* a pass is proportional to the PM4 bytes
+// (≈ draw calls) that pass emitted. We wrap each top-level render pass — the direct children of
+// the frame-render sub_82150970, which itself calls Present sub_821BFF48 — and attribute the
+// kick-delta across the pass's whole subtree (a thread-local depth guard credits nested
+// instrumented calls to the outermost pass only). The pass with the largest per-frame kick-delta
+// is the dominant draw emitter = the native-render hook target. Deterministic, dumped to run.log,
+// no screenshots, no async correlation. Gated by REX_HLE_PASSPROBE.
 // ============================================================================================
 namespace {
-const bool g_drawprobe = std::getenv("REX_HLE_DRAWPROBE") != nullptr;
-// Confirmation test (RESULT: sub_821CC830 is a CENTRAL render/submit fn, broader than the 72.5%
-// group). Skipping its body blanks the WHOLE frame to black AND stops swaps — so it is on the
-// critical per-frame path, not the isolated dominant group. The dominant draws live INSIDE its
-// inline loop; the right hook grain is a mid-asm hook at that site, not this whole-fn stub. See
-// docs/HLE-PHASE0-PROGRESS.md. Kept gated for reference.
-const bool g_stub_cc830 = std::getenv("REX_HLE_STUB_CC830") != nullptr;
-constexpr uint64_t kProbeWindow = 60;  // dump every 60 frames
-constexpr int kLrSlots = 256;
-std::atomic<uint32_t> g_lr[kLrSlots];      // caller guest return address, 0 = empty
-std::atomic<uint64_t> g_lrcnt[kLrSlots];   // per-caller hit count
-std::atomic<uint64_t> g_resv_calls{0};
+const bool g_passprobe = std::getenv("REX_HLE_PASSPROBE") != nullptr;
 
-// Lock-free open-addressed insert (override runs on guest threads, normal context — but keep it
-// cheap on this per-packet hot path).
-inline void RecordCaller(uint32_t lr) {
-  g_resv_calls.fetch_add(1, std::memory_order_relaxed);
-  for (int i = 0; i < kLrSlots; ++i) {
-    uint32_t cur = g_lr[i].load(std::memory_order_relaxed);
-    if (cur == lr) {
-      g_lrcnt[i].fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
-    if (cur == 0) {
-      uint32_t expected = 0;
-      if (g_lr[i].compare_exchange_strong(expected, lr, std::memory_order_relaxed) ||
-          g_lr[i].load(std::memory_order_relaxed) == lr) {
-        g_lrcnt[i].fetch_add(1, std::memory_order_relaxed);
-        return;
-      }
-    }
-  }
-}
+// Visual stub-bisection: REX_HLE_STUB=<guest hex addr> makes that one pass return immediately,
+// so a heavy-combat screenshot shows what it rendered. The dominant UI/sprite group's pass is the
+// one whose stub removes the on-screen sprites/text/HUD while leaving the rest. (No rebuild needed
+// to switch passes — just change the env var.) Kicks are NOT draw-proportional (measured: a fixed
+// ~11 doorbell flushes/frame regardless of 180..1301 draws), so visual stubbing is the ground truth.
+const uint32_t g_stub_addr =
+    std::getenv("REX_HLE_STUB") ? uint32_t(std::strtoul(std::getenv("REX_HLE_STUB"), nullptr, 16)) : 0;
+
+std::atomic<uint64_t> g_kicks{0};  // CP_RB_WPTR doorbell writes (sub_821C6600)
+
+// The pre-Present render passes of sub_82150970, in call order. (sub_821A0B58 is called twice.)
+constexpr int kNumPasses = 10;
+const char* const kPassNames[kNumPasses] = {
+    "sub_8229C360", "sub_8229C650", "sub_821652F0", "sub_821A0B58", "sub_8212DFB8",
+    "sub_82167248", "sub_8210DD58", "sub_82150D78", "sub_821BF298", "sub_821BFA10",
+};
+std::atomic<uint64_t> g_pass_kicks[kNumPasses];
+std::atomic<uint64_t> g_pass_calls[kNumPasses];
+
+// Frame-render total: kicks accrued during the whole sub_82150970 (the frame-render fn that calls
+// Present). Lets us see how much of the frame the 10 child passes actually cover. Independent guard.
+std::atomic<uint64_t> g_frame_kicks{0};
+thread_local int g_in_frame = 0;
+
+// Recursion guard: attribute kicks to the OUTERMOST instrumented pass on the call stack, so a
+// pass that internally calls another instrumented function does not double-count.
+thread_local int g_pass_depth = 0;
+
+// Windowed-delta snapshots (touched only in the Present dump, single render thread -> plain ints).
+uint64_t s_last_total = 0, s_last_frame = 0, s_last_present = 0, s_last_pass[kNumPasses] = {0};
 }  // namespace
 
-// sub_821CC830 — a per-frame render pass on the dominant mid-loop kick path (see
-// docs/HLE-PHASE0-PROGRESS.md). Measured: called ~1x/frame from a single site, sub_821BEF00+0x2DC
-// (caller lr 0x821BF1DC) — so it is NOT a per-packet emitter; it performs the inline draw loop
-// itself. This is the leading candidate for the dominant group's render function and the planned
-// native-render interception point. Currently pass-through + caller histogram (confirms the
-// single caller). Next: confirm it renders pixel shader adf7088205c03df9, then render it natively.
-REX_EXTERN(sub_821CC830) {
-  if (g_drawprobe) {
-    RecordCaller(static_cast<uint32_t>(ctx.lr));
+// Strong override of every instrumented pass. When the probe is off this is a zero-behaviour
+// pass-through (one predictable branch). NAME's body subtree's kicks are credited to slot IDX.
+#define PASS_PROBE(IDX, ADDR, NAME)                                            \
+  REX_EXTERN(NAME) {                                                           \
+    if (g_stub_addr == uint32_t(ADDR)) {                                       \
+      return; /* visual stub-bisection: skip this pass entirely */             \
+    }                                                                          \
+    if (!g_passprobe || g_pass_depth) {                                        \
+      __imp__##NAME(ctx, base);                                               \
+      return;                                                                  \
+    }                                                                          \
+    g_pass_depth = 1;                                                          \
+    const uint64_t k0 = g_kicks.load(std::memory_order_relaxed);              \
+    __imp__##NAME(ctx, base);                                                 \
+    g_pass_kicks[IDX].fetch_add(g_kicks.load(std::memory_order_relaxed) - k0, \
+                                std::memory_order_relaxed);                    \
+    g_pass_calls[IDX].fetch_add(1, std::memory_order_relaxed);                 \
+    g_pass_depth = 0;                                                          \
   }
+
+PASS_PROBE(0, 0x8229C360, sub_8229C360)
+PASS_PROBE(1, 0x8229C650, sub_8229C650)
+PASS_PROBE(2, 0x821652F0, sub_821652F0)
+PASS_PROBE(3, 0x821A0B58, sub_821A0B58)
+PASS_PROBE(4, 0x8212DFB8, sub_8212DFB8)
+PASS_PROBE(5, 0x82167248, sub_82167248)
+PASS_PROBE(6, 0x8210DD58, sub_8210DD58)
+PASS_PROBE(7, 0x82150D78, sub_82150D78)
+PASS_PROBE(8, 0x821BF298, sub_821BF298)
+PASS_PROBE(9, 0x821BFA10, sub_821BFA10)
+
+// Deeper bisection: stub-only gates (no kick attribution) for sub-passes / inline emitters INSIDE
+// the structural top-level passes, to localize the dominant sprite group at finer grain.
+//   sub_821BC3E8 / sub_821BC738 : the two non-frame-begin children of the main-scene pass
+//                                 sub_8212DFB8 (both call the shared sub_821B97C0).
+//   sub_821B97C0                : shared helper called by both -> candidate sprite-draw primitive.
+//   sub_822C1190/1300/1418      : leaf inline emitters under sub_82167248 (0x822C subsystem).
+#define STUB_ONLY(ADDR, NAME)                       \
+  REX_EXTERN(NAME) {                                \
+    if (g_stub_addr == uint32_t(ADDR)) return;      \
+    __imp__##NAME(ctx, base);                       \
+  }
+STUB_ONLY(0x821BC3E8, sub_821BC3E8)
+STUB_ONLY(0x821BC738, sub_821BC738)
+STUB_ONLY(0x821B97C0, sub_821B97C0)
+STUB_ONLY(0x822C1190, sub_822C1190)
+STUB_ONLY(0x822C1300, sub_822C1300)
+STUB_ONLY(0x822C1418, sub_822C1418)
+
+// Frame-render fn (calls the 10 passes above, then Present). Measures total kicks under the whole
+// frame so we can check the 10 passes' coverage. Separate guard from g_pass_depth.
+REX_EXTERN(sub_82150970) {
+  if (!g_passprobe || g_in_frame) {
+    __imp__sub_82150970(ctx, base);
+    return;
+  }
+  g_in_frame = 1;
+  const uint64_t k0 = g_kicks.load(std::memory_order_relaxed);
+  __imp__sub_82150970(ctx, base);
+  g_frame_kicks.fetch_add(g_kicks.load(std::memory_order_relaxed) - k0, std::memory_order_relaxed);
+  g_in_frame = 0;
+}
+
+// The kick / CP_RB_WPTR doorbell write. Counting only; pass straight through.
+REX_EXTERN(sub_821C6600) {
+  if (g_passprobe) {
+    g_kicks.fetch_add(1, std::memory_order_relaxed);
+  }
+  __imp__sub_821C6600(ctx, base);
+}
+
+// sub_821CC830 — D3D frame-begin (resets the 7 command-buffer ring segments + one setup packet),
+// NOT the dominant draw group (RE: docs/HLE-PHASE0-PROGRESS.md). Pass-through; optional stub.
+REX_EXTERN(sub_821CC830) {
   if (g_stub_cc830) {
-    return;  // skip this render pass — confirm what it draws
+    return;  // reference: blanks the whole frame + stops swaps (proves it is frame-begin)
   }
   __imp__sub_821CC830(ctx, base);
 }
@@ -114,10 +177,8 @@ REX_EXTERN(sub_821CC830) {
 //
 // sub_821BFF48 is the title's frame Present/Swap routine: it orchestrates the end-of-frame
 // command buffer and calls __imp__VdSwap (the kernel video swap export) exactly once per frame
-// (generated/default/south_park_td_recomp.5.cpp:76805). It is called directly from 4 sites and
-// via the indirect dispatch table. We wrap it: pass straight through to the original body, and
-// observe the per-frame cadence from host C++. No behaviour change — this increment only
-// validates that variant-B interception works on a real graphics-path guest function.
+// (generated/default/south_park_td_recomp.5.cpp:76805). We wrap it: pass straight through to the
+// original body, observe the per-frame cadence, and dump the pass-attribution histogram.
 // ---------------------------------------------------------------------------------------------
 REX_EXTERN(sub_821BFF48) {
   const uint64_t n = g_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -128,25 +189,32 @@ REX_EXTERN(sub_821BFF48) {
     REXLOG_INFO("[hle] present sub_821BFF48 count={}", n);
   }
 
-  if (g_drawprobe && (n % kProbeWindow == 0)) {
-    // Snapshot the caller histogram, sort, log the top callers + the per-frame reserve rate.
-    std::vector<std::pair<uint32_t, uint64_t>> v;
-    for (int i = 0; i < kLrSlots; ++i) {
-      const uint32_t lr = g_lr[i].load(std::memory_order_relaxed);
-      if (lr) {
-        v.emplace_back(lr, g_lrcnt[i].load(std::memory_order_relaxed));
-      }
+  if (g_passprobe && (n % 120 == 0)) {
+    // Windowed deltas over the last ~120 presents -> isolates the CURRENT regime (heavy combat),
+    // instead of diluting the heavy signal with thousands of light boot/menu frames.
+    const uint64_t total = g_kicks.load(std::memory_order_relaxed);
+    const uint64_t frame = g_frame_kicks.load(std::memory_order_relaxed);
+    const uint64_t wtotal = total - s_last_total;
+    const uint64_t wframe = frame - s_last_frame;
+    const uint64_t wpres = (n - s_last_present) ? (n - s_last_present) : 1;
+    std::vector<std::pair<int, uint64_t>> v;
+    for (int i = 0; i < kNumPasses; ++i) {
+      const uint64_t c = g_pass_kicks[i].load(std::memory_order_relaxed);
+      v.emplace_back(i, c - s_last_pass[i]);
+      s_last_pass[i] = c;
     }
     std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
-    const uint64_t total = g_resv_calls.load(std::memory_order_relaxed);
-    std::string s = "[hle-drawprobe] emitter sub_821CC830 calls=" + std::to_string(total) +
-                    " (~" + std::to_string(total / n) + "/frame) distinct_callers=" +
-                    std::to_string(v.size()) + " top-lr:";
-    for (size_t i = 0; i < v.size() && i < 8; ++i) {
-      char buf[40];
-      std::snprintf(buf, sizeof(buf), " %08X=%llu", v[i].first, (unsigned long long)v[i].second);
+    std::string s = "[hle-passprobe] win=" + std::to_string(wpres) + "f kicks total=" +
+                    std::to_string(wtotal) + " (~" + std::to_string(wtotal / wpres) +
+                    "/f) frame970=" + std::to_string(wframe) + " by-pass(win):";
+    for (auto& p : v) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), " %s=%llu", kPassNames[p.first], (unsigned long long)p.second);
       s += buf;
     }
     REXLOG_INFO("{}", s);
+    s_last_total = total;
+    s_last_frame = frame;
+    s_last_present = n;
   }
 }
