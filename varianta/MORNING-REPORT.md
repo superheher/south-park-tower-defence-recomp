@@ -1,0 +1,59 @@
+# Variant A — Morning Report (autonomous night session, 2026-05-31 → 06-01)
+
+Branch `experimental/hle-graphics-spike` · 5 commits, **NOT pushed** · prod `.so` `1a3f6076` untouched ·
+`rexglue-sdk` untouched · superproject pointer not bumped. Full timeline in `NIGHT-LOG.md`.
+
+## TL;DR
+The entire **deterministic front is done**: the XenonRecomp recompiler now handles **every** instruction
+South Park uses (gap 13,183 → **0**), its jump tables are recovered (**0 → 93** validated), and **all 90
+generated TUs compile** (`-fsyntax-only`). The host runtime (the multi-week phase) is **scaffolded +
+fully enumerated** (474 imports to implement, with a 1:1 behaviour reference).
+
+## What landed
+### TASK 1 — instruction gap closed: 13,183 → 0  ✅
+Added the ~51 missing emitter cases to `recompiler.cpp` (+ 2 helpers to `ppc_context.h`), in 3 verified batches:
+- **Scalar (7):** `addc addme subfze bdzf bdnzt cror crorc` — carry ops on the `ADDE`/`SUBFE` two-term
+  pattern; CTR-decrement branches select the **real** CR bit (`cr(BI/4).{lt,gt,eq,so}`), not hard-coded eq.
+- **Vector (26+):** `vslh vsrh vsrah vsrab vrlh` (per-lane shifts/rotate), `vsubshs vmaxsh vminsh vminsw
+  vsububm vaddsbs vsubsbs vavguh` (simde intrinsics), `vaddsws vavgsw` (int64-clamp), `vspltish`,
+  `vcmpgtsh vcmpgtsw vcmpequh` (+ CR6), `vpk{shss,swss,swus,uhus}[128]` (packs), `stvebx`; aliased
+  `vsel128`→`VSEL`, `lvehx`→`LVX`. Helpers `simde_mm_vctuxs`, `simde_mm_vslo` ported into `ppc_context.h`.
+- **Trajectory:** 13,183 (start of project) → 10,960 (prior session) → 10,363 → 94 → **0**.
+- Every non-trivial op was cross-referenced against RexGlue's recompilation of this exact XEX.
+
+### TASK 2 — jump tables recovered: 0 → 93  ✅ (with caveat)
+Extended XenonAnalyse (`XenonAnalyse/main.cpp`): NOP-tolerant `SearchMask`, **role-based `ReadTableSP`**
+(identifies prologue ops by opcode, not fixed offset), and SP-ordered patterns. Root cause of XenonAnalyse's
+"0 detected": SP's MSVC-360 inserts alignment NOPs and reorders `rlwinm`/`addi` vs Unleashed. → detects
+**102** tables; cross-validated every one against RexGlue (0 misreads); shipped the **93 fully-in-bounds**
+in `sp_switch_tables.toml`. 93 `bctr` sites now emit real `switch` statements (were indirect calls).
+
+### TASK 3 — generated C++ stays syntax-clean  ✅
+All 90 `ppc_recomp.*.cpp` + `ppc_func_mapping.cpp` pass `clang++ -std=c++20 -fsyntax-only`, re-checked
+after the jump tables landed.
+
+### TASK 4 — host runtime: scaffold + enumeration  ◑
+`varianta/runtime/`: the recompiler ABI is documented; **474** kernel/xam imports enumerated
+(`IMPORTS-TODO.md`); `gen_import_stubs.py` emits link-ready trap-stubs (verified correct C++ linkage);
+`CMakeLists.txt` + `host_stub.cpp` + `README.md` lay out the build and the completion path. The full
+90-TU build/link and the real runtime were **not** attempted (the genuinely multi-week phase).
+
+## ⚠ Flagged for human review
+1. **Function-boundary problem (TASK 2 caveat, README-acknowledged).** 9 detected jump tables and 161
+   pre-existing `// ERROR <addr>` conditional-branch markers target addresses XenonAnalyse split into
+   *separate* functions, so `goto` can't reach them. Verified the switch tables add **zero** new errors.
+   Fix needs manual function-boundary overrides (or a boundary-analyzer extension). Not a compile blocker.
+2. **Latent pre-existing upstream gaps** (independent of my work, surfaced in the recompile log): 39
+   `vcmpgtuh.` record-form sites don't set CR6 (upstream `VCMPGTUH` has no Rc handling); 20 `VPKD3D128`
+   "unexpected float16_4 pack" warnings. Low priority until runtime.
+
+## Exact next step
+Run the link-with-stubs to close TASK 4's first milestone:
+```
+cd varianta && (regenerate ppc/ per README) \
+  && python3 runtime/gen_import_stubs.py \
+  && cmake -S runtime -B runtime/out -G Ninja && cmake --build runtime/out
+```
+Then begin the real runtime (memory + XEX loader + func-table init), porting the 474 imports from
+`third_party/rexglue-sdk/src/` per `runtime/IMPORTS-TODO.md`. After that: function-boundary overrides to
+reclaim the 9 deferred jump tables + the 161 branch markers, then the native renderer (Plume + 19 shaders).

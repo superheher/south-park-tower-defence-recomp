@@ -70,4 +70,26 @@ Driver: `docs/NEXT-SESSION-VARIANTA-PROMPT.md`. **NEVER push.** Commit each incr
     share one root cause — XenonAnalyse splits functions at computed-jump targets, so some branch/case
     targets land outside their function. Verified switch tables add ZERO errors (count identical with/
     without tables; switch-case errors `// ERROR:`-with-colon = 0). Fix path = manual function-boundary
-    overrides or a boundary-analyzer extension (separate task).
+    overrides or a boundary-analyzer extension (separate task). Committed (`4ae4809`).
+- **[00:30] TASK 4 (host-runtime) — SCAFFOLD + full enumeration (the large remaining phase; bounded).**
+  Recovered the recompiler ABI from `ppc_context.h`: `PPC_FUNC(f)=void f(PPCContext&,uint8_t* base)`,
+  guest memory = `base+addr` (4 GiB, byte-swapped), indirect dispatch via `PPC_LOOKUP_FUNC`+
+  `PPCFuncMappings[]`. Surface: **22,782** recompiled guest funcs + **474** kernel/xam imports to
+  implement (Xam 44, Nt 30, Net 28, Ke 26, Rtl 21, Vd 20, Ex 11, …) — RexGlue's `rexglue-sdk/src/`
+  implements all (1:1 behaviour ref). Built `varianta/runtime/`: `IMPORTS-TODO.md` (categorized list),
+  `gen_import_stubs.py` (emits 474 trap-stubs so the image links — uses plain `PPC_FUNC` to match the
+  C++-linkage `PPC_EXTERN_FUNC` import decls in `ppc_recomp_shared.h`), `CMakeLists.txt` (globs ppc/ +
+  runtime/), `host_stub.cpp` (placeholder main + loader TODOs), `README.md` (completion path). Validated:
+  stubs + host_stub object-compile clean; import symbols defined with correct mangled C++ linkage
+  (`_Z15__imp__DbgPrintR10PPCContextPh`). NOT done: full 90-TU build/link (heavy/open-ended) and the
+  real runtime (memory+loader+imports+entry) — that's the multi-week phase; scaffold is ready to build.
+
+## Summary (night of 2026-05-31 → 06-01)
+| Task | Result |
+|---|---|
+| **1. Instruction gap** | ✅ **13,183 → 0** (51 new instrs: 7 scalar + 26+ vector + helpers; all RexGlue-cross-checked) |
+| **2. Jump tables** | ✅ **0 → 93** validated tables (extended XenonAnalyse: nop-tolerant + role-based + SP patterns); 9 deferred (boundary) |
+| **3. Syntax-clean** | ✅ all 90 generated TUs pass `-fsyntax-only` (re-checked with tables) |
+| **4. Host runtime** | ◑ scaffold + 474-import enumeration (the large remaining phase) |
+Commits on `experimental/hle-graphics-spike` (NOT pushed): `8e1e0dd`, `d7f16e5`, `ec0f24b`, `4ae4809`, + TASK4.
+Prod `.so` `1a3f6076` untouched; rexglue-sdk untouched; superproject pointer not bumped.
