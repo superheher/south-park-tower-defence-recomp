@@ -1,0 +1,35 @@
+# XenonRecomp config for South Park: Let's Go Tower Defense Play! (variant A).
+# Paths are relative to this TOML's directory (south-park-recomp/varianta/).
+# Register save/restore addresses cribbed from the RexGlue function table
+# (generated/default/south_park_td_register.cpp); setjmp/longjmp from the RexGlue
+# manifest (SEH-unwind-fix root-caused: setjmp=EH-hook dispatcher sub_8242EEA0,
+# longjmp=RtlRestoreContext sub_8242EA70).
+[main]
+file_path = "../private/extracted/default.xex"
+out_directory_path = "ppc"
+switch_table_file_path = "sp_switch_tables.toml"
+
+# --- register save/restore (RexGlue south_park_td_register.cpp) ---
+savegprlr_14_address = 0x8242BE60
+restgprlr_14_address = 0x8242BEB0
+savefpr_14_address   = 0x8242CA40
+restfpr_14_address   = 0x8242CA8C
+savevmx_14_address   = 0x8242C4E0
+restvmx_14_address   = 0x8242C778
+savevmx_64_address   = 0x8242C574
+restvmx_64_address   = 0x8242C80C
+
+# --- setjmp / longjmp (RexGlue manifest) ---
+setjmp_address  = 0x8242EEA0
+longjmp_address = 0x8242EA70
+
+# Optimizations OFF for the first recompilation (per XenonRecomp README: enable only
+# after a successfully running recompilation).
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
