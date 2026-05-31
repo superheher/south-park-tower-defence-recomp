@@ -1,3 +1,199 @@
+diff --git a/XenonAnalyse/main.cpp b/XenonAnalyse/main.cpp
+index d08371e..191d7d1 100644
+--- a/XenonAnalyse/main.cpp
++++ b/XenonAnalyse/main.cpp
+@@ -101,6 +101,104 @@ void ReadTable(Image& image, SwitchTable& table)
+     }
+ }
+ 
++// Collect the first `n` non-NOP instructions starting at `base` (forward). Returns count collected.
++static size_t CollectForward(Image& image, size_t base, ppc_insn* out, size_t n)
++{
++    auto* code = (uint32_t*)image.Find(base);
++    if (code == nullptr)
++        return 0;
++    size_t got = 0, k = 0;
++    while (got < n && k < n + 24)
++    {
++        ppc::Disassemble(code + k, base + 4 * k, out[got]);
++        if (out[got].opcode != nullptr && out[got].opcode->id != PPC_INST_NOP)
++            ++got;
++        ++k;
++    }
++    return got;
++}
++
++// South Park (variant A): role-based, NOP- and order-tolerant replacement for ReadTable.
++// SP's MSVC-360 schedule reorders rlwinm/addi and inserts alignment NOPs vs Unleashed, so we
++// identify the prologue instructions by their role (opcode) rather than a fixed offset, then
++// reuse XenonAnalyse's per-type address arithmetic. The type is derived from the load opcode.
++void ReadTableSP(Image& image, SwitchTable& table)
++{
++    ppc_insn ins[16];
++    size_t n = CollectForward(image, table.base, ins, 16);
++
++    int lis1 = -1, addi1 = -1, lis2 = -1, addi2 = -1, loadIdx = -1, shiftIdx = -1;
++    uint32_t loadId = 0;
++    for (size_t i = 0; i < n; i++)
++    {
++        if (ins[i].opcode == nullptr)
++            continue;
++        uint32_t id = ins[i].opcode->id;
++        if (id == PPC_INST_MTCTR)
++            break; // prologue ends at mtctr
++        if (id == PPC_INST_LIS)
++        {
++            if (lis1 < 0) lis1 = (int)i; else if (lis2 < 0) lis2 = (int)i;
++        }
++        else if (id == PPC_INST_ADDI)
++        {
++            if (lis1 >= 0 && addi1 < 0 && lis2 < 0) addi1 = (int)i;
++            else if (lis2 >= 0 && addi2 < 0) addi2 = (int)i;
++        }
++        else if (id == PPC_INST_LWZX || id == PPC_INST_LBZX || id == PPC_INST_LHZX)
++        {
++            loadIdx = (int)i; loadId = id;
++        }
++        else if (id == PPC_INST_RLWINM && loadIdx >= 0 && shiftIdx < 0)
++        {
++            shiftIdx = (int)i; // rlwinm AFTER the load => value shift (computed type)
++        }
++    }
++
++    if (lis1 < 0 || addi1 < 0 || loadIdx < 0)
++    {
++        table.base = 0; // not a recognizable jump-table prologue; skip
++        return;
++    }
++
++    uint32_t pOffset = (ins[lis1].operands[1] << 16) + ins[addi1].operands[2];
++
++    if (loadId == PPC_INST_LWZX)
++    {
++        const auto* offsets = (be<uint32_t>*)image.Find(pOffset); // absolute target words
++        for (size_t i = 0; i < table.labels.size(); i++)
++            table.labels[i] = offsets[i];
++        return;
++    }
++
++    if (lis2 < 0 || addi2 < 0)
++    {
++        table.base = 0;
++        return;
++    }
++    uint32_t base = (ins[lis2].operands[1] << 16) + ins[addi2].operands[2];
++
++    if (loadId == PPC_INST_LBZX && shiftIdx >= 0)
++    {
++        uint32_t shift = ins[shiftIdx].operands[2]; // computed: base + (byte[i] << shift)
++        const auto* offsets = (uint8_t*)image.Find(pOffset);
++        for (size_t i = 0; i < table.labels.size(); i++)
++            table.labels[i] = base + (offsets[i] << shift);
++    }
++    else if (loadId == PPC_INST_LBZX)
++    {
++        const auto* offsets = (uint8_t*)image.Find(pOffset); // byte offset: base + byte[i]
++        for (size_t i = 0; i < table.labels.size(); i++)
++            table.labels[i] = base + offsets[i];
++    }
++    else // PPC_INST_LHZX
++    {
++        const auto* offsets = (be<uint16_t>*)image.Find(pOffset); // short offset: base + halfword[i]
++        for (size_t i = 0; i < table.labels.size(); i++)
++            table.labels[i] = base + offsets[i];
++    }
++}
++
+ void ScanTable(const uint32_t* code, size_t base, SwitchTable& table)
+ {
+     ppc_insn insn;
+@@ -153,14 +251,23 @@ void* SearchMask(const void* source, const uint32_t* compare, size_t compareCoun
+ 
+     for (size_t i = 0; i < count; i++)
+     {
+-        size_t c = 0;
+-        for (c = 0; c < compareCount; c++)
++        // NOP-tolerant match (South Park's compiler inserts alignment NOPs mid-prologue).
++        // The match must START at a non-NOP equal to compare[0]; interior NOPs are skipped.
++        size_t c = 0, j = 0;
++        while (c < compareCount && (i + j) < count)
+         {
+-            ppc::Disassemble(&src[i + c], 0, insn);
+-            if (insn.opcode == nullptr || insn.opcode->id != compare[c])
+-            {
++            ppc::Disassemble(&src[i + j], 0, insn);
++            if (insn.opcode == nullptr)
+                 break;
++            if (insn.opcode->id == PPC_INST_NOP && c > 0)
++            {
++                j++;
++                continue;
+             }
++            if (insn.opcode->id != compare[c])
++                break;
++            c++;
++            j++;
+         }
+ 
+         if (c == compareCount)
+@@ -238,9 +345,18 @@ int main(int argc, char** argv)
+                         // fmt::println("{:X} ; jmptable - {}", base + (data - dataStart), table.labels.size());
+                         if (table.base != 0)
+                         {
+-                            ReadTable(image, table);
+-                            printTable(table);
+-                            switches.emplace_back(std::move(table));
++                            ReadTableSP(image, table); // role-based, NOP/order tolerant (South Park)
++                            if (table.base != 0)
++                            {
++                                bool dup = false;
++                                for (const auto& s : switches)
++                                    if (s.base == table.base) { dup = true; break; }
++                                if (!dup)
++                                {
++                                    printTable(table);
++                                    switches.emplace_back(std::move(table));
++                                }
++                            }
+                         }
+ 
+                         data += 4;
+@@ -305,6 +421,35 @@ int main(int argc, char** argv)
+     scanPattern(offsetSwitch, std::size(offsetSwitch), SWITCH_BYTEOFFSET);
+     scanPattern(wordOffsetSwitch, std::size(wordOffsetSwitch), SWITCH_SHORTOFFSET);
+ 
++    // South Park (variant A): MSVC-360 reorders rlwinm before the table-base addi vs Unleashed.
++    // NOPs are absorbed by the NOP-tolerant SearchMask; ReadTableSP reads operands by role.
++    // (The computed/byte-offset SP schedules share Unleashed's opcode order, so the patterns above
++    // already cover them once NOPs are skipped; these two cover the reordered absolute/short forms.)
++    println("# ---- SOUTH PARK JUMPTABLES ----");
++    uint32_t spAbsoluteSwitch[] =
++    {
++        PPC_INST_LIS,
++        PPC_INST_RLWINM,
++        PPC_INST_ADDI,
++        PPC_INST_LWZX,
++        PPC_INST_MTCTR,
++        PPC_INST_BCTR,
++    };
++    scanPattern(spAbsoluteSwitch, std::size(spAbsoluteSwitch), SWITCH_ABSOLUTE);
++
++    uint32_t spShortOffsetSwitch[] =
++    {
++        PPC_INST_LIS,
++        PPC_INST_RLWINM,
++        PPC_INST_ADDI,
++        PPC_INST_LHZX,
++        PPC_INST_LIS,
++        PPC_INST_ADDI,
++        PPC_INST_ADD,
++        PPC_INST_MTCTR,
++    };
++    scanPattern(spShortOffsetSwitch, std::size(spShortOffsetSwitch), SWITCH_SHORTOFFSET);
++
+     std::ofstream f(argv[2]);
+     f.write(out.data(), out.size());
+ 
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
 index fa91527..22abbfc 100644
 --- a/XenonRecomp/recompiler.cpp
