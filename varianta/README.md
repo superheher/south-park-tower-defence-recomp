@@ -23,9 +23,13 @@ renderer + a host runtime), which re-emits the guest *including* D3D — the cle
    instructions South Park uses (decoder already supports them all — `thirdparty/disasm/ppc-inst.h` has
    the `PPC_INST_*` enums — so it is purely missing `recompiler.cpp` switch cases). Implemented the 10
    integer load/store-with-update variants (`patches/xenonrecomp-sp-instructions.patch`) → unrecognized
-   dropped **13,183 → 11,821**. The extend→rebuild→recompile loop is proven.
+   dropped **13,183 → 11,821**, then a second safe batch (`eqv`, `lhbrx`, float load/store-update)
+   → **10,960** (18 instructions total). The extend→rebuild→recompile loop is proven; each batch zeros
+   its instructions out.
 
-## Remaining instruction gap (~11,821 occurrences, ~50 distinct)
+## Remaining instruction gap (~10,960 occurrences, ~48 distinct)
+Deferred-on-purpose scalar (need XER/CTR/CR-bit care + XenonTests): `bdzf`/`bdnzt`, `addc`/`addme`/
+`subfze`, `cror`/`crorc`. Plus the vector bulk below.
 RexGlue's recomp implements ALL of these — use `generated/default/*` (or Xenia) as the reference, and
 validate with `XenonTests`. Watch the **reversed 16-byte vector element order** convention (README §Vectors).
 - **VECTOR / VMX (~10,358)** — the bulk: `vslh` 3980, `vsubshs` 2291, `vsrah` 1630, `vspltish` 767,
