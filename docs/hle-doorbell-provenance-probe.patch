@@ -1,0 +1,217 @@
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 3877b1a..5bb1163 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -26,6 +26,142 @@
+ #include <rex/logging.h>
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
++
++#include <dlfcn.h>     // [hle] doorbell probe (dladdr symbolization)
++#include <execinfo.h>  // [hle] doorbell probe (backtrace — async-signal-safe capture)
++
++#include <atomic>     // [hle] doorbell probe
++#include <cstdio>     // [hle] doorbell probe (snprintf)
++#include <cstdlib>    // [hle] doorbell probe (getenv)
++#include <cstring>    // [hle] doorbell probe (strrchr)
++#include <map>        // [hle] doorbell probe (rip-RVA histogram)
++#include <string>     // [hle] doorbell probe
++#include <vector>     // [hle] doorbell probe
++
++// ============================================================================================
++// [hle] Draw-provenance probe (TEMP, getenv-gated REX_HLE_DOORBELL_DIAG).
++//
++// The CP_RB_WPTR doorbell (CommandProcessor::UpdateWritePointer) is the ONE guest-thread-
++// synchronous GPU seam: the guest writes it to kick the async CP worker. MMIO writes are handled
++// via guard-page faults (MMIOHandler::ExceptionCallback), and the recomp is AOT C++ (no guest PC),
++// so the faulting HOST RIP is inside the compiled __imp__sub_<addr> that issued the store — i.e.
++// the XDK command-buffer flush/kick function. mmio_handler passes that RIP through the (otherwise
++// null) ppc_context slot; we turn it into a per-module RVA via dladdr and histogram it. The kick
++// rate gives the batching structure (kicks/frame); the RVA top is the kick site — symbolize it
++// offline with `nm` against the EXE/.so to get the guest function, then climb its callers to the
++// dominant draw (Phase-0 step 3).
++// ============================================================================================
++namespace {
++const bool g_hle_doorbell_diag = std::getenv("REX_HLE_DOORBELL_DIAG") != nullptr;
++constexpr int kHleMaxRipSlots = 64;
++std::atomic<uint64_t> g_hle_rip[kHleMaxRipSlots];     // raw host RIP, 0 = empty
++std::atomic<uint64_t> g_hle_ripcnt[kHleMaxRipSlots];  // per-RIP kick count
++std::atomic<uint64_t> g_hle_kick_count{0};
++
++// One-shot host backtrace at the first kick — walks kick(sub_821C6600) -> flush -> ... -> the
++// title render function -> frame loop, revealing the function that issues the draws (which appear
++// to be inline XDK packet-builds, so the hook target is the render function, not a D3D-API call).
++// backtrace() is async-signal-safe; symbolization (dladdr) is deferred to the vsync dump thread.
++constexpr int kHleBtMax = 32;
++void* g_hle_bt[kHleBtMax];
++std::atomic<int> g_hle_bt_n{0};
++std::atomic<bool> g_hle_bt_captured{false};
++std::atomic<bool> g_hle_bt_logged{false};
++
++// SIGNAL CONTEXT — runs inside the MMIO guard-page fault handler (SIGSEGV). Must be
++// async-signal-safe: lock-free atomics only, NO malloc / mutex / dladdr / logging (an earlier
++// version called dladdr here and deadlocked on the dynamic-linker lock). Just record the raw
++// faulting host RIP into a fixed open-addressed table; symbolization happens off-signal.
++void HleDoorbellProbe(void* host_rip_ptr) {
++  const uint64_t rip = reinterpret_cast<uintptr_t>(host_rip_ptr);
++  const uint64_t k = g_hle_kick_count.fetch_add(1, std::memory_order_relaxed) + 1;
++  // Sample a fresh kick backtrace every 4000 kicks (re-arming): in heavy combat, mid-draw-loop
++  // overflow kicks dominate the count, so most samples are taken INSIDE the dominant render
++  // function (whereas the frontend only ever flushes at the frame boundary). Capture (AS-safe)
++  // here; symbolize off in the vsync dump.
++  if (rip != 0 && (k % 4000 == 0)) {
++    bool expected = false;
++    if (g_hle_bt_captured.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
++      g_hle_bt_n.store(backtrace(g_hle_bt, kHleBtMax), std::memory_order_release);  // AS-safe
++    }
++  }
++  for (int i = 0; i < kHleMaxRipSlots; ++i) {
++    uint64_t cur = g_hle_rip[i].load(std::memory_order_relaxed);
++    if (cur == rip) {
++      g_hle_ripcnt[i].fetch_add(1, std::memory_order_relaxed);
++      return;
++    }
++    if (cur == 0) {
++      uint64_t expected = 0;
++      if (g_hle_rip[i].compare_exchange_strong(expected, rip, std::memory_order_relaxed) ||
++          g_hle_rip[i].load(std::memory_order_relaxed) == rip) {
++        g_hle_ripcnt[i].fetch_add(1, std::memory_order_relaxed);
++        return;
++      }
++    }
++  }
++  // table full — kick still counted, RIP dropped (distinct sites are expected to be very few).
++}
++
++// SAFE CONTEXT — called from the vsync worker thread. dladdr-symbolizes each captured RIP to
++// module+RVA (map offline with `nm` against the EXE/.so to get the guest sub_<addr> kick site).
++void HleDoorbellDump() {
++  const uint64_t k = g_hle_kick_count.load(std::memory_order_relaxed);
++  if (k == 0) {
++    return;
++  }
++  // Symbolize the most recent sampled kick backtrace (kick -> flush -> ... -> render fn), then
++  // re-arm so the next 4000-kick window captures a fresh one.
++  if (g_hle_bt_captured.load(std::memory_order_relaxed) &&
++      g_hle_bt_n.load(std::memory_order_acquire) > 0) {
++    const int n = g_hle_bt_n.load(std::memory_order_relaxed);
++    std::string line = "[hle-kickstack] k=" + std::to_string(k) + ":";
++    for (int i = 0; i < n; ++i) {
++      const char* mod = "?";
++      uint64_t rva = reinterpret_cast<uintptr_t>(g_hle_bt[i]);
++      Dl_info info;
++      if (dladdr(g_hle_bt[i], &info) && info.dli_fbase) {
++        mod = info.dli_fname ? info.dli_fname : "?";
++        rva = reinterpret_cast<uintptr_t>(g_hle_bt[i]) - reinterpret_cast<uintptr_t>(info.dli_fbase);
++      }
++      const char* base = std::strrchr(mod, '/');
++      base = base ? base + 1 : mod;
++      char buf[48];
++      std::snprintf(buf, sizeof(buf), " #%d:%s+0x%llX", i, base, (unsigned long long)rva);
++      line += buf;
++    }
++    REXGPU_INFO("{}", line);
++    g_hle_bt_n.store(0, std::memory_order_relaxed);
++    g_hle_bt_captured.store(false, std::memory_order_relaxed);  // re-arm
++  }
++  std::vector<std::pair<uint64_t, uint64_t>> v;  // (raw rip, count)
++  for (int i = 0; i < kHleMaxRipSlots; ++i) {
++    uint64_t rip = g_hle_rip[i].load(std::memory_order_relaxed);
++    if (rip) {
++      v.emplace_back(rip, g_hle_ripcnt[i].load(std::memory_order_relaxed));
++    }
++  }
++  std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
++  std::string s = "[hle-doorbell] kicks=" + std::to_string(k) +
++                  " distinct_rip=" + std::to_string(v.size()) + " top:";
++  for (size_t i = 0; i < v.size() && i < 8; ++i) {
++    const char* mod = "?";
++    uint64_t rva = v[i].first;
++    Dl_info info;
++    if (dladdr(reinterpret_cast<void*>(v[i].first), &info) && info.dli_fbase) {
++      mod = info.dli_fname ? info.dli_fname : "?";
++      rva = v[i].first - reinterpret_cast<uintptr_t>(info.dli_fbase);
++    }
++    const char* base = std::strrchr(mod, '/');
++    base = base ? base + 1 : mod;
++    char buf[96];
++    std::snprintf(buf, sizeof(buf), " %s+0x%llX=%llu(%.0f%%)", base, (unsigned long long)rva,
++                  (unsigned long long)v[i].second, 100.0 * double(v[i].second) / double(k));
++    s += buf;
++  }
++  REXGPU_INFO("{}", s);
++}
++}  // namespace
+ #include <rex/system/xthread.h>
+ #include <rex/ui/graphics_provider.h>
+ #include <rex/ui/window.h>
+@@ -171,6 +307,13 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             last_frame_time += interval_ticks;
+           }
+           rex::thread::Sleep(std::chrono::milliseconds(1));
++          if (g_hle_doorbell_diag) {  // [hle] symbolize+log the doorbell RIP table off-signal
++            static int hle_dump_tick = 0;
++            if (++hle_dump_tick >= 2000) {  // ~2s at 1ms/iter
++              hle_dump_tick = 0;
++              HleDoorbellDump();
++            }
++          }
+         }
+         return 0;
+       }));
+@@ -235,6 +378,9 @@ uint32_t GraphicsSystem::ReadRegisterThunk(void* ppc_context, GraphicsSystem* gs
+ 
+ void GraphicsSystem::WriteRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr,
+                                         uint32_t value) {
++  if (g_hle_doorbell_diag && ((addr & 0xFFFF) / 4) == 0x01C5) {  // CP_RB_WPTR doorbell
++    HleDoorbellProbe(ppc_context);
++  }
+   gs->WriteRegister(addr, value);
+ }
+ 
+@@ -332,7 +478,16 @@ void GraphicsSystem::MarkVblank() {
+   // Increment vblank counter (so the game sees us making progress).
+   if (command_processor_) {
+     command_processor_->increment_counter();
++    // [recomp fix] Also publish the live counter to the guest's GPU-vblank-counter fence so a guest
++    // polling it between EVENT_WRITE_SHD packets sees vblank progress (fixes the boot intro freeze
++    // where the guest waits forever for the counter target the fence was never refreshed to).
++    command_processor_->RefreshVblankFence();
+   }
++  // [recomp fix: block-on-signal] Wake any guest thread parked in REX_SPIN_BACKOFF's
++  // VblankBackoffWait() on its GPU/vblank-fence spin: we just advanced the vblank counter / fence, so
++  // its wait may now be satisfied. This lets the guest Main thread BLOCK on the fence (freeing its
++  // core) instead of pause-spinning ~34% of all combat-dip cycles in the fence predicate.
++  rex::thread::NotifyVblank();
+ 
+   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
+   //     something wrong and the CP will block waiting for code that
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index 2b93005..8999aaa 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -116,7 +116,11 @@ bool MMIOHandler::CheckLoad(uint32_t virtual_address, uint32_t* out_value) {
+ bool MMIOHandler::CheckStore(uint32_t virtual_address, uint32_t value) {
+   for (const auto& range : mapped_ranges_) {
+     if ((virtual_address & range.mask) == range.address) {
+-      range.write(nullptr, range.callback_context, virtual_address, value);
++      // [hle] CheckStore is called inline from the recomp store path on the guest thread, so the
++      // return address is the host RIP inside the compiled guest function that did the MMIO write
++      // (e.g. the command-buffer kick). Pass it through the (else-null) ppc_context slot for the
++      // doorbell provenance probe.
++      range.write(__builtin_return_address(0), range.callback_context, virtual_address, value);
+       return true;
+     }
+   }
+@@ -504,7 +508,10 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+         value = rex::byte_swap(value);
+       }
+     }
+-    range->write(nullptr, range->callback_context, fault_guest_virtual_address, value);
++    // [hle] Pass the faulting host RIP through the (otherwise-null) ppc_context slot so the GPU
++    // doorbell probe can symbolize the guest function that kicked the command processor.
++    range->write(reinterpret_cast<void*>(rip), range->callback_context, fault_guest_virtual_address,
++                 value);
+   }
+ 
+ #if REX_ARCH_ARM64
