@@ -1,5 +1,5 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..e64f076 100644
+index fa91527..b175a64 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -1684,6 +1684,130 @@ bool Recompiler::Recompile(
@@ -133,3 +133,64 @@ index fa91527..e64f076 100644
      case PPC_INST_SUBF:
          println("\t{}.s64 = {}.s64 - {}.s64;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]));
          if (strchr(insn.opcode->name, '.'))
+@@ -2263,6 +2387,60 @@ bool Recompiler::Recompile(
+         println("\t{}.u64 = {}.u64 ^ {};", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2] << 16);
+         break;
+ 
++    // --- South Park (variant A) added instructions: scalar ---
++    case PPC_INST_ADDC:
++        println("\t{}.ca = {}.u32 + {}.u32 < {}.u32;", xer(), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]));
++        println("\t{}.u64 = {}.u64 + {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_ADDME:
++        println("\t{}.u8 = ({}.u32 + 0xFFFFFFFFu < {}.u32) | ({}.u32 + 0xFFFFFFFFu + {}.ca < {}.ca);", temp(), r(insn.operands[1]), r(insn.operands[1]), r(insn.operands[1]), xer(), xer());
++        println("\t{}.u64 = {}.u64 + {}.ca + 0xFFFFFFFFFFFFFFFFull;", r(insn.operands[0]), r(insn.operands[1]), xer());
++        println("\t{}.ca = {}.u8;", xer(), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_SUBFZE:
++        println("\t{}.u8 = ~{}.u32 + {}.ca < ~{}.u32;", temp(), r(insn.operands[1]), xer(), r(insn.operands[1]));
++        println("\t{}.u64 = ~{}.u64 + {}.ca;", r(insn.operands[0]), r(insn.operands[1]), xer());
++        println("\t{}.ca = {}.u8;", xer(), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_BDZF:
++    {
++        const char* crf[] = { "lt", "gt", "eq", "so" };
++        println("\t--{}.u64;", ctr());
++        println("\tif ({}.u32 == 0 && !{}.{}) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), crf[insn.operands[0] % 4], insn.operands[1]);
++        break;
++    }
++
++    case PPC_INST_BDNZT:
++    {
++        const char* crf[] = { "lt", "gt", "eq", "so" };
++        println("\t--{}.u64;", ctr());
++        println("\tif ({}.u32 != 0 && {}.{}) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), crf[insn.operands[0] % 4], insn.operands[1]);
++        break;
++    }
++
++    case PPC_INST_CROR:
++    {
++        const char* crf[] = { "lt", "gt", "eq", "so" };
++        println("\t{}.{} = {}.{} | {}.{};", cr(insn.operands[0] / 4), crf[insn.operands[0] % 4], cr(insn.operands[1] / 4), crf[insn.operands[1] % 4], cr(insn.operands[2] / 4), crf[insn.operands[2] % 4]);
++        break;
++    }
++
++    case PPC_INST_CRORC:
++    {
++        const char* crf[] = { "lt", "gt", "eq", "so" };
++        println("\t{}.{} = {}.{} | !({}.{});", cr(insn.operands[0] / 4), crf[insn.operands[0] % 4], cr(insn.operands[1] / 4), crf[insn.operands[1] % 4], cr(insn.operands[2] / 4), crf[insn.operands[2] % 4]);
++        break;
++    }
++
+     default:
+         return false;
+     }
