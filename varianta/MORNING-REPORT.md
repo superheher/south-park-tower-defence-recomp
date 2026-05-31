@@ -6,8 +6,9 @@ Branch `experimental/hle-graphics-spike` · 5 commits, **NOT pushed** · prod `.
 ## TL;DR
 The entire **deterministic front is done**: the XenonRecomp recompiler now handles **every** instruction
 South Park uses (gap 13,183 → **0**), its jump tables are recovered (**0 → 93** validated), and **all 90
-generated TUs compile** (`-fsyntax-only`). The host runtime (the multi-week phase) is **scaffolded +
-fully enumerated** (474 imports to implement, with a 1:1 behaviour reference).
+generated TUs compile** (`-fsyntax-only`). The host runtime is **scaffolded, fully enumerated (474
+imports), and links-with-stubs into a 103 MB executable** (0 undefined symbols) — its bring-up to an
+actual boot (real runtime + renderer) is the deferred multi-week phase.
 
 ## What landed
 ### TASK 1 — instruction gap closed: 13,183 → 0  ✅
@@ -32,11 +33,15 @@ in `sp_switch_tables.toml`. 93 `bctr` sites now emit real `switch` statements (w
 All 90 `ppc_recomp.*.cpp` + `ppc_func_mapping.cpp` pass `clang++ -std=c++20 -fsyntax-only`, re-checked
 after the jump tables landed.
 
-### TASK 4 — host runtime: scaffold + enumeration  ◑
+### TASK 4 — host runtime: scaffold + enumeration + **link-with-stubs**  ✅ (night-scope)
 `varianta/runtime/`: the recompiler ABI is documented; **474** kernel/xam imports enumerated
-(`IMPORTS-TODO.md`); `gen_import_stubs.py` emits link-ready trap-stubs (verified correct C++ linkage);
-`CMakeLists.txt` + `host_stub.cpp` + `README.md` lay out the build and the completion path. The full
-90-TU build/link and the real runtime were **not** attempted (the genuinely multi-week phase).
+(`IMPORTS-TODO.md`); `gen_import_stubs.py` emits link-ready trap-stubs (correct C++ linkage);
+`CMakeLists.txt` + `host_stub.cpp` + `README.md`. **The link-with-stubs build SUCCEEDED**: all 93 TUs
+(22,782 guest funcs + 474 import stubs + host) compile with clang++ and link into `sp_td_varianta`
+(103 MB) with **0 undefined symbols / 0 errors**, and the exe runs (prints scaffold notice, exits 0).
+This is the doc's stated TASK-4 scope met ("get it LINKING with stubs"; "Don't try to boot"). It also
+proves the recompiled image's *only* external references are the enumerated imports. The real runtime
+(memory + XEX loader + 474 import impls + entry) and the renderer remain the genuinely multi-week phase.
 
 ## ⚠ Flagged for human review
 1. **Function-boundary problem (TASK 2 caveat, README-acknowledged).** 9 detected jump tables and 161

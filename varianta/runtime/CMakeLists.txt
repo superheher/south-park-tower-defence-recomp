@@ -23,5 +23,6 @@ target_include_directories(sp_td_varianta PRIVATE
     "${PPC_DIR}"
     "${XR}/XenonUtils"
     "${XR}/thirdparty/simde")
-# -O1: the recompiled TUs are huge; -w silences guest-code warnings (e.g. unused, signedness).
-target_compile_options(sp_td_varianta PRIVATE -O1 -w -fno-strict-aliasing)
+# -O0 for bring-up (the recompiled TUs are huge — keeps compile fast + RAM low); raise later.
+# -w silences guest-code warnings (unused, signedness, etc.).
+target_compile_options(sp_td_varianta PRIVATE -O0 -w -fno-strict-aliasing)

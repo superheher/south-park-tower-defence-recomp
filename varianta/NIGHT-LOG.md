@@ -83,6 +83,13 @@ Driver: `docs/NEXT-SESSION-VARIANTA-PROMPT.md`. **NEVER push.** Commit each incr
   stubs + host_stub object-compile clean; import symbols defined with correct mangled C++ linkage
   (`_Z15__imp__DbgPrintR10PPCContextPh`). NOT done: full 90-TU build/link (heavy/open-ended) and the
   real runtime (memory+loader+imports+entry) — that's the multi-week phase; scaffold is ready to build.
+- **[00:30] TASK 4 LINK-WITH-STUBS — SUCCEEDED.** Built all 93 TUs with clang++ -O0 (89 `ppc_recomp` +
+  `ppc_func_mapping` + 474-stub `import_stubs.gen.cpp` + `host_stub`) and **linked → `sp_td_varianta`
+  (103 MB), 0 undefined symbols, 0 errors**; the exe runs (prints the scaffold notice, exits 0). This
+  proves all **22,782** recompiled functions + the 474 import stubs form a coherent, linkable program —
+  and confirms the ONLY external references are the enumerated imports (no hidden missing symbols). TASK
+  4's stated night-scope (CMake skeleton + link-with-stubs + enumeration) is now COMPLETE. Booting needs
+  the real runtime (deferred per the directive: "Don't try to boot... renderer is the phase after").
 
 ## Summary (night of 2026-05-31 → 06-01)
 | Task | Result |
@@ -90,6 +97,6 @@ Driver: `docs/NEXT-SESSION-VARIANTA-PROMPT.md`. **NEVER push.** Commit each incr
 | **1. Instruction gap** | ✅ **13,183 → 0** (51 new instrs: 7 scalar + 26+ vector + helpers; all RexGlue-cross-checked) |
 | **2. Jump tables** | ✅ **0 → 93** validated tables (extended XenonAnalyse: nop-tolerant + role-based + SP patterns); 9 deferred (boundary) |
 | **3. Syntax-clean** | ✅ all 90 generated TUs pass `-fsyntax-only` (re-checked with tables) |
-| **4. Host runtime** | ◑ scaffold + 474-import enumeration (the large remaining phase) |
+| **4. Host runtime** | ✅ (night-scope) scaffold + **link-with-stubs OK** (103 MB exe, 0 undefined) + 474-import enumeration; real runtime = next phase |
 Commits on `experimental/hle-graphics-spike` (NOT pushed): `8e1e0dd`, `d7f16e5`, `ec0f24b`, `4ae4809`, + TASK4.
 Prod `.so` `1a3f6076` untouched; rexglue-sdk untouched; superproject pointer not bumped.
