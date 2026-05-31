@@ -1,11 +1,33 @@
 # South Park recomp — next-session LAUNCH PROMPT
 
-> **TL;DR of the prior session (2026-05-30/31):** the multi-session combat-floor campaign is **closed with
-> a proof** — the 15–20 fps heavy-combat floor is the **title's own per-frame CPU cost at a fixed-60 Hz
-> timestep** (serial *guest-logic → render → guest-waits*), NOT an emulator inefficiency, NOT GPU-bound,
-> and unmovable without speeding up the game. The **one lever with real floor headroom is draw-call
-> batching via texture arrays** — large, risky, do it WITH the user. Everything safe was shipped/validated.
-> **READ FIRST:** `docs/FLOOR-STRUCTURAL-CONCLUSION-REPORT.md` + memory `sp_two_regime_lag`.
+> **⚠ CORRECTION (2026-05-31, prompted by the user 3rd pushback):** the prior "the 15-20 fps floor is the
+> title's own fixed-60Hz cost, structural, accept it" conclusion was a **MEASUREMENT ARTIFACT** — every
+> "heavy combat" number came from probes that **spam the wave-spawn button every 0.3 s**. A clean NORMAL
+> level-1 playthrough runs **45-60 fps and degrades with entity count** (down to 10-15 fps as waves pile
+> up), NOT a flat floor; the real Xbox 360 has no level-1 slowdown ⇒ this is **fixable recomp overhead**.
+> **READ FIRST:** `docs/FLOOR-REOPENED-NATURAL-LOAD-REPORT.md` + memory `sp_floor_was_artifact`. The old
+> `FLOOR-STRUCTURAL-CONCLUSION-REPORT.md` / `sp_two_regime_lag` are SUPERSEDED on the "structural" claim.
+>
+> **The mechanism (natural-load profile, fps→15.9 on its own, GPU 3%, cores free):** serial chain
+> `guest-sim → WAIT-on-CP (guest spends 13% of process in sub_821B9270 waiting) → CP translates ~816
+> draws/frame (43%, FLAT, no hotspot) → present`. The CP is the long pole; the guest blocks on it; the GPU
+> is idle. CP work is throughput-bound and scales with entity count. **Real levers (NOT exhausted):**
+> (1) **overlap CP-translate(N) with guest-sim(N+1)** — highest value, never actually tried (prior
+> "block-on-signal" only de-spun the wait, didn't remove the serialization); architectural/render-risky.
+> (2) reduce draw COUNT (batching; `DRAW-BATCHING-STEP2-PLAN.md`). (3) audio busy-poll de-spin is
+> off-critical-path AND a naive attempt BACKFIRED 3× (thundering herd — needs per-waiter targeted wake,
+> not a global wake-all CV). Micro-opts confirmed marginal — don't.
+>
+> **Methodology rule learned:** profile NORMAL play (`/tmp/normal_play_capture.sh`, `/tmp/natural_profile.sh`
+> — drive via menus at human cadence, let load build, wait for fps to fall on its OWN), NEVER the
+> wave-spam probes (they create a synthetic overload that misrepresents the game). Re-profile efficiency
+> changes — the deterministic gate won't catch a "correct but slower" regression.
+
+> **TL;DR of the prior session (2026-05-30/31) — SUPERSEDED, kept for context:** the multi-session
+> combat-floor campaign was thought **closed with a proof** — the 15–20 fps heavy-combat floor is the
+> **title's own per-frame CPU cost at a fixed-60 Hz timestep** (serial *guest-logic → render →
+> guest-waits*), NOT an emulator inefficiency, NOT GPU-bound. The **one lever with real floor headroom is
+> draw-call batching via texture arrays** — large, risky, do it WITH the user.
 
 ## State (what you're inheriting)
 Static recomp (rexglue-sdk) of *South Park: Let's Go Tower Defense Play!* (XBLA) → native Linux/Vulkan,
