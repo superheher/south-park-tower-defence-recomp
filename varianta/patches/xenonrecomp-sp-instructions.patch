@@ -1,5 +1,5 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..d3a774b 100644
+index fa91527..22abbfc 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -1133,6 +1133,7 @@ bool Recompiler::Recompile(
@@ -149,7 +149,7 @@ index fa91527..d3a774b 100644
      case PPC_INST_VSEL:
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
          break;
-@@ -2263,6 +2389,190 @@ bool Recompiler::Recompile(
+@@ -2263,6 +2389,205 @@ bool Recompiler::Recompile(
          println("\t{}.u64 = {}.u64 ^ {};", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2] << 16);
          break;
  
@@ -337,6 +337,72 @@ index fa91527..d3a774b 100644
 +        println("\tPPC_STORE_U8({}, {}.u8[15 - ({} & 0xF)]);", ea(), v(insn.operands[0]), ea());
 +        break;
 +
++    case PPC_INST_VCFPUXWS128:
++        // convert float -> unsigned fixed word saturate (unsigned analog of VCTSXS); operand[2] = scale
++        printSetFlushMode(true);
++        print("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_vctuxs(", v(insn.operands[0]));
++        if (insn.operands[2] != 0)
++            println("simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_set1_ps({}))));", v(insn.operands[1]), 1u << insn.operands[2]);
++        else
++            println("simde_mm_load_ps({}.f32)));", v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VSLO:
++    case PPC_INST_VSLO128:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_vslo(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
      default:
          return false;
      }
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..d1cc2b9 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -682,6 +682,46 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
+     return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
+ }
+ 
++// Vector Convert To Unsigned Fixed-Point Word Saturate: float -> uint32 saturated to [0, UINT_MAX];
++// NaN -> 0, negative -> 0, > UINT_MAX -> UINT_MAX. (Ported from RexGlue's validated rex::ppc runtime.)
++inline simde__m128i simde_mm_vctuxs(simde__m128 src1)
++{
++    simde__m128 nan_mask = simde_mm_cmpunord_ps(src1, src1);
++    simde__m128 neg_mask = simde_mm_cmplt_ps(src1, simde_mm_setzero_ps());
++    simde__m128 max_val = simde_mm_set1_ps(4294967295.0f); // UINT_MAX as float
++    simde__m128 overflow_mask = simde_mm_cmpge_ps(src1, max_val);
++    simde__m128 clamped = simde_mm_max_ps(src1, simde_mm_setzero_ps());
++    clamped = simde_mm_min_ps(clamped, max_val);
++    // values >= 2^31 don't fit signed cvtt; subtract 2^31, convert, OR the high bit back
++    simde__m128 half_range = simde_mm_set1_ps(2147483648.0f);
++    simde__m128 high_bit_mask = simde_mm_cmpge_ps(clamped, half_range);
++    simde__m128 adjusted = simde_mm_sub_ps(clamped, simde_mm_and_ps(high_bit_mask, half_range));
++    simde__m128i low_bits = simde_mm_cvttps_epi32(adjusted);
++    simde__m128i high_bit = simde_mm_and_si128(simde_mm_castps_si128(high_bit_mask), simde_mm_set1_epi32(int(0x80000000u)));
++    simde__m128i result = simde_mm_or_si128(low_bits, high_bit);
++    result = simde_mm_andnot_si128(simde_mm_castps_si128(nan_mask), result);
++    result = simde_mm_andnot_si128(simde_mm_castps_si128(neg_mask), result);
++    result = simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_castps_si128(overflow_mask), result),
++                               simde_mm_and_si128(simde_mm_castps_si128(overflow_mask), simde_mm_set1_epi32(-1)));
++    return result;
++}
++
++// Vector Shift Left by Octet: shift the whole vector left by ((vB byte0 >> 3) & 0xF) bytes.
++// Operates in XenonRecomp's fully-reversed vector storage (matches RexGlue's rex::ppc::simde_mm_vslo).
++inline simde__m128i simde_mm_vslo(simde__m128i a, simde__m128i b)
++{
++    int shift_bytes = (simde_mm_extract_epi8(b, 0) >> 3) & 0xF;
++    if (shift_bytes == 0)
++        return a;
++    if (shift_bytes >= 16)
++        return simde_mm_setzero_si128();
++    alignas(16) uint8_t src[16], dst[16] = {};
++    simde_mm_store_si128((simde__m128i*)src, a);
++    for (int i = 0; i < 16 - shift_bytes; i++)
++        dst[i + shift_bytes] = src[i];
++    return simde_mm_load_si128((simde__m128i*)dst);
++}
++
+ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
+ {
+     b = simde_mm_srli_epi64(simde_mm_slli_epi64(b, 61), 61);
