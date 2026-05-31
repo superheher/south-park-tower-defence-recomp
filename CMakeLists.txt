@@ -14,6 +14,7 @@ include(generated/rexglue.cmake)
 set(SOUTHPARKTD_SOURCES
     src/main.cpp
     src/stubs.cpp
+    src/hle_graphics.cpp
     src/launcher/launcher.cpp
     src/launcher/onboarding_dialog.cpp
 )
