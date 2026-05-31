@@ -88,9 +88,23 @@ heavy combat adds the deep mid-loop kicks that reveal the render functions above
 that performs an inline draw loop heavy enough to trigger mid-render overflow kicks. It is
 intercepted today in `src/hle_graphics.cpp` (pass-through + caller histogram).
 
-⚠ **Not yet confirmed as the 72.5% group specifically.** It is on *one* heavy mid-loop kick
-path. To confirm it renders the dominant pixel shader `adf7088205c03df9` (not some other
-pass), the next step correlates the render function with the shader.
+⚠ **It is BROADER than the 72.5% group — refined by a stub test.** Skipping `sub_821CC830`'s
+body entirely (`REX_HLE_STUB_CC830=1`) blanks the **whole** frame to black **and stops swaps**
+(no `[pacing-diag]`), with the process still alive. If it rendered only the dominant sprite
+group, the background and other groups would remain and swaps continue — instead everything
+stops. So `sub_821CC830` is a **central per-frame render/submit function** that the frame
+depends on (it does the inline draw loop AND essential setup/submit), not the isolated 72.5%
+group. The dominant group is emitted *within* `sub_821CC830`'s inline loop (or a callee), at a
+finer grain than a whole-function hook.
+
+**Implication for variant B:** a whole-function override of `sub_821CC830` is too coarse — it
+would have to faithfully reproduce the entire pass. The right hook grain is either (a) a
+**mid-asm hook** at the specific inline-draw site for the dominant shader inside `sub_821CC830`
+(RexGlue supports `[[midasm_hook]]` at a guest instruction address), or (b) intercept at the
+shader-bind for `adf7088205c03df9` and the draws that follow. Pinning that site is the next step:
+correlate the dominant pixel shader with the exact inline-draw instruction(s) inside the
+`sub_821BEF00`/`sub_821CC830` render path (CP `IM_LOAD` ucode-addr logging + the kick-backtrace
+RVA that falls inside `sub_821CC830`).
 
 ## Next steps
 

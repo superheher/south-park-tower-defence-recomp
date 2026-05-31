@@ -59,6 +59,12 @@ std::atomic<uint64_t> g_present_count{0};
 // ============================================================================================
 namespace {
 const bool g_drawprobe = std::getenv("REX_HLE_DRAWPROBE") != nullptr;
+// Confirmation test (RESULT: sub_821CC830 is a CENTRAL render/submit fn, broader than the 72.5%
+// group). Skipping its body blanks the WHOLE frame to black AND stops swaps — so it is on the
+// critical per-frame path, not the isolated dominant group. The dominant draws live INSIDE its
+// inline loop; the right hook grain is a mid-asm hook at that site, not this whole-fn stub. See
+// docs/HLE-PHASE0-PROGRESS.md. Kept gated for reference.
+const bool g_stub_cc830 = std::getenv("REX_HLE_STUB_CC830") != nullptr;
 constexpr uint64_t kProbeWindow = 60;  // dump every 60 frames
 constexpr int kLrSlots = 256;
 std::atomic<uint32_t> g_lr[kLrSlots];      // caller guest return address, 0 = empty
@@ -96,6 +102,9 @@ inline void RecordCaller(uint32_t lr) {
 REX_EXTERN(sub_821CC830) {
   if (g_drawprobe) {
     RecordCaller(static_cast<uint32_t>(ctx.lr));
+  }
+  if (g_stub_cc830) {
+    return;  // skip this render pass — confirm what it draws
   }
   __imp__sub_821CC830(ctx, base);
 }
