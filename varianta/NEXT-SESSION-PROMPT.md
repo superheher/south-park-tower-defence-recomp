@@ -1,76 +1,63 @@
-Ты продолжаешь проект variant A — полная статическая рекомпиляция (XenonRecomp) игры «South Park: Let's Go
-Tower Defense Play!» (Xbox 360 XBLA → Linux/Vulkan). Рабочая директория:
+Проект variant A — полная статическая рекомпиляция (XenonRecomp) «South Park: Let's Go Tower Defense
+Play!» (Xbox 360 XBLA → Linux/Vulkan). Рабочая директория:
 /home/h/src/recomp/rexglue-recomps/south-park-recomp/varianta. Ветка experimental/hle-graphics-spike.
+Коммиты НЕ пушить.
 
-✅ ВЫПОЛНЕНО за прошлые сессии (НЕ переоткрывай; коммиты НЕ запушены):
-- Куча/«device teardown» — FIX в NtFreeVirtualMemory(MEM_DECOMMIT) writeback (commit 4e011b5).
-- Jump table sub_8228A208 + инструкции vcmpbfp128/blrl (commit c10ab1a). Boot до 1191 строк.
-- CRT-init thread-join ДЕДЛОК = экран бут-логотипа «нажми A/START, иначе через 5с дальше» (commit 6ecdea6).
-  Расшит ДВУМЯ фиксами, ОБА проверены (детали — NIGHT-LOG «✅ CRT-init thread-join» + память Update 12):
-  (1) **KeTimeStampBundle**: GetTickCount (CRT sub_82448748 = `*(*(0x820008B8)+16)` = TickCount поля
-      KeTimeStampBundle, переменная-экспорт ordinal 0x00AD, плейсхолдер 0xAD000100) стоял на 0 ⇒ 5-сек.
-      таймаут логотипа НИКОГДА не срабатывал. ФИКС: отдельный ~1мс host-поток (StartTimestampPump в
-      SetupEnvironment) пишет uptime-ms в 0xAD000110 (как rexglue xboxkrnl_module.cpp). tid=4 ВЫШЕЛ из
-      опроса логотипа.
-  (2) **Кооперативный токен**: после логотипа очистка GPU-ресурсов (sub_8214F738 → sub_821C1000 →
-      sub_821C6E58) ждёт GPU-fence через busy-spin **sub_821B9270** (db16cyc, без yield) — держит токен ⇒
-      vblank-pump навсегда блокируется в std::mutex::lock(g_waitMutex) (gdb-подтверждено) ⇒ fence никто не
-      двигает. ФИКС: сильный override слабого алиаса sub_821B9270 в kernel.cpp — отпускает токен на время
-      backoff (Unlock→sleep 1мс→Lock), потом зовёт рекомпил-тело __imp__sub_821B9270; пропускает yield на
-      потоке самого pump. Pump теперь крутится нормально, ring ОПУСТОШАЕТСЯ (RPTR==WPTR==37).
+✅ ВЫПОЛНЕНО за прошлые сессии (НЕ переоткрывай):
+- Куча/«device teardown», jump table sub_8228A208, инструкции vcmpbfp128/blrl, CRT-init thread-join
+  (таймаут бут-логотипа: KeTimeStampBundle tick + token-yield) — всё расшито.
+- **GPU CP fence frontier — РАСШИТ (СТОПГАП, последний коммит varianta):** CRT-init join СНЯТ, **игра дошла
+  до ГЛАВНОГО ЦИКЛА** (intro). Полностью — NIGHT-LOG секция «✅ CRT-init join LIFTED … GAME MAIN LOOP».
+  - Причина: тайтл строит командные сегменты (fence += 2 каждый; builder sub_821C6A08 пишет
+    `device+10908 = fence+2` = head), но киккает в ring (CP_RB_WPTR 0x7FC80714, sub_821C6600) только часть
+    (head=17, а в ring только fences 3,5; sub_821C6600 фукнул 6× и встал). Остальное «авто-флашит» реальная
+    GPU. Наш CP исполняет только заккиканное → старые fence (target<head) недостижимы → fence-spin навечно.
+  - Фикс (СТОПГАП, kernel.cpp): forward GPU-fence маркера до запрошенного target в 2 хитнутых вейтерах:
+    `sub_821C6E58` (счётчик, `*(device+10896)` = 0xA2010000) и `sub_821C5DF0` (post-frame segptr,
+    `*(fenceptr+4)`, низкие 2 бита = wrap-генерация). CP синхронный и БЕЗ рендерера ⇒ у дефер-сегмента нет
+    эффекта на вейтер кроме самого fence (draw/state — no-op). **0 device-overwrite, без краша.**
+  - ⚠ Всего 6 spin-сайтов sub_821B9270: sub_821BFF48 / C5DF0 / C6420 / C6E58 / CB690 / CC140. Хитнуты пока
+    2. Если встанет на новом — добавь аналогичный forward (каждый знает свой target в r4/r5).
+  - ⚠ Стопгап driving sub_821C6D58 (флаш тайтла из вейта) НЕ работает: двигает head, но НИЧЕГО не киккает
+    (нужен GPU↔CPU WAIT_REG_MEM handshake, см. п.3). Поэтому форвардим маркер напрямую.
 
-ЗАДАЧА СЕССИИ. **GPU command-processor: довести fence ресурса до target, чтобы очистка после логотипа
-завершилась → tid=4 закончится → join главного снимется → boot пойдёт глубже.** Сейчас pump работает, ring
-пуст (RPTR==WPTR==37, WPTR не растёт — игра больше не сабмитит, т.к. tid=4 всё ещё ждёт), но fence
-`*(*(device+10896))` НЕ достигает target (= r30/r4 функции sub_821C6E58). Это чисто GPU-движок (мульти-
-недельный фронтир): сабмиченный PM4 не доводит этот fence до target.
-
-РЕЗЮМЕ (точка возобновления):
-1. Считай адрес и значение fence. device ≈ 0x26F80 (title-heap-base 0x10000 + 0x16F80; проверь в этом
-   билде). Указатель fence = `*(device+10896)` (BE), текущее значение = `*( *(device+10896) )`, target =
-   r30 функции sub_821C6E58 (= её аргумент r4; см. ppc_recomp.17.cpp:12476 пролог `mr r30,r4`). Поставь
-   bkpt на sub_821C6E58:12489 (вход, r3=device r4=target ещё валидны) и считай device/target/fenceptr/
-   current. (⚠ bkpt на 12588 НЕ ловится — spin держит PC внутри sub_821B9270, лови на входе 12489.)
-2. Сравни fenceptr с тем, что пишет pump: kReg_CP_RB_RPTR(0x7FC80710)/WPTR(0x7FC80714), g_rptrWriteBack
-   (VdEnableRingBufferRPtrWriteBack), и адреса EVENT_WRITE_SHD в ExecutePM4 (kernel.cpp). Три гипотезы:
-   (a) fenceptr == g_rptrWriteBack и target>WPTR(37) ⇒ игра ждёт, пока GPU съест БОЛЬШЕ, чем сабмичено —
-       значит завершающий пакет так и не попал в ring (логотип не «отрисовался» null-GPU); надо, чтобы CP
-       сам довёл RPtr/fence до target ИЛИ корректно обработал отрисовку логотипа.
-   (b) fenceptr — отдельный fence, который пишет конкретный EVENT_WRITE, а ExecutePM4 его не туда/не пишет.
-   (c) механизм fence иной (не RPtr/EVENT_WRITE). Подними семантику из rexglue command_processor.cpp.
-3. Доведи fence до target в CP (это и есть GPU-движок). Сверяйся 1:1 с third_party/rexglue-sdk/src/graphics/
-   command_processor.cpp + prod-оракулом (рендерит 54-55 пайплайнов, проходит эту очистку — у него реальный
-   GPU двигает fence). Когда fence>=target: sub_821C6E58 выйдет, 4 очистки завершатся, tid=4 закончится,
-   join снимется.
-
-⚠ ВТОРИЧНАЯ НАХОДКА (задокументирована, НЕ фикшена): sub_821B9270 содержит 5-сек GPU **watchdog** (вернёт 0
-= прервать ожидание, если fence завис), но его тик = `*(KTHREAD+0x58)`, а FillKThread пишет T+0x54/0x56/0x5C
-и ПРОПУСКАЕТ T+0x58 (в rexglue X_KTHREAD это `unk_58`) ⇒ тик=0, watchdog не срабатывает. Даже если затикать
-T+0x58 — watchdog уходит в sub_821C8B30 (DbgPrint + GPU hang-recovery), т.е. деградированный путь «GPU
-завис», НЕ чистый. Чистый фикс — п.3 (CP двигает fence), а не watchdog.
-
-ДРУГИЕ БЛОКЕРЫ ВПЕРЕДИ: vupkd3d128 (78× default-case __builtin_debugtrap, graphics-path) — реализовать
-недостающие pack-типы в XenonRecomp/recompiler.cpp, когда дойдёт.
+ЗАДАЧА СЕССИИ (по приоритету):
+1. **Отсутствует intro-фильм (КОНТЕНТ, не баг рекомпа).** Цикл крутится на
+   `NtCreateFile('game:\Media\Assets\Movies\en-en\sp_xbox_0_intro.wmv')` → **MISS** (каждый кадр). В
+   `private/extracted/media/Assets/Movies/` есть все Level1-11, но НЕТ подкаталога `en-en/` и нет
+   `sp_xbox_0_intro.wmv` (локализованные intro-фильмы не распакованы). Варианты:
+   (a) найти/распаковать en-en-набор из XBLA-пакета (`/home/h/src/recomp/South_Park_..._XBLA.zip`) и
+       положить по пути; (b) сделать корректный пропуск intro при отсутствии фильма — посмотри
+       `NtCreateFile` в kernel.cpp: какой STATUS возвращает MISS; тайтл его, видимо, считает retry-able
+       (крутит вместо skip). Цель — выйти из intro в меню/геймплей.
+2. **VdSwap → первый кадр.** Сейчас `VdSwap` = stub (возвр. 0), вызовов 0. Когда тайтл выйдет из intro и
+   позовёт VdSwap — это путь к реальному present (Vulkan, фаза рендерера).
+3. **(ДОЛГО) Чистый CP вместо стопгапа.** Заменить fence-forward на непрерывный CP, который идёт по
+   WAIT_REG_MEM-цепочке дефер-IB и ИСПОЛНЯЕТ их (fence двигается как РЕЗУЛЬТАТ). ОБЯЗАТЕЛЬНО до реального
+   рендерера, иначе дефер-draw'ы пропадут. Хвост ring (IB 0x975E0) содержит WAIT_REG_MEM на адреса
+   0x2011xxx с код-адресом 0x821CC7A0 = и есть GPU↔CPU handshake, который надо смоделировать.
 
 ДИАГНОСТИКА / СБОРКА:
 - Запуск: `find /dev/shm -maxdepth 1 -name 'xenia_memory_*' -delete; REX_KTRACE=1 stdbuf -oL -eL timeout 22
-  ./runtime/out/sp_td_varianta ../private/extracted/default.xex > /tmp/boot.log 2>&1`. ⚠ grep ВСЕГДА с `-a`.
-- gdb attach: запусти с REX_KTRACE=0 в фоне, `sleep 8`, `gdb -batch -p <pid> -x скрипт`. Готовые: /tmp/
-  {full,cp,fence,loopwatch,timer}.gdb. Прогресс: `grep -avc KeGetCurrentProcessType` (non-spam=521 на
-  текущем фронтире — KeGetCurrentProcessType это безобидный 28Гц опрос рендер-воркера, фильтруй его).
-  Страховки: `grep -ac INDIRECT-NULL`(=0), `grep -ac "req=0x10000 sz=0x80000"`(=0).
-- Правка рантайма: `ninja -C runtime/out sp_td_varianta` (секунды). Эмиттер: edit recompiler.cpp → cmake
-  build XenonRecomp → `rm ppc/*.cpp; <XR> sp_xenon.toml ppc_context.h` → ninja → regen patch
+  ./runtime/out/sp_td_varianta ../private/extracted/default.xex > /tmp/boot.log 2>&1`. ⚠ grep ВСЕГДА `-a`.
+- Прогресс: `grep -avc KeGetCurrentProcessType` (на intro-цикле >170k за 30с — это норм, цикл крутит кадры
+  без vsync, т.к. fence-вейты мгновенные). Страховка: `grep -ac 'req=0x10000 sz=0x80000'` (=0
+  device-overwrite). Логи фикса: `[fencefwd]` под REX_KTRACE=1; `[cp] T3 op=...` (полные PM4-опкоды) под
+  REX_CPTRACE=1.
+- gdb: запусти REX_KTRACE=0 в фоне, `sleep ~10`, `gdb -batch -p <pid> -x /tmp/allbt.gdb` (готовый скрипт:
+  info threads + thread apply all bt). Рекомпил-функции видны как `__imp__sub_XXXX` — стек читается прямо.
+- Правка рантайма: `ninja -C runtime/out sp_td_varianta` (секунды). Эмиттер (если нужно): edit
+  recompiler.cpp → cmake build XenonRecomp → `rm ppc/*.cpp; <XR> sp_xenon.toml ppc_context.h` → ninja →
   `git -C ../../third_party/XenonRecomp diff > patches/xenonrecomp-sp-instructions.patch`.
-- ⚠ zsh: чистить shm только `find /dev/shm -maxdepth 1 -name 'xenia_memory_*' -delete` (не pkill/glob).
-- Оракул prod: out/build/linux-amd64-release/south_park_td (Release/no-ctx, break по СИМВОЛУ, PIE base
-  0x100000000) — рендерит, проходит очистку логотипа; сравнивай fence/CP.
+- ⚠ zsh: чистить shm только `find /dev/shm ... -delete` (не pkill/glob). Bash-tool сбрасывает cwd —
+  используй абсолютные пути или cd в начале каждого вызова.
+- Оракул prod: `out/build/linux-amd64-release/south_park_td` (рендерит 54-55 пайплайнов, проходит intro;
+  символы есть: `__imp__sub_821C6E58` и т.д.) — сравнивай поведение fence/CP.
 
 ОГРАНИЧЕНИЯ. Скоуп только varianta/ (+ тулчейн через patches/xenonrecomp-sp-instructions.patch). НЕ пушить;
-НЕ трогать prod-бинарь/librexruntime.so(1a3f6076)/rexglue-sdk/указатель суперпроекта. Автор superheher
+НЕ трогать prod-бинарь / librexruntime.so(1a3f6076) / rexglue-sdk / указатель суперпроекта. Автор superheher
 <heh@vivaldi.net>; коммиты заканчивать: Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>.
 Хост — расходный стенд (sudo пароль <redacted>), prod не ломать.
 
-ГОТОВО, КОГДА: (промежуточно) fence ресурса достигает target, sub_821C6E58 выходит, tid=4 завершается, join
-главного снят, boot глубже (>1191 строк, новые ассеты/события); (далее) главный зовёт VdSwap; (цель) кадры
-через VdSwap→Vulkan.
+ГОТОВО, КОГДА: (промежуточно) intro пройден → меню/геймплей; (далее) тайтл зовёт VdSwap; (цель) кадры через
+VdSwap → Vulkan present на экране.

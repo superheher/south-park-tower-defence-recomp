@@ -961,6 +961,8 @@ void ExecutePM4(uint32_t addr, uint32_t dwords, int depth);   // fwd
 
 // Execute one type-3 packet body. `addr` is at the first data dword; `count` data dwords follow.
 void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
+    if (g_cptrace) fprintf(stderr, "[cp]%*s T3 op=0x%02X count=%u d0=0x%X d1=0x%X d2=0x%X\n", depth*2, "", op, count,
+                           GLD32(addr), count>1?GLD32(addr+4):0, count>2?GLD32(addr+8):0);
     switch (op) {
       case PM4_INDIRECT_BUFFER:
       case PM4_INDIRECT_BUFFER_PFD: {
@@ -1107,6 +1109,78 @@ PPC_FUNC(sub_821B9270)
         kernel::LockGuestExecution();
     }
     __imp__sub_821B9270(ctx, base);
+}
+
+// ---- GPU fence-wait completion: forward the completion fence past deferred segments (sub_821C6E58) --
+// sub_821C6E58 spins until the GPU completion fence *(*(device+10896)) reaches `target` (r4), measured
+// relative to the latest built fence head=*(device+10908). The title builds PM4 into command-buffer
+// segments and only periodically kicks them to the ring (CP_RB_WPTR, via sub_821C6600); it relies on
+// the real GPU auto-flushing partially-filled segments, so when it later waits on an OLDER fence
+// (target != head) it assumes that work already reached the GPU. Variant A's CP only executes what the
+// title explicitly kicks, so the deferred tail (built but un-kicked: e.g. fences 7..15 with head=17,
+// fence=5) never runs and an old target is never reached — the post-logo resource teardown (on tid=4,
+// whose exit the CRT-init join waits on) spins forever; later, the per-frame render loop hits the same
+// wall. (Confirmed: the title's own flush sub_821C6D58 will NOT push this segment without the GPU↔CPU
+// WAIT_REG_MEM handshake we don't model; calling it advances head but kicks nothing.) Variant A's CP is
+// synchronous and has no renderer, so a deferred segment's only effect on this waiter is the fence value
+// itself — its draws/state are no-ops here. So forward the completion fence to the requested target
+// (forward-only) and let the wait succeed on its normal path: the synchronous CP has, by construction,
+// already done everything that can affect the waiter.
+// [STOPGAP. The clean fix is a continuous CP that follows the WAIT_REG_MEM-chained deferred IBs and
+//  executes them, so the fence advances as a real result. This forwarding MUST be replaced before a real
+//  renderer lands, or deferred draws would be skipped. See varianta/NIGHT-LOG.md + NEXT-SESSION-PROMPT.]
+extern "C" PPC_FUNC(__imp__sub_821C6E58);
+PPC_FUNC(sub_821C6E58)
+{
+    if (g_coop) {
+        uint32_t device = ctx.r3.u32, target = ctx.r4.u32;
+        uint32_t fenceptr = GLD32(device + 10896);
+        if (fenceptr) {
+            uint32_t head = GLD32(device + 10908), current = GLD32(fenceptr);
+            // Stuck on an OLDER fence (target != head) that hasn't been reached: the title built this
+            // fence's command-buffer segment but deferred kicking it to the ring, relying on real-GPU
+            // auto-flush as segments fill (its own target==head gate does not cover target<head, and its
+            // flush sub_821C6D58 won't push this segment without the GPU↔CPU WAIT_REG_MEM handshake we
+            // don't model). Variant A's CP is synchronous and has no renderer, so the deferred segment's
+            // only effect on this waiter is the fence write itself — its draws/state are no-ops here.
+            // Advance the completion fence to the target so the wait succeeds on the normal path (the
+            // synchronous CP has, by construction, finished everything that can affect it). Forward-only.
+            // [stopgap — the clean fix is a continuous CP that executes WAIT_REG_MEM-chained deferred IBs]
+            if (target != head &&
+                static_cast<uint32_t>(head - target) < static_cast<uint32_t>(head - current)) {
+                GST32(fenceptr, target);
+                if (g_ktrace) fprintf(stderr, "[fencefwd] fence@0x%X %u->%u (head=%u) — deferred-segment wait satisfied\n",
+                                      fenceptr, current, target, head);
+            }
+        }
+    }
+    __imp__sub_821C6E58(ctx, base);
+}
+
+// sub_821C5DF0 — the post-frame GPU sync (sub_821BFF48 -> sub_821C6278 -> sub_821C5EA8 -> here): waits
+// until the GPU's consumed command-buffer position *(fenceptr+4) (segment pointer; low 2 bits = wrap
+// generation) reaches the caller's target (r5 = generation-tagged position, r4 = offset). Same deferred
+// -segment problem as the counter wait above, on the +4 marker. Forward the segment pointer to the
+// requested target when the wait would otherwise spin (the deferred PM4 never reaches variant A's CP).
+// [stopgap — see sub_821C6E58]
+extern "C" PPC_FUNC(__imp__sub_821C5DF0);
+PPC_FUNC(sub_821C5DF0)
+{
+    if (g_coop) {
+        uint32_t device = ctx.r3.u32, off = ctx.r4.u32, posTagged = ctx.r5.u32;
+        uint32_t fenceptr = GLD32(device + 10896);
+        if (fenceptr) {
+            uint32_t segptr = GLD32(fenceptr + 4);
+            uint32_t diff = (posTagged - segptr) & 3u;
+            bool stuck = (diff != 0) && !(diff == 1 && off <= (segptr & ~3u));
+            if (stuck) {
+                GST32(fenceptr + 4, posTagged);
+                if (g_ktrace) fprintf(stderr, "[fencefwd] segptr@0x%X 0x%X->0x%X (off=0x%X) — post-frame wait satisfied\n",
+                                      fenceptr + 4, segptr, posTagged, off);
+            }
+        }
+    }
+    __imp__sub_821C5DF0(ctx, base);
 }
 
 // void VdInitializeRingBuffer(ptr r3, size_log2 r4)

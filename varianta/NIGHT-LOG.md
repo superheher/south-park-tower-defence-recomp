@@ -1058,3 +1058,51 @@ watchdog can never fire. Even if ticked, the watchdog routes to sub_821C8B30 (Db
 i.e. a degraded "GPU hung" path, not clean progress — so the clean fix is #4 (CP completes the fence), not
 the watchdog. Tools this session: gdb loop/fence/CP scripts (/tmp/{loopwatch,timer,fence,cp,full}.gdb),
 `thread apply all bt`. ⚠ grep -a on boot logs.
+
+## 2026-06-01 (cont.) — ✅ CRT-init join LIFTED via GPU fence-forward stopgap → boot reaches the GAME MAIN LOOP (intro movie)
+Root-caused the GPU CP fence frontier end-to-end and cleared it (stopgap), driving the boot from the
+stuck CRT-init join (≈1191 lines) all the way into the **game's main loop** (≈178k non-spam lines, ~355k
+GPU frames executed in 30 s).
+
+**Root cause — deferred command-buffer segments never reach variant A's CP.** Instrumented the fence wait
+`sub_821C6E58` (entry: r3=device=0x26F80, r4=target): fenceptr=`*(device+10896)`=**0xA2010000** (the
+0xA-window mirror our EVENT_WRITE_SHD writes to — address model VERIFIED correct, no mismatch), current
+fence=**5**, target=**7**, head=`*(device+10908)`=**17**. A 5 s watcher proved head/fence/WPTR/RPTR are
+ALL frozen (WPTR=37, ring all-zero past dword 37). So the fence is plumbed correctly but never reaches an
+old target. Decode: the title's packet-builder `sub_821C6A08` (ppc_recomp.17.cpp:11952) does
+`device+10908 = fence+2` per EVENT_WRITE — head=17 ⇒ it BUILT fences 3,5,7,9,11,13,15 but only **3,5** are
+in the kicked ring. The ring-kick is `sub_821C6600` (writes CP_RB_WPTR 0x7FC80714); it fired **6×**
+(WPTR 19→37) then STOPPED — the title defers the tail, relying on the real GPU auto-flushing partially
+-filled segments. `sub_821C6E58`'s own gate (12508-12525) auto-flushes only when `target==head`; for an
+OLDER fence (7≠17) it just spins. Tried driving the title's flush `sub_821C6D58` from the wait — it
+advances head (17→19) but **kicks nothing** (its main-flush path finds no "current command buffer"; the
+deferred segment needs the GPU↔CPU WAIT_REG_MEM handshake — the ring's tail IB 0x975E0 has
+WAIT_REG_MEM packets referencing 0x2011xxx with code addr 0x821CC7A0 — which variant A skips).
+
+**Fix (STOPGAP) — forward the completion fence past deferred segments.** Variant A's CP is synchronous and
+has NO renderer, so a deferred segment's only effect on a waiter is the fence value itself (its draws/state
+are no-ops). So in the two fence-spin waiters that the boot actually hits, forward the GPU-completion
+marker to the requested target (forward-only) and let the wait succeed on its normal path:
+- `sub_821C6E58` (counter wait): `GST32(*(device+10896), target)` when `target!=head` and not-yet-reached.
+- `sub_821C5DF0` (post-frame segptr wait, sub_821BFF48→sub_821C6278→sub_821C5EA8→here): the marker is
+  `*(fenceptr+4)` (segment pointer; low 2 bits = wrap generation); forward it to r5 when stuck.
+(There are 6 `sub_821B9270` spin sites total — sub_821BFF48/C5DF0/C6420/C6E58/CB690/CC140 — only these two
+are hit so far.) **NO faked completion of CPU-visible data; only the GPU-fence markers.**
+
+**Result — the game BOOTS and RUNS.** join lifts (tid=4 teardown completes → ExTerminateThread → main's
+NtWaitForSingleObjectEx(0x90100C40) returns) → main runs CRT global ctors → enters the render loop. It
+loads real game assets (LuaScripts, Fonts, Audio, AnimBlock.bin 1.4 MB, Stickers, subtitles), spawns more
+worker threads, and runs the **intro state machine**, rendering ~12k GPU frames/s. 0 device-overwrites, no
+crash, 1 benign INDIRECT-NULL (null fn-ptr target=0 @lr=0x82292D08, skipped).
+
+**NEW FRONTIER = missing intro movie (content gap, not a recomp bug).** The loop is stuck retrying
+`NtCreateFile('game:\Media\Assets\Movies\en-en\sp_xbox_0_intro.wmv')` → **MISS**. The extracted Movies/
+dir has all Level1-11 movies but **no `en-en/` subdir and no sp_xbox_0_intro.wmv** (the localized intro
+movies were not extracted). The game retries every frame. NEXT: either provide the file (check the XBLA
+package for the en-en movie set) or make the intro skip on missing-movie; then chase VdSwap → first frame.
+
+**⚠ The fence-forward is a STOPGAP** — it must be replaced by a continuous CP that follows the
+WAIT_REG_MEM-chained deferred IBs and executes them (so the fence advances as a real result) BEFORE a real
+renderer lands, or deferred draws would be skipped. Build/run unchanged (ninja -C runtime/out
+sp_td_varianta). Diagnostics added (gated): ExecuteType3 full opcode trace under REX_CPTRACE=1; [fencefwd]
+under REX_KTRACE=1.
