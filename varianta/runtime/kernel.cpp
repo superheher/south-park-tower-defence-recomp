@@ -317,6 +317,46 @@ inline uint32_t GLD32(uint32_t a) { uint32_t b; memcpy(&b, g_base + a, 4); retur
 inline uint16_t GLD16(uint32_t a) { uint16_t b; memcpy(&b, g_base + a, 2); return __builtin_bswap16(b); }
 inline uint64_t GLD64(uint32_t a) { uint64_t b; memcpy(&b, g_base + a, 8); return __builtin_bswap64(b); }
 
+// ---- KeTimeStampBundle: the guest millisecond clock GetTickCount() reads ----------------------------
+// The title's GetTickCount-equivalent (CRT sub_82448748) returns KeTimeStampBundle->TickCount (+16).
+// On Xbox 360 the kernel advances this 24-byte structure continuously; code that polls with a timeout
+// (e.g. the boot-logo "press A/START" screen, which auto-proceeds after 5 s) relies on it ticking.
+// KeTimeStampBundle is kernel-export VARIABLE ordinal 0x00AD; variant A leaves that data import as its
+// unresolved placeholder 0xAD000100 (the address the title actually dereferences — verified at runtime
+// and clear of every MmAllocatePhysical region), so the structure effectively lives there. Nothing
+// advanced +16, so GetTickCount() was pinned at 0 → every "elapsed = now - start" stayed 0 < timeout →
+// the logo worker (tid 4, sub_8242B4A8 → sub_8214F730) spun forever and the main thread, which joins it
+// during CRT static-init, deadlocked. Fix: maintain +16 = guest uptime in ms from a dedicated ~1 ms
+// host thread — a plain guest-memory write needing no execution token — mirroring rexglue-sdk
+// xboxkrnl_module.cpp, which zeroes +0/+8 and updates +16 with QueryGuestUptimeMillis() every 1 ms.
+constexpr uint32_t kKeTimeStampBundle = 0xAD000100;   // xboxkrnl.exe variable import ordinal 0x00AD
+std::chrono::steady_clock::time_point g_bootTime;
+std::atomic<bool> g_timestampRunning{false};
+
+uint32_t GuestUptimeMs() {
+    return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - g_bootTime).count());
+}
+
+void TimestampPump() {
+    while (g_timestampRunning.load()) {
+        GST32(kKeTimeStampBundle + 16, GuestUptimeMs());          // TickCount (ms)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+// Start the 1 ms KeTimeStampBundle updater (once). Called from SetupEnvironment, before _xstart, so the
+// guest clock is already ticking when the CRT static-init logo poll captures its start tick.
+void StartTimestampPump() {
+    if (g_timestampRunning.exchange(true)) return;
+    g_bootTime = std::chrono::steady_clock::now();
+    GST64(kKeTimeStampBundle + 0, 0);    // InterruptTime  (rexglue leaves these 0)
+    GST64(kKeTimeStampBundle + 8, 0);    // SystemTime
+    GST32(kKeTimeStampBundle + 16, 0);   // TickCount
+    GST32(kKeTimeStampBundle + 20, 0);
+    std::thread(TimestampPump).detach();
+}
+
 // Read a XEX optional header that stores its value INLINE (key low byte 0) as a BE u32.
 uint32_t XexOptU32(const uint8_t* xex, uint32_t key, uint32_t fallback) {
     const void* p = getOptHeaderPtr(xex, key);
@@ -432,6 +472,7 @@ uint32_t SetupEnvironment(const uint8_t* xexFile, uint32_t stackBase, uint32_t s
     fprintf(stderr, "[env] KPROCESS=0x%X KTHREAD=0x%X KPCR=0x%X TLS=0x%X (slots=%u dataSize=0x%X "
         "rawAddr=0x%X rawSize=0x%X dyn=0x%X)\n", P, T, K, kTlsAddr, tlsSlots, tlsDataSize, tlsRawAddr,
         tlsRawSize, tlsDynamic);
+    StartTimestampPump();   // advance KeTimeStampBundle->TickCount so GetTickCount()-timed waits expire
     return K;
 }
 } // namespace kernel
@@ -1005,7 +1046,10 @@ void ExecuteRing(uint32_t rptr, uint32_t wptr) {
 }
 } // namespace
 
+std::thread::id g_pumpThreadId;   // set by VblankPump; lets sub_821B9270's token-yield skip the pump
+
 void VblankPump() {
+    g_pumpThreadId = std::this_thread::get_id();
     uint32_t lastWptr = 0;
     while (g_vblankRunning.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(16));   // ~60 Hz
@@ -1041,6 +1085,29 @@ void StartVblankPump() {
     fprintf(stderr, "[video] vblank pump started (kpcr=0x%X)\n", g_pumpKpcr);
 }
 } // namespace
+
+// ---- GPU ring/vblank spin must yield the cooperative token (sub_821B9270) -------------------------
+// sub_821B9270 is the backoff primitive of the title's GPU ring/vblank spin loops (6 call sites in the
+// 0x821Cxxxx render code; e.g. the post-logo GPU-resource cleanup sub_821C6E58 waits here until a GPU
+// fence reaches its target). It is a pure busy-spin (db16cyc no-ops) with no kernel yield, so under the
+// cooperative token a guest worker holds the token the whole time it spins. But the value it spins on is
+// advanced by the vblank pump, which must TAKE the token to run ExecutePM4 — so the pump blocks forever
+// on g_waitMutex while the spinner waits for a fence only the pump can move: a deadlock (confirmed: with
+// tid 4 spinning here the pump sits in std::mutex::lock). Wrap the recompiled spin so it releases the
+// token across the backoff (like KeDelayExecutionThread), letting the pump run and advance the fence,
+// then defer to the original logic. Skip the yield on the pump's own thread, which can re-enter this via
+// the graphics-interrupt callback while legitimately holding the token. Strong def overrides the weak
+// guest alias; __imp__sub_821B9270 is the recompiled body.
+extern "C" PPC_FUNC(__imp__sub_821B9270);
+PPC_FUNC(sub_821B9270)
+{
+    if (g_coop && std::this_thread::get_id() != g_pumpThreadId) {
+        kernel::UnlockGuestExecution();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        kernel::LockGuestExecution();
+    }
+    __imp__sub_821B9270(ctx, base);
+}
 
 // void VdInitializeRingBuffer(ptr r3, size_log2 r4)
 PPC_FUNC(__imp__VdInitializeRingBuffer)
