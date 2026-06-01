@@ -1,117 +1,89 @@
 Ты продолжаешь проект variant A — полная статическая рекомпиляция (XenonRecomp) игры «South Park: Let's Go
 Tower Defense Play!» (Xbox 360 XBLA → Linux/Vulkan). Рабочая директория:
-/home/h/src/recomp/rexglue-recomps/south-park-recomp/varianta.
+/home/h/src/recomp/rexglue-recomps/south-park-recomp/varianta. Ветка experimental/hle-graphics-spike.
 
-ЗАДАЧА СЕССИИ. Починить БАГ ПОРЧИ ГОСТЕВОЙ КУЧИ (root-caused в этой сессии), из-за которого аллокация
-буфера вершинных потоков .ptc возвращает блок НИЖЕ базы кучи, затирающий структуру GPU-устройства. После
-фикса — к кадрам (главный поток выходит из ожиданий GPU-completion → VdSwap → DRAW → Plume Vulkan).
+✅ ПРЕДЫДУЩАЯ ЗАДАЧА ВЫПОЛНЕНА (порча гостевой кучи / «device teardown» — ПОЧИНЕНА, commit 4e011b5).
+Не переоткрывай её. Кратко (полностью — NIGHT-LOG.md секция «✅ FIXED: ... DECOMMIT WRITEBACK», память
+[[sp_varianta_bootstrap]] Update 10): причина была в нашем NtFreeVirtualMemory — на MEM_DECOMMIT он писал
+обратно в out-параметры ВЕСЬ резерв кучи (*BaseAddress=0x10000, *RegionSize=0x100000) вместо запрошенного
+под-диапазона (0x70000/0x10000). Гостевой RtlpDeCommitFreeBlock (sub_8244B018, ppc_recomp.65.cpp:4184-4190)
+ЧИТАЕТ эти out-параметры обратно и сует [base,size) в UnCommittedRanges сегмента (sub_82449D58). ⇒ куча
+считала, что декоммитнут ВЕСЬ резерв → UCR сбрасывался на базу → следующий extend коммитил ПО БАЗЕ
+(req=0x10000 sz=0x80000), затирая живой заголовок кучи + устройство 0x26F80. Фикс = корректная NT-семантика
+writeback (декоммит возвращает выровненный под-диапазон; release — весь аллок). ПРОВЕРЕНО (4 прогона,
+детерминированно 462-463 строки): коммит после декоммита ложится МИМО устройства (req=0x70000/0x80000, НИКОГДА
+req=0x10000), 0 коммитов-поверх-устройства, boot прошёл 171→462 строки и 3→6 ассетов (ArcadeLogo.ptc, UI.xzp
+23.5MB, Strings.bin). Тулчейн/Vd*/PM4-CP/CRT/heap — всё DONE.
 
-⚠ ВАЖНО: ПРЕДЫДУЩАЯ ВЕРСИЯ ПРИЧИНЫ БЫЛА НЕВЕРНОЙ. Старый NEXT-SESSION-PROMPT и NIGHT-LOG «ROOT FOUND:
-.ptc vertex-stream destinations are UN-RELOCATED (надо прибавить 0xA2016000)» — ОШИБКА. Реальная причина
-найдена и проверена в gdb (см. ниже).
+ЗАДАЧА СЕССИИ. Новый фронтир (тот же класс, что Update 3 — «function-boundary / jump-table»). Boot теперь
+детерминированно упирается в ДВА INDIRECT-NULL (печатает их и идёт дальше → молчаливый стопор):
+  [INDIRECT-NULL] target=0x8228A3B8 (caller lr=0x8228A210)  — ПРОПУЩЕННЫЙ case JUMP-TABLE.
+  [INDIRECT-NULL] target=0x00000000 (caller lr=0x8224FDEC)  — null-вызов.
+Цель: восстановить таблицу(ы)/закрыть null-вызов → boot идёт глубже к рендер-циклу → главный поток выходит из
+GPU-completion ожиданий → VdSwap → DRAW → Plume Vulkan.
 
-ПЕРВЫМ ДЕЛОМ ПРОЧИТАЙ (точная точка возобновления):
-1. Память ~/.claude/projects/-home-h-src-recomp/memory/sp_varianta_bootstrap.md — **Update 9** (READ FIRST;
-   Update 8 ОТМЕНЁН Update'ом 9).
-2. varianta/NIGHT-LOG.md — секция (хвост файла) «⛔ PRIOR ROOT-CAUSE CORRECTED: HEAP FREE-LIST corruption».
-3. varianta/runtime/kernel.cpp:78 — inline-NOTE с кратким резюме.
-
-================================================================================================
-РЕАЛЬНАЯ ПРИЧИНА (проверено в gdb)
-================================================================================================
-*(obj+192)=0x82B0 — это НЕ файловое смещение, а ВОЗВРАТ АЛЛОКАТОРА. `sub_822A8150` (зовётся в
-sub_822A2158:23167, прямо перед sub_822A7C08) аллоцирует буфер потоков:
-`sub_82448090(size=0x78000, flags=0x24870000)` → пишет в obj+192. Эта аллокация ВОЗВРАЩАЕТ **0x82B0** —
-адрес НИЖЕ базы кучи тайтла (0x10000), перекрывающий живое устройство на 0x26F40. (Объект — это
-стек-структура в кадре sub_822A2158, ~0x980AF7B0, т.к. стеки воркеров в окне 0x98000000; на +0 лежит магия
-"PTC+" из заголовка файла — это и сбило прошлую сессию на «файловые смещения».)
-
-ЦЕПОЧКА АЛЛОКАТОРА: sub_82448090(flags bit0=0) → sub_8244DF68(0,sz) → sub_8244CDF0 (единый хэндл кучи =
-*(0x82902448)=0x10000) → **sub_8244B950** (классическая NT-куча, сигнатура 0xEEFFEEFF на heap+0x10).
-Запрос 0x78000 → индекс 0x7800; heap+0x28 VirtualMemoryThreshold=0xF000, 0x7800<порога ⇒ поиск по
-**free-list[0]** (loc_8244BBFC→loc_8244BC08), НЕ virtual-alloc и НЕ sub_8244ADD8 (проверено по bt).
-
-ФАНТОМНЫЙ БЛОК (улика, /tmp/narrow2.gdb — break ppc_recomp.65.cpp:7704 при ctx.r3.u32 in [0x1000,0x10000)):
-обход free-list[0] ВЫБИРАЕТ сфабрикованный блок r3=**0x82A0** (= heapbase 0x10000 − 0x7D60), заголовок
-(BE u32): +0=0x80000000 (поле размера 0x8000 *16-байтных* единиц = 0x80000 Б ≥ запроса → обход принимает),
-+4=0x00100000 (похоже на размер резерва кучи), +8=0x00010180 (Flink = sentinel free-list[0] heap+0x180),
-+0xC=0x000582A8 (Blink → **в буфер загрузки .ptc**: файл-буфер=0x50000, 0x582A8=0x50000+0x82A8). Т.е.
-**free-list[0] испорчен фантомным «свободным» блоком ниже базы кучи, чья ссылка указывает в .ptc-буфер**;
-аллок 0x78000 переиспользует его → массив назначений 0x82B0+i*0x3C00 → записи #8/#9 (0x262B0/0x29EB0)
-попадают в устройство → device+10900=0 → ожидания GPU-completion (main 0x388C4; render sub_821CC5D0
-0x29CD4/0x29D40) навсегда встают.
-
-НЕ ЗАВИСИТ ОТ БАЗЫ (поэтому фикс — НЕ смена layout): g_virtNext 0x10000→блок 0x82B0; 0x40000000 (как у
-prod; куча тайтла тогда ложится РОВНО как у prod — устройство-struct=0x40016F80, адрес из prod-лога
-«SetInterruptCallback(821C7170,40016F80)»)→блок 0x3FFF82B0=base−0x7D50, ВСЁ РАВНО перекрывает устройство.
-Базу вернул на 0x10000. Совпадение устройства с точным адресом prod при базе 0x40000000 ДОКАЗЫВАЕТ, что
-куча variant A синхронна prod ДО устройства ⇒ расхождение — чисто в free-list после аллокации устройства.
-
-УГЛУБЛЕНО (gdb /tmp/{watch82a0,narrow3}.gdb — фантомный блок СОЗДАЁТСЯ EXTEND'ом, коммитящим ПО БАЗЕ СЕГМЕНТА):
-у 0x78000 нет подходящего блока в free-list[0] → путь EXTEND: sub_8244B950:7671 (loc_8244BC64) → sub_8244ADD8
-→ sub_82449E78 (commit pages) → sub_8244A108 (создание/коалесинг блока). Пойман на sub_8244A108:1882: новый
-блок **r4 = 0x10000 — это САМА БАЗА КУЧИ**. sub_8244A108 пишет свежий _HEAP_ENTRY туда (поверх собственного
-заголовка кучи: было Size=0x64/PrevSize=0, стало **0x800007D6** = Size=0x8000, **PreviousSize=0x7D6**), затем
-backward-coalesce: `r31 = r4 − PreviousSize*16 = 0x10000 − 0x7D60 = 0x82A0` (фантом, ниже базы).
-ПОЧЕМУ по базе: sub_82449E78 коммитит по адресу из списка UnCommittedRanges сегмента (head=`*(segment+56)`,
-адрес=`*(range+4)`) = **0x10000 (база)** — сегмент СЧИТАЕТ, что он НЕ-СКОММИЧЕН ОТ БАЗЫ (игнорируя начальный
-commit заголовка 0x10000..0x20000 и ранние in-place аллокации — free-list был ЦЕЛ, расходится только
-commit-tracking сегмента). Boot-лог: extend-commit `NtAllocate req=0x10000 sz=0x80000 → 0x10000` (поверх
-живых заголовка/устройства).
-⇒ САМЫЙ ГЛУБОКИЙ КОРЕНЬ (открыт): UnCommittedRanges сегмента (*(segment+56)) ошибочно говорит «не-скоммичен
-от базы». Ставится в RtlCreateHeap (**sub_8244B380**, ppc_recomp.65.cpp:4569) / поддерживается
-RtlpFindAndCommitPages.
+ПЕРВЫМ ДЕЛОМ ПРОЧИТАЙ:
+1. Память [[sp_varianta_bootstrap]] — Update 10 (свежий, описывает фикс кучи + этот фронтир).
+2. NIGHT-LOG.md — секция «✅ FIXED: ... DECOMMIT WRITEBACK» (хвост файла).
 
 ================================================================================================
-ПЛАН ФИКСА
+ФРОНТИР 1 — JUMP-TABLE в sub_8228A208 (bctr → 0x8228A3B8)
 ================================================================================================
-1. Подтвердить и починить commit-tracking сегмента. Захватить *(segment+56) и *(range+4) на EXTEND
-   (narrow3-стиль: break sub_82449E78 / sub_8244A108 при r31<0x10000) — убедиться, что адрес = база.
-   Прочитать НАСТРОЙКУ UnCommittedRanges в RtlCreateHeap (sub_8244B380:4569): как сегмент инициализирует
-   UCR и почему начальный commit заголовка её НЕ сжал. Кандидаты: (a) баг ЭМИТТЕРА XenonRecomp в
-   bookkeeping сегмента/UCR (prod собран rexglue — баг только-в-variant-A разойдётся); (b) семантика
-   variant-A NtAllocateVirtualMemory COMMIT (трекается ОДИН VRegion на резерв; начальный commit не
-   обновляет per-page/UCR так, как ждёт куча).
-   PROD-DIFF: prod имеет ТЕ ЖЕ символы `__imp__sub_XXX` — сравнить *(segment+56)/последовательность.
-   ⚠ prod=Release (нет ctx) → читать гостевую память по membase; много breakpoint'ов роняют prod.
-   ⚠ УЖЕ ПРОБОВАЛ (НЕ помогло): zero-on-decommit в NtFreeVirtualMemory (корректная NT-семантика, оставлено
-   как улучшение) — но мусорный PrevSize это EXTEND поверх ЖИВОГО заголовка кучи, а не stale-данные decommit'а.
-2. ДВА ГЛАВНЫХ ПОДОЗРЕВАЕМЫХ (класс NtQueryInformationFile — значение/состояние, не codegen в общем):
-   (a) Ошибка ЭМИТТЕРА XenonRecomp в пути free/coalesce кучи (sub_82448128/RtlFreeHeap, backward-coalesce
-       через поле PreviousSize блока) — prod собран ДРУГИМ рекомпилятором (rexglue), так что баг эмиттера
-       только-в-variant-A разойдётся.
-   (b) Семантика variant-A NtAllocateVirtualMemory/NtQueryVirtualMemory: трекается ОДИН VRegion на резерв и
-       возвращается состояние commit на ВЕСЬ регион (не по-страничный) — куча может неверно отслеживать
-       committed/uncommitted диапазоны и коалесить с ошибкой. См. kernel.cpp NtAllocate/NtQuery/NtFree.
-3. Исправить расхождение HLE/эмиттера → аллок 0x78000 ложится в валидное место кучи → устройство не порчено.
-4. Проверить: device+10900 НЕ обнуляется; boot идёт глубже.
+0x8228A3B8 — НЕ начало функции (нет в ppc_func_mapping.cpp) ⇒ это mid-function label, цель вычисляемого
+`bctr` внутри sub_8228A208 (ppc_recomp.36.cpp:5667..8749 — большая ~3K-строчная функция; внутри есть
+`mtctr;bctr` + ещё `PPC_CALL_INDIRECT_FUNC`). ⚠ caller lr=0x8228A210 СТАРЫЙ (bctr не ставит LR — это адрес
+после savegprlr-bl в прологе), НЕ адрес bctr. Реальный bctr ищи в теле функции.
 
-КЛЮЧЕВЫЕ АДРЕСА/ФУНКЦИИ:
-- Устройство = g_interruptData = 0x26F80 (блок 0x26F40, 24KB). Хэндл кучи = *(0x82902448) = 0x10000.
-- sub_822A8150 (ppc_recomp.38.cpp:14077; аллок +192 на :14464-14466) ← sub_822A2158 (ppc_recomp.37:23167).
-- sub_8244B950 (ppc_recomp.65.cpp:7244; free-list[0] поиск loc_8244BBFC:7611, выбор блока :7704).
-- sub_82448090 (ppc_recomp.64.cpp:17230), sub_8244DF68 (ppc_recomp.65.cpp:14904).
+WORKFLOW восстановления (проверен в Update 3, README XenonRecomp «functions containing jump tables»):
+1. Найди адрес bctr и регистр-индекс + базу таблицы. В рекомпиле: ищи `// bctr` в sub_8228A208; рядом
+   `mtctr rN` (rN = table[idx]); поднимись к `lwzx`/`lis;addi` что грузит из таблицы — это база таблицы
+   (адрес в .rdata, обычно 0x822xxxxx). gdb: break на хост-строке перед bctr, прочитай ctx.rN.u32 (индекс)
+   и базу.
+2. Прочитай таблицу из гостевой памяти: gdb `x/<N>xw $g_base+<tablebase>` (BE u32 цели; считай записи, пока
+   адрес валиден внутри функции). g_base бери свежим (python rd() с per-call bswap — в /tmp есть скрипты).
+3. Найди истинный КОНЕЦ функции (blr последнего case) если XenonAnalyse её урезал.
+4. Добавь в **sp_xenon.toml** `functions = [{ address = 0x8228A208, size = <байт> }]` (override границ) и в
+   **sp_switch_tables.toml** `[[switch]]` (base = адрес bctr, r = индекс-регистр, labels = [цели...]).
+5. ЧИСТЫЙ регген: `rm ppc/*.cpp` (⚠ «identical file»-оптимизация оставляет устаревшие TU!), затем
+   `third_party/XenonRecomp/.../XenonRecomp sp_xenon.toml ppc/ppc_context.h` (точную команду см. в
+   patches/ и в истории gita; тулчейн — свежий клон third_party/XenonRecomp, на диске, не сабмодуль).
+6. Пересборка: `ninja -C runtime/out sp_td_varianta`.
 
-ИНСТРУМЕНТЫ (готовые gdb-скрипты в /tmp/ — переиспользуй/перепиши):
-- trace.gdb (путь через sub_822A8150), narrow2.gdb (ловит блок ниже базы + заголовок + bt — РАБОТАЕТ),
-  heaplog.gdb (карта alloc size/flags/result), heapdump.gdb (дамп struct кучи), heapfl.gdb/watchfl.gdb
-  (watchpoint'ы). REX_KTRACE=1 (трасса импортов), читать g_base свежим в python (rd() с per-call bswap).
-- ⚠ break на sub_8244B950 (горячая, на КАЖДЫЙ alloc) с python-stop() ТОРМОЗИТ так, что до .ptc не доходит
-  за 150с. Используй БЫСТРЫЙ conditional break (как narrow2: ранний return False, фильтр r3<0x10000).
+================================================================================================
+ФРОНТИР 2 — null-вызов target=0x0 (caller lr=0x8224FDEC, ppc_recomp.30.cpp)
+================================================================================================
+Класс Update 4 (стаб вернул 0 в r3 но НЕ заполнил out-param / указатель на функцию = 0), ЛИБО ещё одна
+таблица. Локализуй: bl перед 0x8224FDEC в ppc_recomp.30.cpp; что туда должно было записать ненулевой
+указатель (трасса вверх, ref 1:1 = third_party/rexglue-sdk/src/). Возможно закроется тем же реггеном, что и
+Фронтир 1 — проверь после него.
 
-СБОРКА/ЗАПУСК/ОТЛАДКА:
-- Правишь varianta/runtime/kernel.cpp; сборка: cd varianta/runtime/out && ninja sp_td_varianta (секунды).
-  Запуск ИЗ varianta/: REX_KTRACE=1 timeout 25 ./runtime/out/sp_td_varianta ../private/extracted/default.xex.
-- ⚠ zsh: НЕ используй pkill/glob (`/dev/shm/xenia_memory_*`) — несовпадение даёт ненулевой код и рушит
-  команду. Чистить shm: `find /dev/shm -maxdepth 1 -name 'xenia_memory_*' -delete`. Заканчивай команды `; true`.
-- gdb -batch -x SCRIPT --args ./runtime/out/sp_td_varianta ../private/extracted/default.xex. Долгие прогоны
-  уходят в фон — жди уведомления. -O0: break по ppc_recomp.N.cpp:LINE, читать ctx.rN.u32. Гостевая память BE.
+================================================================================================
+ДИАГНОСТИКА / ПРОВЕРКА
+================================================================================================
+- Запуск: из varianta/ → `find /dev/shm -maxdepth 1 -name 'xenia_memory_*' -delete; REX_KTRACE=1 stdbuf -oL
+  -eL timeout 22 ./runtime/out/sp_td_varianta ../private/extracted/default.xex > /tmp/boot.log 2>&1`.
+- ⚠ grep по логу: лог СОДЕРЖИТ бинарные байты (имена .embsec_ секций) → grep видит его как binary и МОЛЧИТ.
+  Всегда `grep -a`.
+- LR теперь печатается в Nt{Allocate,Free}VirtualMemory KTRACE (оставлено — помогло поймать баг кучи).
+- Прогресс мерь так: число строк (было 171 → стало 462), число ассетов `grep -ac NtCreateFile`, и НЕТ
+  `grep -a "req=0x10000 sz=0x80000"` (страховка, что устройство не затёрто). Boot многопоточный, но сейчас
+  детерминирован ~462 строки.
+- INDIRECT-NULL логирует PPCIndirectNull (kernel.cpp) и ПРОПУСКАЕТ вызов; цели уникальны за прогон.
+- gdb -batch -x SCRIPT --args ./runtime/out/sp_td_varianta ../private/extracted/default.xex. -O0: break по
+  ppc_recomp.N.cpp:LINE, читать ctx.rN.u32. Гостевая память BE. Долгие прогоны уходят в фон — жди уведомления.
+- Оракул prod (out/build/linux-amd64-release/south_park_td, read-only под gdb, ТА ЖЕ PPCContext-раскладка,
+  base 0x100000000, PIE — break по СИМВОЛУ): доходит до рендера (54-55 Vulkan-пайплайнов). Сравнивай.
+
+СБОРКА. Правишь varianta/runtime/*.cpp → `ninja -C runtime/out sp_td_varianta` (секунды). Для jump-table —
+правишь *.toml → чистый регген ppc/ → ninja. ⚠ zsh: НЕ используй pkill/glob; чистить shm только `find
+/dev/shm -maxdepth 1 -name 'xenia_memory_*' -delete`. cd внутри compound-команды может дёрнуть пермишн —
+используй `ninja -C <dir>` и абсолютные пути.
 
 ОГРАНИЧЕНИЯ. Скоуп только varianta/ (+ тулчейн через patches/xenonrecomp-sp-instructions.patch). НЕ пушить; НЕ
 трогать prod-бинарь/librexruntime.so(1a3f6076)/rexglue-sdk/указатель суперпроекта. Автор superheher
 <heh@vivaldi.net>; коммиты заканчивать: Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>.
 Хост — расходный стенд (sudo пароль <redacted>), prod не ломать.
 
-ГОТОВО, КОГДА: (промежуточно) аллок 0x78000 .ptc возвращает валидный блок В пределах кучи, device+10900 не
-обнуляется, boot идёт глубже; (далее) главный поток вышел из KeWaitForSingleObject и игра зовёт VdSwap;
-(цель) в окне видны кадры через VdSwap→Vulkan.
+ГОТОВО, КОГДА: (промежуточно) оба INDIRECT-NULL закрыты, boot идёт глубже (>462 строк, новые ассеты/потоки);
+(далее) главный поток вышел из KeWaitForSingleObject и игра зовёт VdSwap; (цель) в окне видны кадры через
+VdSwap→Vulkan.

@@ -915,3 +915,51 @@ ATTEMPTED FIX (kept, but NOT the cure): added zero-on-decommit/release to NtFree
 MEM_DECOMMIT loses page contents). Correct semantics + verified not to break early boot, but does NOT fix
 this bug -- the garbage PrevSize comes from the extend overwriting the LIVE heap header at the base, not from
 stale decommitted data. Left in as a correctness improvement.
+
+## 2026-06-01 (cont.) — ✅ FIXED: the corruption was the NtFreeVirtualMemory(MEM_DECOMMIT) WRITEBACK (commit 4e011b5)
+The "DEEPEST ROOT (open)" above (segment UnCommittedRanges says uncommitted-from-base) is now ROOT-CAUSED and
+FIXED. It was an HLE bug in our kernel, NOT an emitter bug and NOT heap-create UCR seeding.
+
+THE CONCRETE SEQUENCE (KTRACE with caller-LR added to Nt{Allocate,Free}VirtualMemory — that is what made it
+diagnosable; see the title-heap 0x10000 reserve [0x10000,0x110000)):
+- Heap grows commit CORRECTLY, advancing the boundary: NtAllocate COMMIT req=0x20000,0x30000,0x40000,0x50000,
+  0x60000 -> committed to 0x80000 (all from lr=0x82449F30 = RtlpFindAndCommitPages sub_82449E78). The device
+  (0x26F80) lands in this correctly-committed region. So the UCR was FINE up to here (refutes the earlier
+  "set wrong at RtlCreateHeap" guess).
+- Then the heap SHRINKS: NtFreeVirtualMemory(MEM_DECOMMIT, req=0x70000, reqsz=0x10000) from lr=0x8244B140
+  (RtlpDeCommitFreeBlock sub_8244B018) -- decommit the file-buffer tail [0x70000,0x80000).
+- ⚠ Our NtFreeVirtualMemory wrote the out-params back as the WHOLE reservation: *BaseAddress=rb=0x10000,
+  *RegionSize=r->size=0x100000 (instead of the page-aligned requested sub-range 0x70000 / 0x10000).
+- The guest decommit helper READS *BaseAddress / *RegionSize BACK (sub_8244B018: ppc_recomp.65.cpp:4184-4190
+  `lwz r5,80(r1); lwz r4,84(r1); bl 0x82449d58`) and feeds them to sub_82449D58, which INSERTS [base,size)
+  into the segment's UnCommittedRanges. So the heap recorded the ENTIRE reservation [0x10000,0x110000) as
+  uncommitted -> UCR first-range addr reset to 0x10000.
+- Next extend (the 0x78000 .ptc vertex-stream buffer): RtlpFindAndCommitPages walks the UCR, finds the
+  [0x10000,...) range, and commits AT THE BASE: NtAllocate COMMIT req=0x10000 sz=0x80000 -> commits
+  [0x10000,0x90000), over the live header + device. sub_8244A108 writes a fresh _HEAP_ENTRY at 0x10000
+  (0x800007D6 = Size 0x8000 / PrevSize 0x7D6); backward-coalesce r31 = 0x10000 - 0x7D60 = 0x82A0 (the phantom
+  below-base block). device+10900 zeroed -> all GPU-completion waits (main 0x388C4; render 0x29CD4/0x29D40)
+  stall = the "teardown".
+
+THE FIX (kernel.cpp NtFreeVirtualMemory): MEM_DECOMMIT now writes back the page-aligned requested base and the
+page-rounded requested size, and only clears the region's committed flag when the WHOLE reservation is
+decommitted; MEM_RELEASE still returns the whole allocation. (The prior zero-on-decommit was necessary-but-
+not-sufficient; the writeback was the actual divergence — prod's rexglue kernel returns the sub-range, ours
+returned the region.)
+
+RESULT (verified, 4 runs, deterministic 462-463 lines): the post-decommit commit lands clear of the device
+(NtAllocate COMMIT req=0x70000 then 0x80000, NEVER req=0x10000 sz=0x80000); 0 device-overwrite commits; boot
+advances 171 -> 462 lines and 3 -> 6 assets (past ArcadeLogo.ptc, UI.xzp 23.5MB, Strings.bin). The GPU-device
+teardown is GONE.
+
+NEW FRONTIER (downstream, different class = the known function-boundary/jump-table problem, Update 3 workflow):
+the boot now ends at two INDIRECT-NULLs, stable across all runs:
+  [INDIRECT-NULL] target=0x8228A3B8 (caller lr=0x8228A210)  -- a missing jump-table case. 0x8228A3B8 is NOT a
+    function start (absent from ppc_func_mapping); it is a mid-function label reached by a `bctr` inside
+    sub_8228A208 (ppc_recomp.36.cpp:5667..8749, a ~3KB-line fn with a `mtctr;bctr` table). lr=0x8228A210 is
+    STALE (bctr doesn't set LR). RECOVER per Update 3: gdb the table base/index at the bctr, read the BE-u32
+    targets, add functions=[{address,size}] to sp_xenon.toml + a [[switch]] to sp_switch_tables.toml, clean
+    regen ppc/ (rm ppc/*.cpp first), rebuild.
+  [INDIRECT-NULL] target=0x00000000 (caller lr=0x8224FDEC)  -- a null call in ppc_recomp.30.cpp (likely an
+    unfilled out-param/fn-ptr, Update 4 class, OR another table). Characterize after the first.
+Then: more tables (Update 3 noted 9 deferred + 161 markers) -> the GPU CP draws -> VdSwap -> Plume Vulkan.
