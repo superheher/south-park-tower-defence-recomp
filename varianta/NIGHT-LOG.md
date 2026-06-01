@@ -249,6 +249,31 @@ Remaining is now a stable LOGIC bug, not a race:
 - Memory layout verified correct: the title's 1.88 GB heap reserve now lands at base 0x48D0000 (ends
   0x749D0000, **below** the image 0x82000000); kernel arena + worker stacks at 0x90000000+.
 
+### ⏩ UPDATE — cascade cleared, boot reaches the GPU command-processor boundary (commits through case-insensitive VFS)
+The -1 subsystem WAS the asset/profile subsystem; resolved it by walking the cascade with correct imports:
+XamUserGetSigninInfo → XamUserReadProfileSettings (0-settings) → then the **file VFS**. Implemented a
+read-only VFS (Nt{CreateFile,OpenFile,ReadFile,QueryInformationFile,SetInformationFile,Close}) that maps
+guest `game:\…` → `<g_gameDir>/…` (the extracted dir, from the XEX path), **case-insensitively** (Xbox FS
+is case-insensitive; the title opens `UI\`/`Audio\` but the extract is lowercase `ui`/`audio` — that
+mismatch was the last crash). Now `default.xex`/`SouthParkXact.xgs`/`ArcadeLogo.ptc`/`UI.xzp` all open OK and
+**the crash is GONE (exit 139 → 124)**. The boot loads assets + allocates GPU physical memory, then
+**deadlocks at the GPU ring-buffer spin `sub_821B9270`** (a worker busy-polls the RPtr write-back for the
+GPU to "catch up"; it needs a command processor to advance RPtr — and it holds the cooperative token while
+spinning, starving everything else). **This is the GPU-CP / renderer boundary (goal step 5).**
+
+### Revised next-steps
+1. **GPU command processor (the frontier).** The spin waits for `[RPtr]` (the ring-buffer read pointer
+   write-back, set by VdEnableRingBufferRPtrWriteBack = `g_rptrWriteBack`) to reach the CPU's write pointer.
+   Minimal "null GPU": capture the guest's WPtr writes to the CP register, advance RPtr→WPtr (pretend all
+   PM4 consumed) from a host GPU thread that writes guest memory directly (no token needed — it's a memory
+   write, not guest code). That alone should release the spin → boot proceeds. THEN the real renderer:
+   parse + translate the PM4 stream → draws (Plume + the 19 shaders in `private/extracted/media/shaders/`;
+   Unleashed `gpu/video.cpp` ref). This is the multi-week piece.
+2. Fix the token-starvation generally (so busy-waits don't starve the pump): once the CP advances RPtr the
+   spin exits on its own, but for robustness, detect long token holds or give the GPU-advance thread direct
+   memory access without the token (as above).
+3. Remaining soft-stubs surface as the boot proceeds (more Xam, audio XAudio*, input) — implement as hit.
+
 ### Systematic next-steps (priority order)
 1. ✅ **DONE — cooperative execution token** (commit e56368f): the boot is now deterministic. (Ruled out:
    broken atomics — XenonRecomp emits real `__sync_bool_compare_and_swap` for `lwarx/stwcx`.)
