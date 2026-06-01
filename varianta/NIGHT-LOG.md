@@ -443,3 +443,25 @@ Net for the session: boot advanced 127 → ~10,500 trace-lines across video init
 crash is precisely localized and three root hypotheses eliminated. Reaching a rendered frame still
 requires resolving the init divergence (above) AND then building the GPU engine (PM4 → Plume + 19
 shaders) — the latter remains multi-week.
+
+### Reference-diff is FEASIBLE — turnkey starting point for next session
+Confirmed the working build can serve as a correctness oracle for the init divergence:
+- The prod game exe `out/build/linux-amd64-release/south_park_td` (20 MB, the rexglue-sdk recomp that
+  renders this title fully) is **NOT stripped**: it exports all ~30,310 guest `sub_*` symbols, incl.
+  `sub_821E07A0` (count loop) @ host 0x733910 (W), `sub_82244378` (XUI validator) @ 0x879d80,
+  `sub_821DC228` (float dispatcher) @ 0000000000725a20. So I can break read-only at the exact guest
+  functions that diverge in variant A.
+- A display is available (DISPLAY=:0 / wayland-0) and launch is known (`tools/gamectl.sh`):
+  `cd out/build/linux-amd64-release && SDL_VIDEODRIVER=x11 LD_LIBRARY_PATH=. ./south_park_td
+  --game_data_root=../../../private/extracted --user_data_root=../../../private/userdata
+  --log_file=run.log`. ⚠ leaks a 4.5 GB /dev/shm/xenia_memory_* per launch — run `tools/gamectl.sh
+  kill_all` after to reclaim it; NEVER modify the prod binary (read-only gdb only).
+- Procedure: break sub_821DC228 in prod and read the loop index (max should be ≤21; variant A reaches
+  32767 because the count is 0x8000) → confirms which side is correct; then break sub_821E07A0 /
+  sub_82244378 entry in BOTH builds and diff the guest object state (the construction inputs) to find the
+  first divergence. Caveat: the two builds use different PPCContext layouts + heap addresses, so compare
+  GUEST values (registers/memory contents), match the same call instance, not host pointers.
+
+This won't itself produce frames (the GPU engine — PM4 → Plume → 19 shaders — remains multi-week after
+init is correct), but it is the lowest-cost route to unblock the CRT-init divergence that currently
+stops the boot well before the GPU boundary.
