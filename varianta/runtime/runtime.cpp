@@ -26,6 +26,10 @@ int main(int argc, char** argv)
 {
     const char* xexPath = argc > 1 ? argv[1] : "../private/extracted/default.xex";
 
+    // The guest filesystem maps to the directory containing the XEX (the extracted game dir).
+    { std::string p = xexPath; size_t s = p.find_last_of('/');
+      kernel::g_gameDir = (s == std::string::npos) ? "." : p.substr(0, s); }
+
     // 1. Reserve the full 4 GiB guest address space (lazy-committed via MAP_NORESERVE).
     g_base = static_cast<uint8_t*>(mmap(nullptr, PPC_MEMORY_SIZE, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));

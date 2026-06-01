@@ -1,10 +1,15 @@
 #pragma once
 // Shared host-runtime state between the loader (runtime.cpp) and the kernel imports (kernel.cpp).
 #include <cstdint>
+#include <string>
 
 extern uint8_t* g_base;   // guest memory base (4 GiB), defined in runtime.cpp
 
 namespace kernel {
+
+// Host directory the guest filesystem maps to (the extracted game dir; set by runtime.cpp from the
+// XEX path). Guest paths like "game:\media\foo" resolve to <g_gameDir>/media/foo.
+extern std::string g_gameDir;
 
 // Guest addresses of the boot environment the host provides (set by SetupEnvironment).
 extern uint32_t g_kpcrAddr;        // X_KPCR    (loaded into r13)

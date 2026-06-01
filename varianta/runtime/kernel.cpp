@@ -932,6 +932,130 @@ PPC_FUNC(__imp__XamUserReadProfileSettings)
     ctx.r3.u64 = 0;                                 // X_ERROR_SUCCESS
 }
 
+// ====================================================================================================
+// File VFS (read-only) — backs Nt{CreateFile,ReadFile,QueryInformationFile,SetInformationFile,Close}.
+// Guest paths (X_OBJECT_ATTRIBUTES.name_ptr -> X_ANSI_STRING) like "game:\media\foo" resolve under
+// kernel::g_gameDir (the extracted game dir). Ref: rexglue-sdk src/filesystem + xboxkrnl_io.cpp.
+// ====================================================================================================
+namespace kernel { std::string g_gameDir; }
+namespace {
+std::unordered_map<uint32_t, FILE*> g_files;
+uint32_t g_nextFileHandle = 0xF2000000;   // file handle space (distinct from threads at 0xF1xxxxxx)
+std::mutex g_fileMutex;
+
+std::string GuestAnsiString(uint32_t strPtr) {   // X_ANSI_STRING: len@0(u16), max@2(u16), buf@4(u32)
+    if (!strPtr) return {};
+    uint16_t len = GLD16(strPtr + 0x00);
+    uint32_t buf = GLD32(strPtr + 0x04);
+    std::string s;
+    for (uint16_t i = 0; i < len && buf; i++) s += static_cast<char>(g_base[buf + i]);
+    return s;
+}
+
+// "game:\media\foo" / "\Device\...\foo" / "d:\foo" -> <g_gameDir>/media/foo (best-effort).
+std::string TranslatePath(std::string p) {
+    size_t colon = p.find(':');
+    std::string rel = (colon != std::string::npos) ? p.substr(colon + 1) : p;
+    for (char& c : rel) if (c == '\\') c = '/';
+    while (!rel.empty() && rel[0] == '/') rel.erase(0, 1);
+    return kernel::g_gameDir + "/" + rel;
+}
+FILE* FileForHandle(uint32_t h) {
+    std::lock_guard<std::mutex> lk(g_fileMutex);
+    auto it = g_files.find(h);
+    return it != g_files.end() ? it->second : nullptr;
+}
+} // namespace
+
+// NTSTATUS NtCreateFile(*handle r3, access r4, obj_attr r5, io_status r6, alloc r7, attrs r8, share r9,
+//                       disposition r10, options r11)
+PPC_FUNC(__imp__NtCreateFile)
+{
+    uint32_t pHandle = ctx.r3.u32, objAttr = ctx.r5.u32, ioStatus = ctx.r6.u32;
+    uint32_t namePtr = objAttr ? GLD32(objAttr + 0x04) : 0;
+    std::string path = GuestAnsiString(namePtr);
+    std::string host = TranslatePath(path);
+    FILE* f = path.empty() ? nullptr : fopen(host.c_str(), "rb");
+    KTRACE("NtCreateFile('%s' -> '%s') %s\n", path.c_str(), host.c_str(), f ? "OK" : "MISS");
+    if (!f) {
+        if (pHandle) PPC_STORE_U32(pHandle, 0);
+        if (ioStatus) { PPC_STORE_U32(ioStatus + 0, 0xC0000034u); PPC_STORE_U32(ioStatus + 4, 0); }
+        ctx.r3.u64 = 0xC0000034u;   // STATUS_OBJECT_NAME_NOT_FOUND
+        return;
+    }
+    uint32_t h;
+    { std::lock_guard<std::mutex> lk(g_fileMutex); h = g_nextFileHandle++; g_files[h] = f; }
+    if (pHandle) PPC_STORE_U32(pHandle, h);
+    if (ioStatus) { PPC_STORE_U32(ioStatus + 0, 0); PPC_STORE_U32(ioStatus + 4, 1); } // SUCCESS, FILE_OPENED
+    ctx.r3.u64 = 0;
+}
+
+// NtOpenFile(*handle r3, access r4, obj_attr r5, io_status r6, share r7, options r8) — open-existing.
+PPC_FUNC(__imp__NtOpenFile)
+{
+    uint32_t pHandle = ctx.r3.u32, objAttr = ctx.r5.u32, ioStatus = ctx.r6.u32;
+    uint32_t namePtr = objAttr ? GLD32(objAttr + 0x04) : 0;
+    std::string host = TranslatePath(GuestAnsiString(namePtr));
+    FILE* f = fopen(host.c_str(), "rb");
+    if (!f) { if (pHandle) PPC_STORE_U32(pHandle, 0); ctx.r3.u64 = 0xC0000034u; return; }
+    uint32_t h;
+    { std::lock_guard<std::mutex> lk(g_fileMutex); h = g_nextFileHandle++; g_files[h] = f; }
+    if (pHandle) PPC_STORE_U32(pHandle, h);
+    if (ioStatus) { PPC_STORE_U32(ioStatus + 0, 0); PPC_STORE_U32(ioStatus + 4, 1); }
+    ctx.r3.u64 = 0;
+}
+
+// NTSTATUS NtReadFile(handle r3, event r4, apc r5, apc_ctx r6, io_status r7, buffer r8, len r9, *offset r10)
+PPC_FUNC(__imp__NtReadFile)
+{
+    uint32_t handle = ctx.r3.u32, ioStatus = ctx.r7.u32, buffer = ctx.r8.u32, length = ctx.r9.u32,
+             pOffset = ctx.r10.u32;
+    FILE* f = FileForHandle(handle);
+    if (!f) { ctx.r3.u64 = 0xC0000008u; return; }      // STATUS_INVALID_HANDLE
+    if (pOffset) fseek(f, static_cast<long>(GLD64(pOffset)), SEEK_SET);
+    size_t n = length ? fread(g_base + buffer, 1, length, f) : 0;
+    if (ioStatus) { PPC_STORE_U32(ioStatus + 0, n ? 0 : 0xC0000011u); PPC_STORE_U32(ioStatus + 4, static_cast<uint32_t>(n)); }
+    KTRACE("NtReadFile(h=0x%X len=%u off=%s) -> %zu\n", handle, length, pOffset ? "set" : "cur", n);
+    ctx.r3.u64 = (n || length == 0) ? 0 : 0xC0000011u; // STATUS_END_OF_FILE
+}
+
+// NTSTATUS NtQueryInformationFile(handle r3, io_status r4, info r5, len r6, class r7)
+PPC_FUNC(__imp__NtQueryInformationFile)
+{
+    uint32_t handle = ctx.r3.u32, ioStatus = ctx.r4.u32, info = ctx.r5.u32, infoClass = ctx.r7.u32;
+    FILE* f = FileForHandle(handle);
+    if (!f) { ctx.r3.u64 = 0xC0000008u; return; }
+    long cur = ftell(f); fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, cur, SEEK_SET);
+    if (info) {
+        if (infoClass == 14) {                          // FILE_POSITION_INFORMATION
+            PPC_STORE_U64(info + 0, static_cast<uint64_t>(cur));
+        } else {                                        // FILE_STANDARD/NETWORK_OPEN: report sizes
+            PPC_STORE_U64(info + 0, static_cast<uint64_t>(size));   // AllocationSize
+            PPC_STORE_U64(info + 8, static_cast<uint64_t>(size));   // EndOfFile
+        }
+    }
+    if (ioStatus) { PPC_STORE_U32(ioStatus + 0, 0); PPC_STORE_U32(ioStatus + 4, 0); }
+    ctx.r3.u64 = 0;
+}
+
+// NTSTATUS NtSetInformationFile(handle r3, io_status r4, info r5, len r6, class r7) — handle seek (14).
+PPC_FUNC(__imp__NtSetInformationFile)
+{
+    uint32_t handle = ctx.r3.u32, info = ctx.r5.u32, infoClass = ctx.r7.u32;
+    FILE* f = FileForHandle(handle);
+    if (f && infoClass == 14 && info) fseek(f, static_cast<long>(GLD64(info + 0)), SEEK_SET);
+    ctx.r3.u64 = 0;
+}
+
+// NTSTATUS NtClose(handle r3) — close file handles (others are no-op: thread/event handles persist).
+PPC_FUNC(__imp__NtClose)
+{
+    uint32_t h = ctx.r3.u32;
+    { std::lock_guard<std::mutex> lk(g_fileMutex); auto it = g_files.find(h);
+      if (it != g_files.end()) { fclose(it->second); g_files.erase(it); } }
+    ctx.r3.u64 = 0;
+}
+
 // NTSTATUS KeWaitForMultipleObjects(count r3, objects r4, waitType r5, reason r6, mode r7,
 //                                   alertable r8, *timeout r9, waitblocks r10)
 PPC_FUNC(__imp__KeWaitForMultipleObjects)
