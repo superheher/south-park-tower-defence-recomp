@@ -3,9 +3,12 @@
 // ABI: PPC_FUNC(__imp__Name)(PPCContext& ctx, uint8_t* base); args in ctx.r3,r4,...; NTSTATUS/ret in ctx.r3.
 // Guest pointers are guest addresses — dereference via PPC_LOAD_*/PPC_STORE_* (base + addr, byte-swapped).
 #include "ppc_recomp_shared.h"
+#include "kernel.h"
+#include <xex.h>     // getOptHeaderPtr, XEX_HEADER_*
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <utility>
 
@@ -191,3 +194,213 @@ PPC_FUNC(__imp__RtlTryEnterCriticalSection)
 {
     ctx.r3.u64 = 1;
 }
+
+// ====================================================================================================
+// Boot environment: title X_KPROCESS + main-thread X_KTHREAD + X_KPCR + static TLS block.
+// Layouts are 1:1 with rexglue-sdk (Xenia-derived): include/rex/system/{xthread.h,kernel_state.h};
+// behaviour mirrors KernelState::{Setup,InitializeProcess,SetProcessTLSVars} +
+// XThread::{Create,InitializeGuestObject}. The recompiled CRT reads r13=KPCR → current_thread (KTHREAD)
+// → process (KPROCESS), the per-thread TLS block, the stack bounds, and the process TLS slot bitmap.
+// ====================================================================================================
+namespace {
+// Dedicated kernel arena (far from the guest virtual bump at 0x40000000 and the XEX image at
+// 0x82000000); the full 4 GiB is lazily mmap'd so these addresses are already backed.
+constexpr uint32_t kProcessAddr = 0x60000000;
+constexpr uint32_t kThreadAddr  = 0x60001000;
+constexpr uint32_t kKpcrAddr    = 0x60002000;
+constexpr uint32_t kTlsAddr     = 0x60003000;  // per-thread TLS block (main thread)
+constexpr uint32_t kDefaultTlsSlots = 1024;
+constexpr uint32_t kProctypeUser = 1;          // X_PROCTYPE_USER (KeGetCurrentProcessType == 1)
+
+// Big-endian guest stores/loads via the raw base (used during setup, no PPCContext in scope).
+inline void GST8 (uint32_t a, uint8_t  v) { g_base[a] = v; }
+inline void GST16(uint32_t a, uint16_t v) { uint16_t b = __builtin_bswap16(v); memcpy(g_base + a, &b, 2); }
+inline void GST32(uint32_t a, uint32_t v) { uint32_t b = __builtin_bswap32(v); memcpy(g_base + a, &b, 4); }
+inline void GST64(uint32_t a, uint64_t v) { uint64_t b = __builtin_bswap64(v); memcpy(g_base + a, &b, 8); }
+inline uint32_t GLD32(uint32_t a) { uint32_t b; memcpy(&b, g_base + a, 4); return __builtin_bswap32(b); }
+
+// Read a XEX optional header that stores its value INLINE (key low byte 0) as a BE u32.
+uint32_t XexOptU32(const uint8_t* xex, uint32_t key, uint32_t fallback) {
+    const void* p = getOptHeaderPtr(xex, key);
+    if (!p) return fallback;
+    uint32_t b; memcpy(&b, p, 4); return __builtin_bswap32(b);
+}
+} // namespace
+
+namespace kernel {
+uint32_t g_kpcrAddr = 0, g_mainThreadAddr = 0, g_processAddr = 0;
+
+uint32_t SetupEnvironment(const uint8_t* xexFile, uint32_t stackBase, uint32_t stackLimit,
+                          uint32_t startAddress)
+{
+    // ---- XEX TLS directory (XEX_HEADER_TLS_INFO = 4 BE dwords) --------------------------------------
+    uint32_t tlsSlots = kDefaultTlsSlots, tlsRawAddr = 0, tlsDataSize = 0, tlsRawSize = 0;
+    if (const void* ti = getOptHeaderPtr(xexFile, XEX_HEADER_TLS_INFO)) {
+        const uint8_t* p = static_cast<const uint8_t*>(ti);
+        uint32_t v[4]; memcpy(v, p, 16);
+        tlsSlots    = __builtin_bswap32(v[0]);
+        tlsRawAddr  = __builtin_bswap32(v[1]);
+        tlsDataSize = __builtin_bswap32(v[2]);
+        tlsRawSize  = __builtin_bswap32(v[3]);
+    }
+    if (tlsSlots == 0) tlsSlots = kDefaultTlsSlots;
+    uint32_t slotsPadded = (tlsSlots + 3) & ~3u;
+    uint32_t tlsSlotSize = tlsSlots * 4;
+    uint32_t tlsTotal    = tlsSlotSize + tlsDataSize;
+    uint32_t tlsDynamic  = kTlsAddr + tlsDataSize;     // dynamic slots follow the static (extended) data
+
+    // Build the TLS block: zero, then copy the XEX raw template into the static (extended) region.
+    memset(g_base + kTlsAddr, 0, tlsTotal ? tlsTotal : 0x1000);
+    if (tlsDataSize && tlsRawAddr && tlsRawSize)
+        memcpy(g_base + kTlsAddr, g_base + tlsRawAddr, tlsRawSize);
+
+    uint32_t defaultStack = XexOptU32(xexFile, XEX_HEADER_DEFAULT_STACK_SIZE, 0);
+    uint32_t kernStack = defaultStack ? ((defaultStack + 0xFFF) & ~0xFFFu) : 0;
+    if (kernStack < 16 * 1024) kernStack = 16 * 1024;
+
+    // ---- X_KPROCESS (title process) -----------------------------------------------------------------
+    const uint32_t P = kProcessAddr;
+    memset(g_base + P, 0, 0x60);
+    GST32(P + 0x04, P + 0x04); GST32(P + 0x08, P + 0x04);   // thread_list: self-ref LIST_ENTRY
+    GST32(P + 0x0C, 60);                                     // quantum
+    GST32(P + 0x14, 0);                                      // thread_count (++ when main thread links)
+    GST8 (P + 0x18, 10); GST8(P + 0x19, 13); GST8(P + 0x1A, 17); GST8(P + 0x1B, 6);
+    GST32(P + 0x1C, kernStack);                              // kernel_stack_size
+    GST32(P + 0x20, tlsRawAddr);                             // tls_static_data_address (XEX template)
+    GST32(P + 0x24, tlsDataSize);                            // tls_data_size
+    GST32(P + 0x28, tlsRawSize);                             // tls_raw_data_size
+    GST16(P + 0x2C, static_cast<uint16_t>(4 * slotsPadded)); // tls_slot_size
+    GST8 (P + 0x2F, kProctypeUser);                          // process_type
+    GST32(P + 0x54, P + 0x54); GST32(P + 0x58, P + 0x54);   // unk_54: self-ref LIST_ENTRY
+    // tls_slot_bitmap[8]: 1 = available slot (high bits first), matching SetProcessTLSVars.
+    uint32_t bitmapSlots = slotsPadded / 32;
+    for (uint32_t i = 0; i < 8; i++) {
+        uint32_t v;
+        if (i < bitmapSlots) v = 0xFFFFFFFFu;
+        else if (i == bitmapSlots) { uint32_t rem = slotsPadded % 32; v = rem ? (~0u << (32 - rem)) : 0; }
+        else v = 0;
+        GST32(P + 0x30 + i * 4, v);
+    }
+
+    // ---- X_KTHREAD (main thread) — InitializeGuestObject --------------------------------------------
+    const uint32_t T = kThreadAddr;
+    memset(g_base + T, 0, 0xAB0);
+    GST8 (T + 0x00, 6);                                      // header.type = ThreadObject
+    GST32(T + 0x10, T + 0x10); GST32(T + 0x14, T + 0x10);   // self-ref ptrs
+    GST32(T + 0x40, T + 0x20); GST32(T + 0x44, T + 0x20);   // wait_timeout_block.list_entry
+    GST32(T + 0x48, T);        GST32(T + 0x4C, T + 0x18);   // .thread, .object
+    GST16(T + 0x54, 0x0100);   GST16(T + 0x56, 0x0201);     // .wait_result_xstatus, .wait_type
+    GST32(T + 0x5C, stackBase);                              // stack_base (high)
+    GST32(T + 0x60, stackLimit);                             // stack_limit (low)
+    GST32(T + 0x64, stackBase - 240);                        // stack_kernel
+    GST32(T + 0x68, tlsDynamic);                             // tls_address (dynamic TLS base)
+    GST8 (T + 0x6C, 2);                                      // thread_state = RUNNING
+    GST32(T + 0x74, T + 0x74); GST32(T + 0x78, T + 0x74);   // apc_lists[0]: self-ref
+    GST32(T + 0x7C, T + 0x7C); GST32(T + 0x80, T + 0x7C);   // apc_lists[1]: self-ref
+    GST8 (T + 0x72, kProctypeUser); GST8(T + 0x73, kProctypeUser); // process_type(_dup)
+    GST32(T + 0x84, P);                                      // process
+    GST8 (T + 0x8B, 1);                                      // may_queue_apcs
+    GST32(T + 0x9C, 0xFDFFD7FFu);                            // msr_mask
+    GST32(T + 0xC0, kKpcrAddr + 0x100); GST32(T + 0xC4, kKpcrAddr + 0x100); // a/another_prcb_ptr
+    GST32(T + 0xD0, stackBase);                              // stack_alloc_base
+    GST32(T + 0x110, T + 0x110); GST32(T + 0x114, T + 0x110); // process_threads (relinked below)
+    GST32(T + 0x144, T + 0x144); GST32(T + 0x148, T + 0x144); // timer_list: self-ref
+    GST32(T + 0x14C, 1);                                     // thread_id (main = 1)
+    GST32(T + 0x150, startAddress);                          // start_address
+    GST32(T + 0x154, T + 0x154); GST32(T + 0x158, T + 0x154); // unk_154: self-ref
+    GST32(T + 0x17C, 1);                                     // unk_17C
+
+    // Link the main thread into the process thread list (XeInsertTailList: list was self-ref).
+    GST32(T + 0x110, P + 0x04);   // entry->flink = head
+    GST32(T + 0x114, P + 0x04);   // entry->blink = head (head->blink was head itself)
+    GST32(P + 0x04, T + 0x110);   // head->flink = entry
+    GST32(P + 0x08, T + 0x110);   // head->blink = entry
+    GST32(P + 0x14, 1);           // thread_count = 1
+
+    // ---- X_KPCR -------------------------------------------------------------------------------------
+    const uint32_t K = kKpcrAddr;
+    memset(g_base + K, 0, 0x2D8);
+    GST32(K + 0x00, kTlsAddr);            // tls_ptr (static TLS / block start; this is *(r13))
+    GST8 (K + 0x18, 0);                   // current_irql = PASSIVE
+    GST64(K + 0x30, K);                   // pcr_ptr
+    GST32(K + 0x70, stackBase);           // stack_base_ptr
+    GST32(K + 0x74, stackLimit);          // stack_end_ptr
+    GST32(K + 0x100, T);                  // prcb_data.current_thread
+    GST32(K + 0x2A8, K + 0x100);          // prcb -> &prcb_data
+
+    g_kpcrAddr = K; g_mainThreadAddr = T; g_processAddr = P;
+    fprintf(stderr, "[env] KPROCESS=0x%X KTHREAD=0x%X KPCR=0x%X TLS=0x%X (slots=%u dataSize=0x%X "
+        "rawAddr=0x%X rawSize=0x%X dyn=0x%X)\n", P, T, K, kTlsAddr, tlsSlots, tlsDataSize, tlsRawAddr,
+        tlsRawSize, tlsDynamic);
+    return K;
+}
+} // namespace kernel
+
+// ---- dynamic TLS slots (KeTls*) --------------------------------------------------------------------
+// Slot bitmap lives in the current process (1 = free, high-bit-first). Slot values live in the current
+// thread's dynamic TLS array. Current thread/process resolved via r13 (KPCR) so this works per-thread.
+PPC_FUNC(__imp__KeTlsAlloc)
+{
+    uint32_t thread = PPC_LOAD_U32(ctx.r13.u32 + 0x100);   // KPCR.prcb_data.current_thread
+    uint32_t proc   = PPC_LOAD_U32(thread + 0x84);          // KTHREAD.process
+    uint32_t slot = 0xFFFFFFFFu;
+    for (uint32_t bi = 0; bi < 8; bi++) {
+        uint32_t bm = PPC_LOAD_U32(proc + 0x30 + bi * 4);
+        if (bm == 0) continue;
+        uint32_t lz = __builtin_clz(bm);
+        uint32_t s = bi * 32 + lz;
+        if (s >= 256) continue;
+        PPC_STORE_U32(proc + 0x30 + bi * 4, bm & ~(1u << (31 - lz)));
+        slot = s;
+        break;
+    }
+    if (slot != 0xFFFFFFFFu) {
+        uint32_t tlsDyn = PPC_LOAD_U32(thread + 0x68);
+        PPC_STORE_U32(tlsDyn + slot * 4, 0);
+    }
+    KTRACE("KeTlsAlloc -> %u\n", slot);
+    ctx.r3.u64 = slot;
+}
+
+PPC_FUNC(__imp__KeTlsFree)
+{
+    uint32_t idx = ctx.r3.u32;
+    if (idx < 256) {
+        uint32_t thread = PPC_LOAD_U32(ctx.r13.u32 + 0x100);
+        uint32_t proc   = PPC_LOAD_U32(thread + 0x84);
+        uint32_t bi = idx / 32, lz = idx % 32;
+        uint32_t bm = PPC_LOAD_U32(proc + 0x30 + bi * 4);
+        PPC_STORE_U32(proc + 0x30 + bi * 4, bm | (1u << (31 - lz)));
+    }
+    ctx.r3.u64 = 1;
+}
+
+PPC_FUNC(__imp__KeTlsGetValue)
+{
+    uint32_t idx = ctx.r3.u32;
+    uint32_t thread = PPC_LOAD_U32(ctx.r13.u32 + 0x100);
+    uint32_t tlsDyn = PPC_LOAD_U32(thread + 0x68);
+    ctx.r3.u64 = (idx < 0x4000) ? PPC_LOAD_U32(tlsDyn + idx * 4) : 0;
+}
+
+PPC_FUNC(__imp__KeTlsSetValue)
+{
+    uint32_t idx = ctx.r3.u32, val = ctx.r4.u32;
+    uint32_t thread = PPC_LOAD_U32(ctx.r13.u32 + 0x100);
+    uint32_t tlsDyn = PPC_LOAD_U32(thread + 0x68);
+    if (idx < 0x4000) PPC_STORE_U32(tlsDyn + idx * 4, val);
+    ctx.r3.u64 = 1;
+}
+
+// ---- time ------------------------------------------------------------------------------------------
+// DWORD KeQueryPerformanceFrequency() — Xbox 360 timebase = 50 MHz (avoid guest div-by-zero).
+PPC_FUNC(__imp__KeQueryPerformanceFrequency) { ctx.r3.u64 = 50000000u; }
+
+// void KeQuerySystemTime(PLARGE_INTEGER) — 100ns units since 1601. Fixed plausible value (~2024).
+PPC_FUNC(__imp__KeQuerySystemTime)
+{
+    if (ctx.r3.u32) PPC_STORE_U64(ctx.r3.u32, 0x01DA80F800000000ull);
+}
+
+// BOOL XexCheckExecutablePrivilege(DWORD privilege) — title has no special privileges during bring-up.
+PPC_FUNC(__imp__XexCheckExecutablePrivilege) { ctx.r3.u64 = 0; }

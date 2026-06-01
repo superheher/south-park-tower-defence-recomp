@@ -4,6 +4,7 @@
 // entry point. Kernel/xam imports are still trap-stubs (import_stubs.gen.cpp): the first one the boot
 // sequence reaches prints its name and traps, revealing what to implement next.
 #include "ppc_recomp_shared.h"
+#include "kernel.h"  // kernel::SetupEnvironment
 #include <image.h>   // XenonUtils: Image::ParseImage (decrypts/decompresses the XEX)
 #include <file.h>    // XenonUtils: LoadFile
 #include <sys/mman.h>
@@ -77,28 +78,20 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // 6. Set up a minimal guest thread environment. On Xbox 360 (this recomp's convention) r13 holds
-    //    the KPCR pointer; early CRT init reads the current thread via *(r13 + offsetof(X_KPCR,
-    //    prcb_data.current_thread)). Layout (rexglue X_KPCR, size 0x2D8): tls_ptr@0x0,
-    //    stack_base_ptr@0x70 (high), stack_end_ptr@0x74 (low), prcb_data@0x100 (X_KPRCB;
-    //    current_thread@0x0), prcb@0x2A8. KTHREAD is left zeroed for now (populate as the boot demands).
-    auto store32 = [&](uint32_t addr, uint32_t val) {
-        *reinterpret_cast<uint32_t*>(g_base + addr) = __builtin_bswap32(val);
-    };
+    // 6. Build the guest boot environment: title X_KPROCESS + main-thread X_KTHREAD + X_KPCR + the
+    //    static TLS block (initialized from the XEX TLS directory). r13 = KPCR; the CRT walks
+    //    KPCR -> prcb_data.current_thread (KTHREAD) -> process (KPROCESS) and reads the per-thread TLS
+    //    block, the stack bounds, and the process TLS slot bitmap. See kernel.cpp SetupEnvironment.
     constexpr uint32_t STACK_TOP = 0x70100000, STACK_BOTTOM = 0x70000000;
-    constexpr uint32_t KPCR = 0x60000000, KTHREAD = 0x60010000, TLS = 0x60020000;
-    store32(KPCR + 0x00, TLS);                  // tls_ptr
-    store32(KPCR + 0x70, STACK_TOP);            // stack_base_ptr (high address)
-    store32(KPCR + 0x74, STACK_BOTTOM);         // stack_end_ptr  (low address)
-    store32(KPCR + 0x100, KTHREAD);             // prcb_data.current_thread
-    store32(KPCR + 0x2A8, KPCR + 0x100);        // prcb -> &prcb_data
+    uint32_t kpcr = kernel::SetupEnvironment(file.data(), STACK_TOP, STACK_BOTTOM,
+        static_cast<uint32_t>(image.entry_point));
 
-    static PPCContext ctx{};                     // msr defaults to 0x200A000; everything else zero
+    static PPCContext ctx{};                     // msr defaults; everything else zero
     ctx.r1.u64 = STACK_TOP - 0x200;              // SP with a little headroom; back-chain is zeroed
-    ctx.r13.u64 = KPCR;                          // KPCR pointer (Xbox 360 thread-base convention)
+    ctx.r13.u64 = kpcr;                          // KPCR pointer (Xbox 360 thread-base convention)
 
-    fprintf(stderr, "[boot] calling guest entry 0x%zX (SP=0x%llX)...\n",
-        image.entry_point, (unsigned long long)ctx.r1.u64);
+    fprintf(stderr, "[boot] calling guest entry 0x%zX (SP=0x%llX r13=0x%X)...\n",
+        image.entry_point, (unsigned long long)ctx.r1.u64, kpcr);
     entry(ctx, g_base);
     fprintf(stderr, "[boot] guest entry returned (r3=0x%llX).\n", (unsigned long long)ctx.r3.u64);
     return 0;

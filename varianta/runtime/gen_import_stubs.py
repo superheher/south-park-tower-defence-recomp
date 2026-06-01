@@ -22,11 +22,15 @@ with open(out, 'w') as f:
     f.write('// Trap-stubs for kernel/xam imports so the recompiled image links.\n')
     f.write('// Replace each with a real implementation; behaviour reference:\n')
     f.write('//   ../../third_party/rexglue-sdk/src/  (this exact title) + Xenia / UnleashedRecomp.\n')
-    f.write('#include "ppc_recomp_shared.h"\n#include <cstdio>\n\n')
+    f.write('#include "ppc_recomp_shared.h"\n#include <cstdio>\n#include <cstdlib>\n\n')
     for n in names:
         # Imports are declared C++-linkage in ppc_recomp_shared.h via PPC_EXTERN_FUNC, so define
         # with plain PPC_FUNC (NOT PPC_FUNC_IMPL, which is extern "C") to match the symbol linkage.
         # WEAK so a real implementation in kernel.cpp (strong symbol) overrides the trap-stub.
-        f.write(f'__attribute__((weak)) PPC_FUNC(__imp__{n}) {{ static bool w=false; if(!w){{w=true; fprintf(stderr,"[unimpl import] {n}\\n");}} __builtin_trap(); }}\n')
+        # Soft stub: log once and return 0 (NTSTATUS_SUCCESS / null) so the boot can keep going and
+        # reveal the WHOLE import cascade in one run. Set REX_STUBTRAP=1 to hard-trap instead (to
+        # pinpoint exactly which unimplemented import a crash is downstream of). Strong impls in
+        # kernel.cpp override these weak symbols.
+        f.write(f'__attribute__((weak)) PPC_FUNC(__imp__{n}) {{ static bool w=false; if(!w){{w=true; fprintf(stderr,"[stub] {n}\\n"); if(getenv("REX_STUBTRAP")) __builtin_trap();}} ctx.r3.u64=0; }}\n')
     f.write(f'\n// {len(names)} kernel/xam import stubs\n')
 print(f"wrote {out}: {len(names)} stubs")
