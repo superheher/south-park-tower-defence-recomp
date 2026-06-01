@@ -11,6 +11,7 @@
 #include <cstring>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <mutex>
 #include <atomic>
@@ -25,6 +26,19 @@
 // Lightweight import trace (set REX_KTRACE=0 to silence).
 static const bool g_ktrace = []{ const char* e = getenv("REX_KTRACE"); return !e || e[0] != '0'; }();
 #define KTRACE(...) do { if (g_ktrace) { fprintf(stderr, "[kernel] " __VA_ARGS__); } } while (0)
+
+// Called (via rex_indirect.h's PPC_CALL_INDIRECT_FUNC override) when a guest indirect-call target has no
+// recompiled function — i.e. a jump-table case-label the recompiler emitted as a call (XenonAnalyse missed
+// the table). Log each distinct target once and continue (skip the call) so one run maps every missing
+// table target for batch recovery.
+void PPCIndirectNull(uint32_t target, uint32_t lr)
+{
+    static std::mutex m;
+    static std::unordered_set<uint32_t> seen;
+    std::lock_guard<std::mutex> lk(m);
+    if (seen.insert(target).second)
+        fprintf(stderr, "[INDIRECT-NULL] target=0x%08X (caller lr=0x%08X)\n", target, lr);
+}
 
 // ---- guest virtual memory manager ------------------------------------------------------------------
 // Backs Nt{Allocate,Query,Free}VirtualMemory. The full 4 GiB is already mmap'd lazily by the host

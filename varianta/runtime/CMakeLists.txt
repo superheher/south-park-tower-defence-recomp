@@ -25,7 +25,8 @@ target_include_directories(sp_td_varianta PRIVATE
     "${XR}/thirdparty/simde")
 # -O0 for bring-up (the recompiled TUs are huge — keeps compile fast + RAM low); raise later.
 # -w silences guest-code warnings (unused, signedness, etc.).
-target_compile_options(sp_td_varianta PRIVATE -O0 -w -fno-strict-aliasing)
+target_compile_options(sp_td_varianta PRIVATE -O0 -w -fno-strict-aliasing
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/rex_indirect.h")   # log+skip null indirect-call targets
 
 # Link the prebuilt XenonUtils (XEX parse/decrypt/decompress; AES+LZX compiled in) + its deps.
 # These come from the XenonRecomp build tree; (re)build them with: cmake --build ${XR}/out/build.
