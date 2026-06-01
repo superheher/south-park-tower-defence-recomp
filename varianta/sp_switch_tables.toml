@@ -2908,3 +2908,20 @@ labels = [
     0x821DC35C, 0x821DC36C, 0x821DC374, 0x821DC37C, 0x821DC384, 0x821DC38C,
     0x821DC394, 0x821DC39C, 0x821DC3A4, 0x821DC3AC,
 ]
+
+# --- MANUAL (XenonAnalyse missed it): sub_8228A208 (ppc_recomp.36.cpp:5667..8749, guest 0x8228A208..
+# 0x8228B858, already one whole function — NO functions override needed). 16-bit OFFSET table: the bctr
+# @0x8228A3B4 jumps to jumpbase 0x8228A3B8 + offtab[r19], offtab(u16) @0x820CCF38 read via
+# `lhzx r0,0x820CCF38,r19*2`. Bound `cmplwi r19,28; bgt 0x8228B6AC` => 29 cases (r19 in [0,28]).
+# Labels resolved (0x8228A3B8 + offtab[i]) from guest .rdata via gdb (/tmp/readtab.gdb).
+[[switch]]
+base = 0x8228A3B4
+r = 19
+default = 0x8228B6AC
+labels = [
+    0x8228A3B8, 0x8228A508, 0x8228A5A4, 0x8228A62C, 0x8228A690, 0x8228A6B4,
+    0x8228A7F0, 0x8228A8BC, 0x8228A984, 0x8228AA2C, 0x8228AA6C, 0x8228AA88,
+    0x8228AA88, 0x8228AB50, 0x8228ABB8, 0x8228AC3C, 0x8228AD04, 0x8228AFC0,
+    0x8228B094, 0x8228B24C, 0x8228B2B4, 0x8228B408, 0x8228B490, 0x8228B538,
+    0x8228B558, 0x8228B644, 0x8228B6E8, 0x8228B6F0, 0x8228B850,
+]

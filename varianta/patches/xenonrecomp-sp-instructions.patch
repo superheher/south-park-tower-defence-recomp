@@ -195,7 +195,7 @@ index d08371e..191d7d1 100644
      f.write(out.data(), out.size());
  
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..555da24 100644
+index fa91527..7926eb4 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -1,3 +1,4 @@
@@ -221,7 +221,24 @@ index fa91527..555da24 100644
              println("\t}}");
  
              switchTable = config.switchTables.end();
-@@ -1133,6 +1142,7 @@ bool Recompiler::Recompile(
+@@ -712,7 +721,15 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_BLRL:
+-        println("__builtin_debugtrap();");
++        // Branch to Link Register and Link: call the function at the CURRENT lr, then set lr to the
++        // return address (next instruction). Capture lr before overwriting it.
++        println("\t{{");
++        println("\t\tuint32_t blrlTarget = static_cast<uint32_t>(ctx.lr);");
++        if (!config.skipLr)
++            println("\t\tctx.lr = 0x{:X};", base + 4);
++        println("\t\tPPC_CALL_INDIRECT_FUNC(blrlTarget);");
++        println("\t}}");
++        csrState = CSRState::Unknown; // the call could change it
+         break;
+ 
+     case PPC_INST_BLT:
+@@ -1133,6 +1150,7 @@ bool Recompiler::Recompile(
          println("\t{}.s64 = {};", r(insn.operands[0]), int32_t(insn.operands[1] << 16));
          break;
  
@@ -229,7 +246,7 @@ index fa91527..555da24 100644
      case PPC_INST_LVEWX:
      case PPC_INST_LVEWX128:
      case PPC_INST_LVX:
-@@ -1684,6 +1694,130 @@ bool Recompiler::Recompile(
+@@ -1684,6 +1702,130 @@ bool Recompiler::Recompile(
          println("{}.u32, {}.u32);", r(insn.operands[2]), r(insn.operands[0]));
          break;
  
@@ -360,7 +377,23 @@ index fa91527..555da24 100644
      case PPC_INST_SUBF:
          println("\t{}.s64 = {}.s64 - {}.s64;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]));
          if (strchr(insn.opcode->name, '.'))
-@@ -2087,6 +2221,7 @@ bool Recompiler::Recompile(
+@@ -1831,7 +1973,14 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VCMPBFP:
+     case PPC_INST_VCMPBFP128:
+-        println("\t__builtin_debugtrap();");
++        printSetFlushMode(true);
++        // Vector compare bounds: per lane, bit31 (0x80000000) set if a > b (above +bound),
++        // bit30 (0x40000000) set if a < -b (below -bound); 0 when a is within [-b, +b].
++        // a<-b expressed as (-b) > a so only cmpgt is needed (xor flips b's sign).
++        println("\tsimde_mm_store_ps({}.f32, simde_mm_or_ps(simde_mm_and_ps(simde_mm_cmpgt_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))), simde_mm_and_ps(simde_mm_cmpgt_ps(simde_mm_xor_ps(simde_mm_load_ps({}.f32), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))), simde_mm_load_ps({}.f32)), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x40000000))))));",
++            v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[2]), v(insn.operands[1]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_ps({}.f32), 0xF);", cr(6), v(insn.operands[0]));
+         break;
+ 
+     case PPC_INST_VCMPEQFP:
+@@ -2087,6 +2236,7 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_ps({}.f32, simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({}.f32))));", v(insn.operands[0]), v(insn.operands[1]));
          break;
  
@@ -368,7 +401,7 @@ index fa91527..555da24 100644
      case PPC_INST_VSEL:
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
          break;
-@@ -2263,6 +2398,205 @@ bool Recompiler::Recompile(
+@@ -2263,6 +2413,205 @@ bool Recompiler::Recompile(
          println("\t{}.u64 = {}.u64 ^ {};", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2] << 16);
          break;
  
@@ -574,7 +607,7 @@ index fa91527..555da24 100644
      default:
          return false;
      }
-@@ -2381,6 +2715,14 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2381,6 +2730,14 @@ bool Recompiler::Recompile(const Function& fn)
          name = fmt::format("sub_{}", fn.base);
      }
  
