@@ -72,7 +72,8 @@ static void InitCriticalSection(uint8_t* base, uint32_t cs)
 
 PPC_FUNC(__imp__RtlInitializeCriticalSection)
 {
-    KTRACE("RtlInitializeCriticalSection(cs=0x%X)\n", ctx.r3.u32);
+    KTRACE("RtlInitializeCriticalSection(cs=0x%X) caller-lr=0x%llX r2=0x%X r13=0x%X\n",
+        ctx.r3.u32, (unsigned long long)ctx.lr, ctx.r2.u32, ctx.r13.u32);
     InitCriticalSection(base, ctx.r3.u32);
 }
 

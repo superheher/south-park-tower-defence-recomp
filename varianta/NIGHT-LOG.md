@@ -134,3 +134,16 @@ Prod `.so` `1a3f6076` untouched; rexglue-sdk untouched; superproject pointer not
   sub-fn computes `cs=0x618` (≈ `r2/TOC+0x618` or a null-global deref) and reaches HalReturnToFirmware;
   check whether `r2`/TOC or a loader-provided global must be initialized before `_xstart`. Deep
   boot-path debugging. Committed; checkpoint.
+- **[06:50] Bail = CRT computing null-based addresses ⇒ needs systemic entry-environment setup.**
+  Traced cs=0x618: `RtlInitializeCriticalSection` caller-lr=0x8244B874 (inside `sub_8244B380`),
+  **r2=0x0**, r13=0x60000000. cs=r29, and r29 is reloaded from a caller-provided stack slot
+  ([r31+316] = caller frame); 0x618 ≈ null-base+0x618 threaded up the call chain. **ROOT: `_xstart`
+  expects a fuller loader-provided entry environment than set up.** Candidates: (a) **r2 / SDA base**
+  (currently 0), (b) the **XEX TLS-directory static init** — `KPCR.tls_ptr` points at a ZEROED block,
+  (c) entry-arg registers r3/r4, (d) XEX static initializers. This is the systemic multi-day piece
+  (UnleashedRecomp/Xenia implement it extensively). Hand-tracing recompiled CRT code is low-velocity;
+  **NEXT should set up the entry environment comprehensively** — parse the XEX PE TLS directory (at
+  base+IMAGE_BASE) + copy static TLS data + research the correct entry registers (r2/r3) from
+  rexglue/Xenia — rather than chase individual null derefs. ⚠ Reality check: a full boot is the
+  multi-week runtime tail; the loop is grinding it but velocity is now low per iteration. Committed
+  (lr/r2/r13 trace); checkpoint.
