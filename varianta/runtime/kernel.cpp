@@ -463,6 +463,21 @@ PPC_FUNC(__imp__XGetVideoMode)
     KTRACE("XGetVideoMode -> 1280x720\n");
 }
 
+// void VdQueryVideoMode(X_VIDEO_MODE* mode r3) — SAME fill as XGetVideoMode. The device build calls
+// THIS (not XGetVideoMode); a zeroed mode → div-by-zero on the display dimensions (sub_821D29A8).
+PPC_FUNC(__imp__VdQueryVideoMode)
+{
+    uint32_t m = ctx.r3.u32;
+    if (!m) return;
+    for (uint32_t i = 0; i < 0x30; i += 4) PPC_STORE_U32(m + i, 0);
+    PPC_STORE_U32(m + 0x00, 1280); PPC_STORE_U32(m + 0x04, 720);   // display_width/height
+    PPC_STORE_U32(m + 0x08, 0); PPC_STORE_U32(m + 0x0C, 1); PPC_STORE_U32(m + 0x10, 1); // interlaced/wide/hidef
+    { float hz = 60.0f; uint32_t b; memcpy(&b, &hz, 4); PPC_STORE_U32(m + 0x14, b); }    // refresh_rate
+    PPC_STORE_U32(m + 0x18, 1);            // video_standard = NTSC
+    PPC_STORE_U32(m + 0x1C, 0x4A); PPC_STORE_U32(m + 0x20, 0x01);
+    KTRACE("VdQueryVideoMode -> 1280x720\n");
+}
+
 // ---- physical memory (GPU buffers) -----------------------------------------------------------------
 namespace { uint32_t g_physNext = 0xA0000000; }  // Xbox physical-address window (all lazily mmap'd)
 
