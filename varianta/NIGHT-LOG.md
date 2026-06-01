@@ -333,3 +333,57 @@ jump-table problem** resurfaces at runtime — `sub_821DC228:17351` computed-jum
 that XenonAnalyse missed → recompiler emitted `PPC_CALL_INDIRECT_FUNC(0x821DC29C)` (a mid-function LABEL,
 not a function) → null dispatch → PC=0 SIGSEGV. Fix = recover the table into `sp_switch_tables.toml` +
 regenerate ppc/ (likely several such tables). (2) the GPU engine (device reads 0 GPU registers; CP/PM4/Plume).
+
+---
+
+## 2026-06-01 (cont.) — jump-table robustness + cooperative wait: boot 127 → ~10,500 trace-lines
+
+Two committed fixes (`23bf29b`, `1d435a1`; NOT pushed) took the boot from a hard crash at the first
+runtime jump table to ~10,500 trace-lines deep, across video init and UI asset load.
+
+### Fix 1 — ALL jump-table switches hardened (the dominant blocker)
+The function-boundary jump table (`sub_821DC228`, the float-store dispatcher) didn't just need recovery —
+its recovered switch emitted `default: __builtin_unreachable()`. At `-O0`, that lets clang DROP the switch
+bounds-check and compile a raw `jmp *table[idx]`. The caller's data-driven loop ran the index to 22 (the
+table has 22 entries 0..21), so `jmp *table[22]` read one slot past the host jump table and jumped to
+**host address 0** — a fatal crash with a wiped register/frame context (rip=0, rsi=0, zeroed stack).
+On real hardware index 22 is *also* out of range, so the title never emits it there; ours diverged.
+
+Fix (toolchain + runtime, hardens all 93 tables at once):
+- `recompiler.cpp` (in `patches/xenonrecomp-sp-instructions.patch`, now 663 lines): the switch `default`
+  now does the **real computed jump** `PPC_CALL_INDIRECT_FUNC(ctr)` — exactly what the original `bctr`
+  does (`ctr` already holds the HW target from the preceding `mtctr`). `__builtin_unreachable` is gone
+  from every generated switch. Regenerated `ppc/` (88 TUs).
+- `rex_indirect.h` + `kernel.cpp`: every indirect branch now routes through a bounds-checked
+  **`PPCInvokeGuest`** — it only indexes the function table for targets in `[PPC_CODE_BASE, IMAGE_END)`,
+  else logs+skips (`INDIRECT-NULL`). Without the bound, a wild target's table slot lands GiB past the
+  4 GiB guest map and faults the *lookup read itself*. The macro is now a 1-liner → helper, so future
+  dispatch-policy tweaks recompile only `kernel.cpp`, not all ~90 TUs.
+
+### Fix 2 — real `NtWaitForMultipleObjectsEx`
+Was a soft stub returning success instantly → tid=6 (`sub_821E61A8`) busy-spun (WaitAny on two events,
+infinite timeout). Implemented as the handle-based sibling of `KeWaitForMultipleObjects` (ResolveObject
+each handle → same cooperative wait core). Crossed the spin → the main thread progressed to loading
+`game:\UI\UI.xzp` (`NtReadFile` now returns 23.5 MB of real data) and reached `XamLoaderLaunchTitle`.
+
+### NEW FRONTIER — a CRT static-init divergence (precise; resume here)
+Main thread: `_xstart → sub_82249638 → sub_82249678 → sub_8214FFD0 → sub_8229C4B0`.
+`sub_8229C4B0` is the constructor of the global object at `0x828E3A38`. At `ppc_recomp.37.cpp:8362-8388`
+it calls `sub_82201800(r4 = &field@0x828E825C)` to build a sub-object, reads it back, and — if null —
+defensively `goto loc_8229C59C`, which reads `*(r1+80)`. On the null-skip path that stack slot is
+**uninitialized = 0xFFFFFFFF**, so `lwz r11,0(r3)` reads `base + 0xFFFFFFFF` (crossing the 4 GiB end) →
+SIGSEGV.
+
+Why the field is null: inside `sub_82201800` (`ppc_recomp.22.cpp:14784+`) the allocation
+`sub_82448090(96)` **succeeds** (→`0xd89d0`), but the init `sub_822009F0(r3=obj, r4=0x828c3830)`
+**returns `0x8030001C`** (sev=error, facility 0x30, code 0x1c). Line 14820 `bge` then takes the error
+path, so the store `*(r29=0x828E825C) = r31(obj)` at `:14841` is **skipped** → field stays null.
+
+⇒ Root-cause `sub_822009F0` (`ppc_recomp.22.cpp:~12560+`, a long chain of `PPC_CALL_INDIRECT_FUNC`
+virtual calls): which virtual call / resource lookup yields `0x8030001C`. Likely shares a root with the
+**count divergence** (`sub_821E07A0`'s loop bound = `*(u16)(sub_821E0150_ret + 31)`; runs ~10k → 10,347
+`INDIRECT-NULL` skips). Leading hypotheses for the shared root: the ~48-instruction recomp gap (esp. VMX
+lanes) silently mis-emitting a computation; a missing import returning wrong data; or an asset-parse
+mismatch. Method: `gdb -batch`, `break ppc_recomp.N.cpp:LINE`, read `ctx.rN.u32` / `base` (the `-O0`
+host frames + file:line map cleanly). Then: more init → the GPU engine (PM4 / register MMIO / Plume +
+19 shaders) — still multi-week.
