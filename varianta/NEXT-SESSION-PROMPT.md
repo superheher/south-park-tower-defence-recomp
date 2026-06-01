@@ -30,24 +30,31 @@ GPU-completion ожиданий → VdSwap → DRAW → Plume Vulkan.
 ФРОНТИР 1 — JUMP-TABLE в sub_8228A208 (bctr → 0x8228A3B8)
 ================================================================================================
 0x8228A3B8 — НЕ начало функции (нет в ppc_func_mapping.cpp) ⇒ это mid-function label, цель вычисляемого
-`bctr` внутри sub_8228A208 (ppc_recomp.36.cpp:5667..8749 — большая ~3K-строчная функция; внутри есть
-`mtctr;bctr` + ещё `PPC_CALL_INDIRECT_FUNC`). ⚠ caller lr=0x8228A210 СТАРЫЙ (bctr не ставит LR — это адрес
-после savegprlr-bl в прологе), НЕ адрес bctr. Реальный bctr ищи в теле функции.
+`bctr` внутри sub_8228A208 (ppc_recomp.36.cpp:5667..8749 — большая ~3K-строчная функция; внутри ОДИН `bctr`,
+в цикле). ⚠ caller lr=0x8228A210 СТАРЫЙ (bctr не ставит LR — это адрес после savegprlr-bl в прологе).
+
+✅ ТАБЛИЦА УЖЕ ДЕКОДИРОВАНА (этап «discovery» сделан — ppc_recomp.36.cpp:5872-5891, loc_8228A390):
+это 16-БИТНАЯ OFFSET-таблица (НЕ массив 32-битных адресов):
+  bctr @ **0x8228A3B4**, индекс-регистр **r19**.
+  `lis r12,-32243; addi r12,r12,-12488` → база offset-таблицы **0x820CCF38** (.rdata), записи u16.
+  `lhzx r0, 0x820CCF38, r19*2` → 16-битный offset.
+  `lis r12,-32215; addi r12,r12,-23624` → jump-base **0x8228A3B8**; цель = **0x8228A3B8 + offtab[r19]**.
+  (offset 0 → 0x8228A3B8 = первый case, который XenonAnalyse и пропустил.)
+ОСТАЛОСЬ: (a) прочитать offset-таблицу 0x820CCF38 из памяти и границу N (на r19) — gdb `x/<2N>hx
+$g_base+0x820CCF38` (BE u16), либо найди `cmplwi r19,N; bgt default` выше loc_8228A390; (b) labels[i] =
+0x8228A3B8 + offtab[i]; (c) истинный размер sub_8228A208 для sp_xenon.toml.
 
 WORKFLOW восстановления (проверен в Update 3, README XenonRecomp «functions containing jump tables»):
-1. Найди адрес bctr и регистр-индекс + базу таблицы. В рекомпиле: ищи `// bctr` в sub_8228A208; рядом
-   `mtctr rN` (rN = table[idx]); поднимись к `lwzx`/`lis;addi` что грузит из таблицы — это база таблицы
-   (адрес в .rdata, обычно 0x822xxxxx). gdb: break на хост-строке перед bctr, прочитай ctx.rN.u32 (индекс)
-   и базу.
-2. Прочитай таблицу из гостевой памяти: gdb `x/<N>xw $g_base+<tablebase>` (BE u32 цели; считай записи, пока
-   адрес валиден внутри функции). g_base бери свежим (python rd() с per-call bswap — в /tmp есть скрипты).
-3. Найди истинный КОНЕЦ функции (blr последнего case) если XenonAnalyse её урезал.
-4. Добавь в **sp_xenon.toml** `functions = [{ address = 0x8228A208, size = <байт> }]` (override границ) и в
-   **sp_switch_tables.toml** `[[switch]]` (base = адрес bctr, r = индекс-регистр, labels = [цели...]).
-5. ЧИСТЫЙ регген: `rm ppc/*.cpp` (⚠ «identical file»-оптимизация оставляет устаревшие TU!), затем
-   `third_party/XenonRecomp/.../XenonRecomp sp_xenon.toml ppc/ppc_context.h` (точную команду см. в
-   patches/ и в истории gita; тулчейн — свежий клон third_party/XenonRecomp, на диске, не сабмодуль).
-6. Пересборка: `ninja -C runtime/out sp_td_varianta`.
+1. Прочитай offset-таблицу + N (см. выше). labels[i] = 0x8228A3B8 + offtab[i].
+2. Найди истинный КОНЕЦ функции (blr последнего case) если XenonAnalyse её урезал.
+3. Добавь в **sp_xenon.toml** `functions = [{ address = 0x8228A208, size = <байт> }]` (override границ) и в
+   **sp_switch_tables.toml** `[[switch]]` (base = 0x8228A3B4, r = 19, default = <вне-диапазона case>,
+   labels = [0x8228A3B8+offtab[i] ...]). Формат labels = явные адреса (см. существующие 94 записи в toml).
+4. ЧИСТЫЙ регген: `rm ppc/*.cpp` (⚠ «identical file»-оптимизация оставляет устаревшие TU!), затем XenonRecomp
+   (тулчейн — свежий клон third_party/XenonRecomp на диске, не сабмодуль; точную команду см. patches/ и git-историю).
+5. Пересборка: `ninja -C runtime/out sp_td_varianta`.
+⚠ Если 16-бит-offset формат не поддержан XenonRecomp напрямую — задай labels ЯВНО (resolved-адреса), как в
+существующих entries; XenonRecomp эмитит switch по labels, не пересчитывая offset-таблицу.
 
 ================================================================================================
 ФРОНТИР 2 — null-вызов target=0x0 (caller lr=0x8224FDEC, ppc_recomp.30.cpp)
