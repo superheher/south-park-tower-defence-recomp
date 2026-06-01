@@ -507,3 +507,38 @@ guest VALUES and branch decisions, matched by call order, not host pointers.)
 This is the same object-data-corruption family as the XUI `+8` crash; pinning either root likely explains
 both. Still upstream of the GPU engine (multi-week) — but the reference oracle makes the init root
 attackable directly now.
+
+## 2026-06-01 (cont.) — BREAKTHROUGH: one VFS fix unblocks all init; boot reaches the RENDER LOOP
+
+The reference oracle paid off. Traced the count divergence to its true root: the title sizes its asset
+reads with **NtQueryInformationFile / FILE_NETWORK_OPEN_INFORMATION (class 34)**, whose `EndOfFile` is at
+**+40** (offsets 0..31 are timestamps, AllocationSize @+32). My impl wrote `EndOfFile` at **+8**
+(FILE_STANDARD layout) for every non-position class, so class-34 size queries returned 0 → 0-byte reads
+→ `SouthParkXact.xgs` ("FSGX") and `*.ptc` never loaded → the main object's `+144` pointed at garbage →
+BOTH the spurious 32768-iter `sub_821E07A0` count loop AND the `sub_82244378` XUI-validation SIGSEGV.
+
+Fix (commit 760b0bd, kernel.cpp): switch on `infoClass` — 14 (FilePositionInformation, CurrentByteOffset
+@0), 34 (FileNetworkOpenInformation: times @0..31, AllocationSize @32, EndOfFile @40, FileAttributes @48),
+5/default (FileStandardInformation: Alloc @0, EndOfFile @8, NumberOfLinks @16); report bytes-written in
+the IoStatusBlock.
+
+Result — one fix, the whole init chain unblocked:
+- XGS reads 931 B, .ptc 93863 B (were 0); **INDIRECT-NULL 10347 → 0** (count loop gone);
+  **the SIGSEGV at sub_82244378 is GONE** (exit 139 → 124/running).
+- Boot now crosses video init: `VdInitializeRingBuffer(base=0xA0002000 size=0x1000)`,
+  `VdEnableRingBufferRPtrWriteBack(ptr=0x201003C)`, **vblank pump started**,
+  `VdSetGraphicsInterruptCallback(cb=0x821C7170)`, `XGetVideoMode 1280x720`, 6 threads, XexLoadImage.
+- It then runs the title's **main/render loop** `sub_821CC5D0` (a per-frame critical-section acquire +
+  `KeWaitForSingleObject`, ~34/s). NOT crashed, NOT deadlocked — but NOT yet presenting (`VdSwap` not
+  reached): it's waiting at the GPU command-processor boundary.
+
+FRONTIER (task #6, the GPU engine — the last step before frames):
+- The title writes PM4 to the ring buffer @0xA0002000 and waits on RPtr writeback @0x201003C. The vblank
+  pump fires the graphics-interrupt callback every 16 ms, but the render-wait still spins → next: a "null
+  GPU" that advances RPtr to the title's WPtr (capture WPtr via the system command buffer / CP_RB_WPTR)
+  so the render-wait releases and the title proceeds to issue/await draws; THEN PM4 → Plume Vulkan + the
+  19 shaders for actual pixels. This last stage remains multi-week, but init is no longer the blocker.
+
+Lesson worth keeping: a single wrong struct-field offset in one kernel HLE call masqueraded as a deep
+"object-graph corruption" across two unrelated subsystems. The guest-level reference oracle (diffing
+against the rendering build) is what cut through it — keep it as the first tool for any divergence.
