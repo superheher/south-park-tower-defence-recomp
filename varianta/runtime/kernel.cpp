@@ -175,11 +175,27 @@ PPC_FUNC(__imp__NtFreeVirtualMemory)
     uint32_t pBase = ctx.r3.u32, pSize = ctx.r4.u32, freeType = ctx.r5.u32;
     if (!pBase) { ctx.r3.u64 = kStatusMemoryNotAllocated; return; }
     uint32_t gbase = PPC_LOAD_U32(pBase);
+    uint32_t reqSize = pSize ? PPC_LOAD_U32(pSize) : 0;
     auto [rb, r] = FindRegion(gbase);
     if (!r) { ctx.r3.u64 = kStatusMemoryNotAllocated; return; }
-    if (freeType & kMemRelease)        { r->reserved = false; r->committed = false; }
-    else if (freeType & kMemDecommit)  { r->committed = false; }
-    // Underlying host pages persist (lazy mmap); only bookkeeping changes.
+    // ⚠ Xbox/NT MEM_DECOMMIT/RELEASE LOSE the pages' contents (a later MEM_COMMIT of the same VA returns
+    // ZEROED pages). variant A keeps host pages mapped (lazy), so without this the title's heap re-commits
+    // a decommitted range and reads STALE bytes as a block header — e.g. RtlAllocateHeap's backward-coalesce
+    // (sub_8244A108: prev = block - PreviousSize*16) read a garbage PreviousSize from un-zeroed .ptc data and
+    // underflowed below the heap base (returned 0x82B0), corrupting free-list[0] and overwriting the live GPU
+    // device. Zero the freed range here to match real decommit semantics (the next commit then sees zeros).
+    uint32_t zbase = gbase, zsize = reqSize;
+    if (freeType & kMemRelease) {
+        r->reserved = false; r->committed = false;
+        if (zsize == 0) { zbase = rb; zsize = r->size; }   // release whole reservation
+    } else if (freeType & kMemDecommit) {
+        r->committed = false;
+        if (zsize == 0) zsize = rb + r->size - gbase;      // decommit to end of region
+    }
+    if ((freeType & (kMemRelease | kMemDecommit)) && zsize) {
+        if (zbase >= rb && zbase + zsize <= rb + r->size)  // stay within the tracked reservation
+            std::memset(base + zbase, 0, zsize);
+    }
     PPC_STORE_U32(pBase, rb);
     if (pSize) PPC_STORE_U32(pSize, r->size);
     KTRACE("NtFreeVirtualMemory(0x%X type=0x%X)\n", gbase, freeType);

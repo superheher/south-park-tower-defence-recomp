@@ -883,3 +883,35 @@ HLE/emitter divergence → the 0x78000 alloc lands in valid heap space → devic
 GPU-completion waits → VdSwap → DRAW. Tools added this session: /tmp/trace.gdb (path through sub_822A8150),
 /tmp/narrow2.gdb (catch the below-heap block + header + bt), /tmp/heaplog.gdb (alloc size/flags/result map),
 /tmp/heapdump.gdb (heap struct dump). kernel.cpp:78 has an inline NOTE summarizing this.
+
+### DEEPER (same session) — the phantom block is created by the heap EXTEND committing AT THE SEGMENT BASE
+Drove it one layer further (gdb /tmp/{watch82a0,narrow3}.gdb). The free-list[0] walk had NO fit for the
+0x78000 request, so it took the EXTEND path: sub_8244B950:7671 (loc_8244BC64) -> sub_8244ADD8 ->
+sub_82449E78 (commit pages) -> sub_8244A108 (create/coalesce the new block). Caught at sub_8244A108:1882:
+the new block r4 = 0x10000 -- the HEAP BASE / segment itself. sub_8244A108 wrote a fresh _HEAP_ENTRY at
+0x10000 (overwriting the heap's own header: was Size=0x64/PrevSize=0 per heapdump, became 0x800007D6 =
+Size=0x8000, PreviousSize=0x7D6), then its backward-coalesce did r31 = r4 - PreviousSize*16 = 0x10000 -
+0x7D60 = 0x82A0 (the phantom block, below the base). Chain: extend commits the new block AT THE SEGMENT
+BASE -> overwrites the heap header -> coalesce reads the just-written garbage PrevSize=0x7D6 -> underflows
+to 0x82A0 -> free-list[0] gets the below-base phantom -> 0x78000 alloc reuses it -> device overwrite.
+
+WHY commit at the base: sub_82449E78 walks the segment's UnCommittedRanges list (head = *(segment+56)) and
+commits at the found range's address (*(range+4)); for the heap's first segment (0x10000) that address is
+0x10000 (the base) -- the segment thinks it is UNCOMMITTED FROM THE BASE, ignoring the initial header commit
+(early log: NtAllocate req=0x10000 sz=0x10000 COMMIT committed 0x10000..0x20000) and the early in-place
+allocs (device 0x26F40 etc. landed correctly, so the FREE-LIST was fine -- only the segment's
+UnCommittedRanges / commit-boundary is wrong). Boot log confirms the extend commit: NtAllocate req=0x10000
+sz=0x80000 COMMIT -> 0x10000 (commits over the live header/device region).
+
+=> DEEPEST ROOT (open): the heap segment's UnCommittedRanges (*(segment+56)) wrongly says uncommitted starts
+at the segment base. Set at heap creation (RtlCreateHeap = sub_8244B380, ppc_recomp.65.cpp:4569) and
+maintained by RtlpFindAndCommitPages. Likely a variant-A divergence in how the commit-tracking is
+seeded/updated vs prod (XenonRecomp emitter bug in the segment/UCR bookkeeping, OR variant A's
+NtAllocateVirtualMemory COMMIT return/semantics so the initial-commit does not shrink the UCR). NEXT: read
+sub_8244B380's segment/UnCommittedRanges setup + capture *(segment+56) and *(range+4) at the extend; compare
+with prod (same __imp__sub_XXX symbols).
+
+ATTEMPTED FIX (kept, but NOT the cure): added zero-on-decommit/release to NtFreeVirtualMemory (real NT/Xbox
+MEM_DECOMMIT loses page contents). Correct semantics + verified not to break early boot, but does NOT fix
+this bug -- the garbage PrevSize comes from the extend overwriting the LIVE heap header at the base, not from
+stale decommitted data. Left in as a correctness improvement.
