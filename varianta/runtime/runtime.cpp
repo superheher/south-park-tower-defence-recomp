@@ -92,7 +92,9 @@ int main(int argc, char** argv)
 
     fprintf(stderr, "[boot] calling guest entry 0x%zX (SP=0x%llX r13=0x%X)...\n",
         image.entry_point, (unsigned long long)ctx.r1.u64, kpcr);
+    kernel::LockGuestExecution();   // main thread holds the cooperative execution token while running
     entry(ctx, g_base);
+    kernel::UnlockGuestExecution();
     fprintf(stderr, "[boot] guest entry returned (r3=0x%llX).\n", (unsigned long long)ctx.r3.u64);
     return 0;
 }

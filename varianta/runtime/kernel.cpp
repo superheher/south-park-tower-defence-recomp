@@ -204,7 +204,15 @@ std::recursive_mutex* CsLock(uint32_t cs) {
 }
 } // namespace
 
-PPC_FUNC(__imp__RtlEnterCriticalSection) { CsLock(ctx.r3.u32)->lock(); }
+PPC_FUNC(__imp__RtlEnterCriticalSection)
+{
+    auto* m = CsLock(ctx.r3.u32);
+    if (!m->try_lock()) {                 // held by a thread that yielded while owning it: release the
+        kernel::UnlockGuestExecution();   // execution token while we block, then re-acquire it.
+        m->lock();
+        kernel::LockGuestExecution();
+    }
+}
 PPC_FUNC(__imp__RtlLeaveCriticalSection) { CsLock(ctx.r3.u32)->unlock(); }
 
 // BOOLEAN RtlTryEnterCriticalSection(cs)
@@ -589,24 +597,32 @@ const bool g_noSpawn = getenv("REX_NOSPAWN") != nullptr;  // diagnostic: create 
 // Xbox dispatch objects carry an X_DISPATCH_HEADER (type@0x00 u8, signal_state@0x04 s32). We back
 // waits with one global condition variable; the signal_state lives in guest memory. Coarse but
 // correct. Reference: rexglue-sdk xboxkrnl_threading.cpp.
+// g_waitMutex IS the cooperative guest-execution token: the running guest thread holds it; waits
+// release it (cv.wait) so another thread can run. So SignalObject (called by the running thread)
+// must NOT re-lock it, and WaitObject adopts the already-held lock.
 std::mutex g_waitMutex;
 std::condition_variable g_waitCv;
 
 void SignalObject(uint32_t obj, int32_t state) {
-    { std::lock_guard<std::mutex> lk(g_waitMutex); GST32(obj + 0x04, static_cast<uint32_t>(state)); }
+    GST32(obj + 0x04, static_cast<uint32_t>(state));   // caller already holds the token
     g_waitCv.notify_all();
 }
 
 // timeout: <0 = infinite, 0 = poll, >0 = milliseconds. Returns 0 (success) or 0x102 (STATUS_TIMEOUT).
+// Releases the execution token while blocked (lets other guest threads run), re-holds it on resume.
 uint32_t WaitObject(uint32_t obj, int64_t timeoutMs) {
-    std::unique_lock<std::mutex> lk(g_waitMutex);
+    std::unique_lock<std::mutex> lk(g_waitMutex, std::adopt_lock);   // token already held by caller
     auto signaled = [&]{ return static_cast<int32_t>(GLD32(obj + 0x04)) > 0; };
+    bool ok = true;
     if (timeoutMs < 0) g_waitCv.wait(lk, signaled);
-    else if (!g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), signaled)) return 0x00000102u;
-    uint8_t type = g_base[obj + 0x00];           // consume for auto-reset event / semaphore / mutant
-    if (type == 1 || type == 2 || type == 5)
-        GST32(obj + 0x04, static_cast<uint32_t>(static_cast<int32_t>(GLD32(obj + 0x04)) - 1));
-    return 0;
+    else ok = g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), signaled);
+    if (ok) {                                     // consume for auto-reset event / semaphore / mutant
+        uint8_t type = g_base[obj + 0x00];
+        if (type == 1 || type == 2 || type == 5)
+            GST32(obj + 0x04, static_cast<uint32_t>(static_cast<int32_t>(GLD32(obj + 0x04)) - 1));
+    }
+    lk.release();                                 // keep the token held as we resume running
+    return ok ? 0 : 0x00000102u;
 }
 
 int64_t TimeoutMs(uint32_t timeoutPtr) {
@@ -618,6 +634,7 @@ int64_t TimeoutMs(uint32_t timeoutPtr) {
 }
 
 void GuestThreadRun(ThreadRec* rec) {
+    g_waitMutex.lock();                      // acquire the execution token (blocks until the creator yields)
     PPCContext ctx{};
     ctx.r1.u64 = rec->stackTop - 0x200;
     ctx.r13.u64 = rec->kpcr;
@@ -630,8 +647,15 @@ void GuestThreadRun(ThreadRec* rec) {
         CallGuest(rec->startAddr, ctx);
     }
     SignalObject(rec->threadAddr, 1);        // wake anyone waiting on this thread object (header type 6)
+    g_waitMutex.unlock();
 }
 } // namespace
+
+namespace kernel {
+// The cooperative execution token (see kernel.h). g_waitMutex is held by the running guest thread.
+void LockGuestExecution()   { g_waitMutex.lock(); }
+void UnlockGuestExecution() { g_waitMutex.unlock(); }
+} // namespace kernel
 
 // NTSTATUS ExCreateThread(*handle r3, stack r4, *tid r5, xapi r6, start r7, ctx r8, flags r9)
 PPC_FUNC(__imp__ExCreateThread)
@@ -720,8 +744,10 @@ void VblankPump() {
         g_vblankCount.fetch_add(1);
         uint32_t cb = g_interruptCallback;
         if (!cb) continue;
-        // Fire the guest graphics interrupt callback (source = 0 vblank) on the pump's own context.
-        // Per rexglue, the TLS ptr must read 0 during interrupts (some titles check it).
+        // Fire the guest graphics interrupt callback (source = 0 vblank) on the pump's own context,
+        // holding the cooperative execution token (it runs guest code). Per rexglue, the TLS ptr must
+        // read 0 during interrupts (some titles check it).
+        g_waitMutex.lock();
         PPCContext ctx{};
         ctx.r1.u64 = g_pumpStack - 0x200;
         ctx.r13.u64 = g_pumpKpcr;
@@ -731,6 +757,7 @@ void VblankPump() {
         GST32(g_pumpKpcr + 0x00, 0);
         CallGuest(cb, ctx);
         GST32(g_pumpKpcr + 0x00, savedTls);
+        g_waitMutex.unlock();
     }
 }
 
@@ -857,7 +884,7 @@ PPC_FUNC(__imp__KeWaitForMultipleObjects)
 {
     uint32_t count = ctx.r3.u32, objects = ctx.r4.u32, waitType = ctx.r5.u32; // 0=WaitAll, 1=WaitAny
     int64_t timeoutMs = TimeoutMs(ctx.r9.u32);
-    std::unique_lock<std::mutex> lk(g_waitMutex);
+    std::unique_lock<std::mutex> lk(g_waitMutex, std::adopt_lock);   // token already held by caller
     auto firstReady = [&]() -> int {
         if (waitType == 1) {                       // WaitAny -> index of first signaled, else -1
             for (uint32_t i = 0; i < count; i++) {
@@ -873,13 +900,16 @@ PPC_FUNC(__imp__KeWaitForMultipleObjects)
         return 0;
     };
     auto pred = [&]{ return firstReady() >= 0; };
+    bool ok = true;
     if (timeoutMs < 0) g_waitCv.wait(lk, pred);
-    else if (!g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), pred)) { ctx.r3.u64 = 0x102; return; }
+    else ok = g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), pred);
+    if (!ok) { lk.release(); ctx.r3.u64 = 0x102; return; }   // keep the token; report STATUS_TIMEOUT
     int idx = firstReady();
     // Consume auto-reset/semaphore/mutant objects we're satisfied on.
     auto consume = [&](uint32_t o){ uint8_t t = g_base[o + 0x00];
         if (t == 1 || t == 2 || t == 5) GST32(o + 0x04, static_cast<int32_t>(GLD32(o + 0x04)) - 1); };
     if (waitType == 1) consume(GLD32(objects + idx * 4));
     else for (uint32_t i = 0; i < count; i++) consume(GLD32(objects + i * 4));
+    lk.release();                                            // keep the token held as we resume
     ctx.r3.u64 = (waitType == 1) ? static_cast<uint32_t>(idx) : 0;   // WAIT_OBJECT_0 + idx
 }

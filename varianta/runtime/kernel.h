@@ -18,4 +18,10 @@ extern uint32_t g_processAddr;     // X_KPROCESS (title process)
 uint32_t SetupEnvironment(const uint8_t* xexFile, uint32_t stackBase, uint32_t stackLimit,
                           uint32_t startAddress);
 
+// Cooperative "guest-execution token": only one guest thread runs at a time, releasing it across
+// blocking waits (matches RexGlue's fiber scheduling; preemptive host threads corrupt the title's
+// unprotected shared state). The main thread acquires it before calling the entry point.
+void LockGuestExecution();
+void UnlockGuestExecution();
+
 } // namespace kernel
