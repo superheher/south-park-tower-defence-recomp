@@ -6,7 +6,28 @@ the ordered, concrete plan, built from this session's traces. Status as of commi
 `experimental/hle-graphics-spike` (NOT pushed). Behaviour ref 1:1 = `third_party/rexglue-sdk/src/` +
 UnleashedRecomp `gpu/video.cpp`.
 
-## Where the boot stops (the precise wall)
+## ⬆️ STATUS UPDATE 2026-06-01/02 (the old "wall" below is SOLVED — boot now reaches the intro MOVIE)
+The "device is null / worker spins" wall described below is **cleared**. The boot now lifts the CRT-init
+join, runs the game main loop, and **reaches & plays the intro movie** (loads 8.4MB sp_xbox_0_intro.wmv,
+4 VC-1 decoder threads, render loop presents framebuffers via VdSwap). Commits c0a39ae..c4579fc.
+- **Step 1 (scheduler):** the coop token + sub_821B9270 token-yield is sufficient for now (fibers NOT
+  needed yet; ordering works — the device is built (0x26F80) before the GPU waits run).
+- **Step 2 (CP / null-GPU):** DONE as a **fence-forward STOPGAP** — the GPU completion fences
+  (*(device+10896) counter + *(fenceptr+4) segptr) are advanced to the requested target in the hit
+  waiters (sub_821C6E58, sub_821C5DF0), since the title defers kicking deferred segments and our CP runs
+  only kicked ring content. VdSwap advances the swap counter. The clean replacement = a continuous CP that
+  executes the WAIT_REG_MEM-chained deferred IBs (still TODO, but only matters once Step 4 lands).
+- **Step 3 (PM4 parse):** DONE — ExecutePM4 parses the full TYPE0/1/3 stream (IB/EVENT_WRITE_SHD/INTERRUPT/
+  WAIT_REG_MEM/DRAW). **Translate = still a no-op** (DRAW_INDX counts only).
+- **THE REMAINING WALL = Step 4 (the renderer proper).** The intro movie is **renderer-gated**: a 180 s run
+  = 1.1M trace lines but never advances past the movie because the video frames are never actually drawn/
+  displayed. Everything further (intro→menu→gameplay→visible frames) needs Step 4. This is multi-week and a
+  **strategic decision**: variant A's renderer ≈ prod's GPU subsystem (Xenia-based CP→Vulkan that the prod
+  oracle already uses), so the options are (a) port a minimal renderer, (b) integrate rexglue's Vulkan
+  backend/Plume into variant A's runtime, or weigh variant A vs just using prod. **Autonomous loop stopped
+  here — this is a human scope/approach call (see Step 4 below).**
+
+## [HISTORICAL] Where the boot USED to stop (SOLVED — kept for context)
 A guest **worker thread** runs `sub_821C6E58(device=r3) → sub_821B9270(&local)` — the **GPU ring-buffer
 wait**. `sub_821B9270` reads `r29 = [arg+0] = device`, then polls `[[device+10896]]` (the **RPtr
 write-back**, = `g_rptrWriteBack` from `VdEnableRingBufferRPtrWriteBack`) against a target, looping until
@@ -14,7 +35,7 @@ the GPU "catches up". At the wall the **device is null** (`r29=0`): the worker s
 D3D device was built (a thread-ordering artifact of my preemptive/coop scheduler), so it spins forever,
 holding the cooperative token and starving the main thread that would build the device. **Two root causes,
 both must be fixed:** (A) the scheduler lets a busy-wait starve everything; (B) there is no GPU command
-processor to advance RPtr.
+processor to advance RPtr. [Both since handled — see status update above.]
 
 ## Step 1 — Deterministic cooperative scheduler (fibers)  [prerequisite]
 Replace the `std::thread` + single-mutex token (commit e56368f; `kernel.cpp` `g_waitMutex`/`GuestThreadRun`)
