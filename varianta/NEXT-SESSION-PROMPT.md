@@ -31,13 +31,17 @@ Play!» (Xbox 360 XBLA → Linux/Vulkan). Рабочая директория:
        `NtCreateFile` в kernel.cpp: какой STATUS возвращает MISS; тайтл его, видимо, считает retry-able
        (крутит вместо skip). Цель — выйти из intro в меню/геймплей.
 2. **PRESENT/RENDER путь (главный технический фронтир).** Замерено: после init **главный RING МЁРТВ** —
-   `WPTR=37`, `ExecuteRing` срабатывает 1 раз, `XE_SWAP`=0 за весь ран. Весь post-init рендер/present идёт
-   через `VdGetSystemCommandBuffer` (сейчас возвращает ПЛЕЙСХОЛДЕР 0xBEEF0000/1 — kernel.cpp) + дефер-
-   сегменты, которые наш CP НЕ потребляет; `VdSwap` = stub (0 вызовов). Поэтому игра крутит логику
-   (main активен в sub_821D5CA8, грузит ассеты, intro-стейт-машина), но НЕ выдаёт отображаемой GPU-работы.
-   Реализовать **system command buffer** (вернуть реальный гостевой буфер + исполнять его PM4 при сабмите/
-   kick) — это и есть путь к present И чистая замена fence-forward-стопгапа (см. п.3). Ref: rexglue
-   VdGetSystemCommandBuffer / command_processor.cpp + prod-оракул.
+   `WPTR=37`, `ExecuteRing` срабатывает 1 раз, `XE_SWAP`=0 за весь ран. `VdSwap` = stub (0 вызовов). Т.е.
+   тайтл крутит цикл (main активен в sub_821D5CA8, грузит ассеты, intro-стейт-машина) но НИ киккает ring,
+   НИ зовёт VdSwap → нет отображаемой GPU-работы. ⚠ВАЖНО: `VdGetSystemCommandBuffer` возвращает плейсхолдер
+   0xBEEF0000/1 — но это НЕ баг: **prod (рендерит!) возвращает ТЕ ЖЕ 0xBEEF0000/1** (rexglue
+   xboxkrnl_video.cpp:340). Значит system command buffer — НЕ дифференциатор. Реальный вопрос: почему
+   тайтл (даже с форварднутыми fence) больше НЕ киккает ring и не зовёт VdSwap, а prod — зовёт? Скорее
+   всего тайтл решает киккать/презентить по СОСТОЯНИЮ GPU (fence/RPTR/swap-counter прогресс через реальное
+   исполнение дефер-сегментов + vblank), которое наш форвард не воспроизводит целиком. СЛЕДУЮЩИЙ ШАГ =
+   СРАВНЕНИЕ С PROD-ОРАКУЛОМ: запусти out/build/linux-amd64-release/south_park_td под gdb, bkpt на
+   sub_821C6600 (kick), VdSwap, sub_821D5CA8; посмотри, как prod-тайтл презентит на intro (киккает ли ring
+   дальше? зовёт ли XE_SWAP/VdSwap? какие fence/swap-counter он видит?) — и воспроизведи это состояние.
 3. **(ДОЛГО) Чистый CP вместо стопгапа.** Заменить fence-forward на непрерывный CP, который идёт по
    WAIT_REG_MEM-цепочке дефер-IB и ИСПОЛНЯЕТ их (fence двигается как РЕЗУЛЬТАТ). ОБЯЗАТЕЛЬНО до реального
    рендерера, иначе дефер-draw'ы пропадут. Хвост ring (IB 0x975E0) содержит WAIT_REG_MEM на адреса
