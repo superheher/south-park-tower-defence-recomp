@@ -1004,3 +1004,57 @@ Past the heap fix, drove the boot through the next two blockers; new frontier is
    event signal, a queue it polls that is never fed, or a premature join. Tools: gdb attach + `thread apply
    all bt` (/tmp/{threads,t1,obj,h}.gdb); the wait is NtWaitForSingleObjectEx kernel.cpp:1272 / WaitObject:734.
    ⚠ XamLoaderLaunchTitle (a stub) is called around here but is NOT the blocker (the join is).
+
+## 2026-06-01 (cont.) — ✅ CRT-init thread-join = boot-logo "press A/START" timeout; cleared TWO stuck-clock/token bugs; new frontier = GPU CP fence completion (commit 6ecdea6)
+Root-caused the CRT-init thread-join deadlock end-to-end and cleared its two causes. The join is the
+**boot-logo screen**: a global ctor spawns tid=4 (sub_8242B4A8 → sub_8242B428 → sub_8214F730 →
+**sub_8214F738**) to show the logo and JOINs it; main waits ∞ in NtWaitForSingleObjectEx(0x90100C40).
+
+**1. The logo poll (sub_8214F738) — gdb-decoded.** It is a bounded "press A/START, else 5 s timeout"
+poll: `start = GetTickCount(); loop { sub_82448928()→[r1+96]; if [r1+96]==0x5800(VK_PAD_A) || ==0x5814
+(VK_PAD_START) exit; Sleep(5ms); if (GetTickCount()-start) >= 5000 exit }`. sub_82448928 →
+**XamInputGetKeystrokeEx** (so [r1+96] is the keystroke VirtualKey). Timeout and keypress CONVERGE to
+the same cleanup (loc_8214FD44, returns 0) — it is a "skip-or-wait-5s" logo, exactly what prod (no
+controller) does via timeout. gdb at the loop: `now=0 start=0 elapsed=0 status=0x0000` every iter → the
+clock never moved.
+
+**2. Root cause = GetTickCount stuck at 0.** sub_82448748 (the CRT clock) returns
+`*(*(0x820008B8)+16)` = **KeTimeStampBundle.TickCount** (+16). KeTimeStampBundle is xboxkrnl.exe data-
+export **ordinal 0x00AD**; variant A leaves that import as the unresolved placeholder **0xAD000100** (the
+addr the title dereferences — verified 4×, clear of every MmAllocatePhysical region) and never advanced
++16. So elapsed stayed 0 < 5000 forever. FIX (kernel.cpp): a dedicated ~1 ms host thread (StartTimestamp
+Pump, started in SetupEnvironment) writes guest-uptime-ms to 0xAD000110, zeroes +0/+8 — mirrors
+rexglue-sdk xboxkrnl_module.cpp's 1 ms timestamp timer. VERIFIED: tick advances (0→8913→12912 ms), the
+5 s timeout fires, **tid=4 leaves the logo loop** (now at sub_8214F738:19568 = post-loop cleanup).
+
+**3. Second bug = cooperative-token starvation (exactly the prompt's anticipated token issue).** Past the
+logo, the cleanup `sub_8214F738 → sub_821C1000(×4 resources) → sub_821C0850 → sub_821C6E58` waits for a
+GPU fence: `while *(*(device+10896)) < target { sub_821B9270() }`. **sub_821B9270 is a pure busy-spin
+(db16cyc no-ops), no kernel yield** → the guest worker holds the execution token the whole time. But the
+fence is advanced by the **vblank pump**, which must TAKE the token to run ExecutePM4 → the pump blocked
+forever in std::mutex::lock(g_waitMutex) (gdb-CONFIRMED: pump parked at `__lll_lock_wait → … →
+VblankPump():g_waitMutex.lock`). Deadlock: spinner waits for a fence only the pump can move; pump waits
+for the token the spinner holds. FIX (kernel.cpp): strong override of the weak guest alias sub_821B9270
+releases the token across the backoff (Unlock→sleep 1ms→Lock) then calls the recompiled body
+__imp__sub_821B9270; skips the yield on the pump's own thread (it can re-enter via the gfx-interrupt
+callback while holding the token). VERIFIED: pump now runs its normal 16 ms cycle (no longer lock-blocked),
+the ring DRAINS (RPTR==WPTR==37).
+
+**4. NEW FRONTIER = GPU CP fence completion (the renderer, multi-week).** With the pump running and the
+ring drained (RPTR==WPTR==37, WPTR not advancing — title submits no more because tid=4 is still waiting),
+the resource fence `*(*(device+10896))` STILL never reaches `target` (sub_821C6E58 r30). So the cleanup
+wait (and main's join) does not yet lift. This is now a pure GPU command-processor gap: the PM4 the title
+submitted does not drive that fence to target — either the completing EVENT_WRITE/fence packet was never
+in the ring (the title would submit it only after the cleanup, which blocks — or the logo's draws were
+never really rendered by the null/PM4 GPU), or the pump's EVENT_WRITE handling doesn't target
+*(device+10896). RESUME: capture `*(device+10896)` (device ≈ 0x26F80; fence ptr at +10896, target =
+sub_821C6E58 r30/r4) and compare to g_rptrWriteBack / the EVENT_WRITE addresses the pump writes; make the
+CP advance that fence (the GPU engine). 0 INDIRECT-NULL, 0 device-overwrite, no crash throughout.
+
+**Secondary finding (documented, NOT fixed):** sub_821B9270 also embeds a 5 s GPU **watchdog** that would
+abort the wait (return 0) if the fence is stuck — but its tick is `r30 = *(KTHREAD+0x58)`, and FillKThread
+sets T+0x54/0x56/0x5C yet **omits T+0x58** (rexglue X_KTHREAD `unk_58`), so it is pinned at 0 and the
+watchdog can never fire. Even if ticked, the watchdog routes to sub_821C8B30 (DbgPrint + GPU hang-recovery),
+i.e. a degraded "GPU hung" path, not clean progress — so the clean fix is #4 (CP completes the fence), not
+the watchdog. Tools this session: gdb loop/fence/CP scripts (/tmp/{loopwatch,timer,fence,cp,full}.gdb),
+`thread apply all bt`. ⚠ grep -a on boot logs.
