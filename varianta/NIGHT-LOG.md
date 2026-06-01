@@ -275,10 +275,20 @@ spinning, starving everything else). **This is the GPU-CP / renderer boundary (g
    (a) is the quick "null GPU" that should release the spin → boot proceeds. THEN the real renderer: parse +
    translate the PM4 stream the ring buffer holds → draws (Plume + the 19 shaders in
    `private/extracted/media/shaders/*.updb`; Unleashed `gpu/video.cpp` ref). Multi-week.
-2. Fix the token-starvation generally (so busy-waits don't starve the pump): once the CP advances RPtr the
-   spin exits on its own, but for robustness, detect long token holds or give the GPU-advance thread direct
-   memory access without the token (as above).
-3. Remaining soft-stubs surface as the boot proceeds (more Xam, audio XAudio*, input) — implement as hit.
+2. **Threading model (interlocks with #1).** Findings (commit w/ REX_NOTOKEN gate): PREEMPTIVE threads
+   (`REX_NOTOKEN=1`) hang EARLIER (line 43, XamInputSetState) — worse. COOPERATIVE (default token) reaches
+   asset-load + GPU init but is **non-deterministic** in *thread-ordering* (the token serializes execution,
+   not the OS-scheduled handoff order) → different runs stop at the GPU spin / `RtlRaiseException` / a crash.
+   The worker that hits the GPU spin has `r29=0` (**null GPU device**) = token-starvation: it busy-waits
+   holding the token for device state the (blocked) main thread would produce. **Proper fix = a
+   DETERMINISTIC cooperative scheduler (real fibers, like RexGlue: `rex/thread/fiber.h`) with explicit
+   yield ordering + a PARALLEL host GPU thread** that advances RPtr by writing guest memory directly (so a
+   busy-waiting fiber's condition becomes true without the fiber yielding). This is the core
+   GPU-CP/threading-architecture rework — multi-week.
+3. `RtlRaiseException` (a now-reachable frontier on some interleavings) = guest SEH; XenonRecomp models SEH
+   via setjmp/longjmp — implement RtlRaiseException to drive the guest __except path (or it's a benign
+   "feature probe" the title raises + catches).
+4. Remaining soft-stubs surface as the boot proceeds (more Xam, audio XAudio*, input) — implement as hit.
 
 ### Systematic next-steps (priority order)
 1. ✅ **DONE — cooperative execution token** (commit e56368f): the boot is now deterministic. (Ruled out:
