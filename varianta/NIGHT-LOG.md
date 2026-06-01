@@ -485,3 +485,25 @@ and STILL never loops, and match the same `sub_821E07A0` invocation (it can be c
 Then diff the loop-entry guard inputs / count source (`*(orig+144)+31`) between builds to find where
 variant A's count first goes wrong. This capability now makes any divergent function comparable to the
 known-good build in minutes.
+
+### CONFIRMED via reference oracle: variant A's count loop is SPURIOUS
+Ran the working build ~95 s under gdb (read-only): it entered `sub_821E07A0` exactly once, called the
+float-store dispatcher `sub_821DC228` **zero times**, and **reached rendering** (run.log: "Created 54
+graphics pipelines from Vulkan storage", VulkanTextureCache active). So the correct build renders without
+ever executing that loop — variant A's 32768-iteration loop (count=0x8000) is definitively wrong, not a
+boot-stage artifact. (Caveat resolved: prod did reach the render stage, so it's "never runs", not "not
+yet".)
+
+The divergence is therefore in `sub_821E07A0`'s ENTRY logic (ppc_recomp.19.cpp from line 2877): before
+the loop it does several `PPC_CALL_INDIRECT_FUNC` virtual calls + branches —
+`if(r8==0) goto loc_821E08B8` (2912), `if(*(r31+16)!=0) goto loc_821E08DC` (2920),
+`if(r3<0) goto loc_821E08E0` (2937) — one of which, in the correct build, routes PAST the loop. Variant A
+takes the loop path because one of those virtual-call results / branch inputs diverges. Next: capture
+those branch inputs (r8 @2909, *(r31+16) @2917, the 2933 vcall's r3 @2935) in variant A, then find the
+first one whose value is wrong vs the correct build — that pins the divergence. (Cross-build address
+matching is confounded by different heap layouts + prod's different host code/no source lines, so compare
+guest VALUES and branch decisions, matched by call order, not host pointers.)
+
+This is the same object-data-corruption family as the XUI `+8` crash; pinning either root likely explains
+both. Still upstream of the GPU engine (multi-week) — but the reference oracle makes the init root
+attackable directly now.
