@@ -542,3 +542,38 @@ FRONTIER (task #6, the GPU engine — the last step before frames):
 Lesson worth keeping: a single wrong struct-field offset in one kernel HLE call masqueraded as a deep
 "object-graph corruption" across two unrelated subsystems. The guest-level reference oracle (diffing
 against the rendering build) is what cut through it — keep it as the first tool for any divergence.
+
+## 2026-06-01 (cont.) — GPU engine: scope nailed down to a PM4 interpreter (the renderer = step 5)
+
+Pushed task #6 from "null GPU" to a fully-specified implementation plan, and proved no shortcut exists.
+
+State recap: assets load, the game boots to its render loop and writes a PM4 stream to the ring buffer
+(@0xA0002000). Built+committed (d9b009d) a minimal CP in the vblank pump that polls CP_RB_WPTR
+(GPU MMIO base 0x7FC80000, reg 0x1C5 @0x7FC80714), advances RPtr in CP_RB_RPTR (0x7FC80710) + the
+write-back (g_rptrWriteBack @0x201003C), and fires the command-complete interrupt. VERIFIED RPtr=WPtr=25.
+
+Proven dead ends (so the next session doesn't repeat them):
+- Advancing RPtr does NOT release the render-wait (event 0x36E70) — it isn't RPtr-gated.
+- Firing the graphics-interrupt callback with source=1 alone does NOT release it (correctly ignored
+  without backing GPU state).
+- VdVerifyMEInitCommand is NOT called by the title — no stub-level shortcut.
+- A KeSetEvent trace shows the title signals NEARBY render-context events (0x36e30, 0x36e54) but never
+  0x36E70 — the 0x36E70 signal path is gated on the GPU actually PROCESSING the submitted PM4.
+
+PM4 decoded: first packet 0xC0114800 = TYPE-3 op 0x48 = PM4_ME_INIT (count 17 → dwords 0..17), then
+dwords 18..24 are the follow-on packet(s) to decode. So the render-wait needs a real PM4 interpreter.
+
+IMPLEMENTATION SPEC (from rexglue-sdk src/graphics/command_processor.cpp — Xenia 1:1, already renders
+this title; strongly prefer REUSING it over a scratch rewrite):
+- CP worker loop: read write_ptr_index; if RPtr==WPtr (or 0xBAADF00D) wait; else
+  read_ptr = ExecutePrimaryBuffer(read_ptr, write_ptr); store_and_swap RPtr to the write-back. (:290-53)
+- ExecutePacket dispatch on `packet >> 30`: type 0 = ExecutePacketType0 (register-window writes),
+  type 1/2 (rare/NOP), type 3 = ExecutePacketType3 (opcode = (packet>>8)&0x7F, count = ((packet>>16)&
+  0x3FFF)+1). (:818-837)
+- ME_INIT handler = ExecutePacketType3_ME_INIT (:1082) sets the CP micro-engine register bases.
+- The render-wait ack is almost certainly a later packet: an EVENT_WRITE / interrupt-trigger that the
+  CP turns into a memory write or graphics interrupt → the title's handler then signals 0x36E70. Decode
+  dwords 18..24 + find that opcode; reproduce its side effect to release the wait (init-only, still no
+  pixels). PIXELS then require the type-3 draw packets → Plume Vulkan + the 19 shaders
+  (private/extracted/media/shaders/*.updb). Wire the CP to variant A's g_base / ring @0xA0002000 /
+  regs @0x7FC80000 / RPtr-WB @0x201003C. This is the multi-week remainder; every other subsystem boots.
