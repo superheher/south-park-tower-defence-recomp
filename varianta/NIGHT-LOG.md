@@ -767,3 +767,25 @@ free/coalesce that leaves heap+0x162B0 free over the live device). Candidate too
 the heap's free (RtlFreeHeap) and log (size, ptr, caller) into a per-build trace, then diff. ⚠ prod is
 Release (read guest mem by membase, break by symbol; can't read ctx). gdb: /tmp/{earlyalloc,devalloc2,
 allochist}.gdb (watch a guest addr from __imp___xstart, walk the writers).
+
+## 2026-06-01 (cont.) — teardown refined: device = one 24KB heap block; .ptc main buffers are CORRECT; corruption = a subset of wrong dest pointers
+
+Deeper allocation diff:
+- **The device is ONE 24 KB guest-heap block.** sub_8212DBA0 calls sub_82448090(size=24448=0x5F80) →
+  0x26F40 (caller 0x8212DCEC); the device struct is `(0x26F40+131)&~0x7F = 0x26F80` (alloc aligned up
+  128B; orig ptr saved at device-4), then memset to 24320 (0x5F00) → device spans 0x26F80..0x2CE80.
+- **sub_821BE840's main .ptc buffers are CORRECT** — allocated in the 0xA0000000 physical window:
+  a1 size 0x500 (small obj), a2 size **0x398000 (3.7 MB) → 0xA2016000 / 0xA23AE000**, a3 size 0x21E800 →
+  0xA2746000. So the .ptc loader's big vertex/texture buffers are placed FINE (no device overlap).
+- ⇒ The corruption is NOT a gross allocator failure. It's a **subset of destination pointers** in the
+  16-entry buffer-ptr array that sub_822A58F8 walks (r28 = *(r1+1412)+60, where *(r1+1412)=0x20F50A98):
+  most entries point to the correct 0xA2xxxxxx buffers, but SOME point INTO the device struct (bases
+  0x262B0 / 0x29EB0 → writes land at device+0x770..+0x3370, hitting device+10900 the handler-block ptr).
+- Still a variant-A divergence (prod renders); the device block alloc + the physical buffers are identical
+  in spirit to prod, so the wrong array entries are the divergence.
+
+REMAINING ROOT (next layer): who populates the buffer-ptr array at 0x20F50A98+60 with device-pointing
+entries (0x262B0/0x29EB0)? Trace the writers of that array; determine whether *(r1+1412)=0x20F50A98 is a
+valid structure or a wild pointer, and where the device-pointing entries come from (a .ptc-relocation base,
+a stride/count parsed wrong, or a stale/garbage pointer). This is the .ptc-loader's vertex-stream
+descriptor — several functions deep (sub_822A2158/sub_822A7C08/sub_822A7480/sub_822AC488/sub_822AC328).
