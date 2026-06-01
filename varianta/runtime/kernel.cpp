@@ -6,38 +6,127 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <utility>
 
 // Lightweight import trace (set REX_KTRACE=0 to silence).
 static const bool g_ktrace = []{ const char* e = getenv("REX_KTRACE"); return !e || e[0] != '0'; }();
 #define KTRACE(...) do { if (g_ktrace) { fprintf(stderr, "[kernel] " __VA_ARGS__); } } while (0)
 
-// ---- minimal guest heap (bump allocator) ----------------------------------------------------------
-// A region inside the 4 GiB guest space, below the image base (0x82000000). Enough for early boot;
-// a real allocator (free lists, NtFreeVirtualMemory) comes later.
-static uint32_t g_heapNext = 0x40000000;
-static uint32_t GuestAlloc(uint32_t size, uint32_t align)
-{
-    if (align < 0x1000) align = 0x1000;
-    g_heapNext = (g_heapNext + (align - 1)) & ~(align - 1);
-    uint32_t addr = g_heapNext;
-    g_heapNext += (size + 0xFFF) & ~0xFFFu;
-    return addr;
-}
+// ---- guest virtual memory manager ------------------------------------------------------------------
+// Backs Nt{Allocate,Query,Free}VirtualMemory. The full 4 GiB is already mmap'd lazily by the host
+// (runtime.cpp), so a "commit" is essentially free — we only TRACK reservations so that
+// NtQueryVirtualMemory can answer (the guest RtlCreateHeap = sub_8244B380 reserves a region then
+// queries it back). Reference: rexglue-sdk src/kernel/xboxkrnl/xboxkrnl_memory.cpp + the Xenia heap
+// model. ⚠ Xbox 360 ABI: NtAllocateVirtualMemory has 4 (+1 debug) args and NO ProcessHandle —
+// r3=*BaseAddress, r4=*RegionSize, r5=AllocType, r6=Protect, r7=DebugMemory (NOT the Win32 6-arg form).
+namespace {
+constexpr uint32_t kMemCommit = 0x1000, kMemReserve = 0x2000, kMemDecommit = 0x4000;
+constexpr uint32_t kMemRelease = 0x8000, kMemFree = 0x10000, kMemPrivate = 0x20000;
+constexpr uint32_t kMemLargePages = 0x20000000;
+constexpr uint32_t kPageReadWrite = 0x04;
+constexpr uint32_t kStatusSuccess = 0x00000000;
+constexpr uint32_t kStatusInvalidParameter = 0xC000000Du;
+constexpr uint32_t kStatusMemoryNotAllocated = 0xC00000A0u;
 
-// NTSTATUS NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits, *RegionSize, AllocType, Protect)
+struct VRegion { uint32_t size; bool reserved; bool committed; uint32_t protect; };
+std::map<uint32_t, VRegion> g_regions;   // base -> region (kept non-overlapping)
+uint32_t g_virtNext = 0x40000000;        // bump cursor for kernel-chosen bases (user virtual range)
+
+inline uint32_t RoundUp(uint32_t v, uint32_t a) { return (v + (a - 1)) & ~(a - 1); }
+
+// Largest tracked region whose [base, base+size) contains addr.
+std::pair<uint32_t, VRegion*> FindRegion(uint32_t addr)
+{
+    auto it = g_regions.upper_bound(addr);
+    if (it == g_regions.begin()) return {0, nullptr};
+    --it;
+    if (addr >= it->first && addr < it->first + it->second.size) return {it->first, &it->second};
+    return {0, nullptr};
+}
+} // namespace
+
+// NTSTATUS NtAllocateVirtualMemory(*BaseAddress r3, *RegionSize r4, AllocType r5, Protect r6, Debug r7)
 PPC_FUNC(__imp__NtAllocateVirtualMemory)
 {
-    uint32_t pBase = ctx.r4.u32;
-    uint32_t pSize = ctx.r6.u32;
-    uint32_t reqBase = pBase ? PPC_LOAD_U32(pBase) : 0;
-    uint32_t reqSize = pSize ? PPC_LOAD_U32(pSize) : 0;
-    uint32_t size = (reqSize + 0xFFFF) & ~0xFFFFu;     // 64 KiB granularity
-    if (size == 0) size = 0x10000;
-    uint32_t addr = reqBase ? reqBase : GuestAlloc(size, 0x10000);
-    if (pBase) PPC_STORE_U32(pBase, addr);
-    if (pSize) PPC_STORE_U32(pSize, size);
-    KTRACE("NtAllocateVirtualMemory -> 0x%X (%u B)\n", addr, size);
-    ctx.r3.u64 = 0;  // STATUS_SUCCESS
+    uint32_t pBase = ctx.r3.u32, pSize = ctx.r4.u32;
+    uint32_t allocType = ctx.r5.u32, protect = ctx.r6.u32;
+    if (!pBase || !pSize) { ctx.r3.u64 = kStatusInvalidParameter; return; }
+    uint32_t reqBase = PPC_LOAD_U32(pBase);
+    uint32_t reqSize = PPC_LOAD_U32(pSize);
+    if (reqSize == 0) { ctx.r3.u64 = kStatusInvalidParameter; return; }
+
+    uint32_t pageSize = (allocType & kMemLargePages) ? 0x10000u : 0x1000u;
+    uint32_t gbase, size;
+    if (reqBase) {                                    // caller chose the base (e.g. commit-on-reserve)
+        gbase = reqBase & ~(pageSize - 1);
+        size = RoundUp(reqSize + (reqBase - gbase), pageSize);
+    } else {                                          // kernel chooses — 64 KiB granular bump
+        size = RoundUp(reqSize, 0x10000);
+        g_virtNext = RoundUp(g_virtNext, 0x10000);
+        gbase = g_virtNext;
+        g_virtNext += size;
+    }
+    if (protect == 0) protect = kPageReadWrite;
+
+    auto [rb, r] = FindRegion(gbase);
+    if (r) {                                          // grow/recommit an existing reservation
+        if (allocType & kMemReserve) r->reserved = true;
+        if (allocType & kMemCommit) { r->reserved = true; r->committed = true; }
+        r->protect = protect;
+        if (gbase + size > rb + r->size) r->size = (gbase - rb) + size;
+    } else {
+        VRegion nr{};
+        nr.size = size;
+        nr.reserved = (allocType & (kMemReserve | kMemCommit)) != 0;
+        nr.committed = (allocType & kMemCommit) != 0;
+        nr.protect = protect;
+        g_regions[gbase] = nr;
+    }
+    PPC_STORE_U32(pBase, gbase);
+    PPC_STORE_U32(pSize, size);
+    KTRACE("NtAllocateVirtualMemory(req=0x%X sz=0x%X type=0x%X prot=0x%X) -> base=0x%X size=0x%X\n",
+        reqBase, reqSize, allocType, protect, gbase, size);
+    ctx.r3.u64 = kStatusSuccess;
+}
+
+// NTSTATUS NtQueryVirtualMemory(BaseAddress r3, *MEMORY_BASIC_INFORMATION r4, RegionType r5)
+PPC_FUNC(__imp__NtQueryVirtualMemory)
+{
+    uint32_t addr = ctx.r3.u32, pMbi = ctx.r4.u32;
+    auto [rb, r] = FindRegion(addr);
+    if (!r) {
+        KTRACE("NtQueryVirtualMemory(0x%X) -> INVALID (not tracked)\n", addr);
+        ctx.r3.u64 = kStatusInvalidParameter;
+        return;
+    }
+    uint32_t state = r->committed ? kMemCommit : (r->reserved ? kMemReserve : kMemFree);
+    PPC_STORE_U32(pMbi + 0x00, rb);                  // base_address
+    PPC_STORE_U32(pMbi + 0x04, rb);                  // allocation_base
+    PPC_STORE_U32(pMbi + 0x08, r->protect);          // allocation_protect
+    PPC_STORE_U32(pMbi + 0x0C, rb + r->size - addr); // region_size (addr .. end of region)
+    PPC_STORE_U32(pMbi + 0x10, state);               // state
+    PPC_STORE_U32(pMbi + 0x14, r->protect);          // protect
+    PPC_STORE_U32(pMbi + 0x18, kMemPrivate);         // type
+    KTRACE("NtQueryVirtualMemory(0x%X) -> base=0x%X size=0x%X state=0x%X\n", addr, rb, r->size, state);
+    ctx.r3.u64 = kStatusSuccess;
+}
+
+// NTSTATUS NtFreeVirtualMemory(*BaseAddress r3, *RegionSize r4, FreeType r5, Debug r6)
+PPC_FUNC(__imp__NtFreeVirtualMemory)
+{
+    uint32_t pBase = ctx.r3.u32, pSize = ctx.r4.u32, freeType = ctx.r5.u32;
+    if (!pBase) { ctx.r3.u64 = kStatusMemoryNotAllocated; return; }
+    uint32_t gbase = PPC_LOAD_U32(pBase);
+    auto [rb, r] = FindRegion(gbase);
+    if (!r) { ctx.r3.u64 = kStatusMemoryNotAllocated; return; }
+    if (freeType & kMemRelease)        { r->reserved = false; r->committed = false; }
+    else if (freeType & kMemDecommit)  { r->committed = false; }
+    // Underlying host pages persist (lazy mmap); only bookkeeping changes.
+    PPC_STORE_U32(pBase, rb);
+    if (pSize) PPC_STORE_U32(pSize, r->size);
+    KTRACE("NtFreeVirtualMemory(0x%X type=0x%X)\n", gbase, freeType);
+    ctx.r3.u64 = kStatusSuccess;
 }
 
 // DWORD KeGetCurrentProcessType(void) -> 1 (X_PROCTYPE_TITLE)
