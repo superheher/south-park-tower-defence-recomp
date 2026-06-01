@@ -591,3 +591,24 @@ EVENT_WRITE/interrupt opcode in the IBs that the title's handler turns into the 
 reproduce it → render-wait releases (init done, still no pixels); (5) type-3 DRAW_* packets → Plume
 Vulkan + 19 shaders → pixels. Best path remains reusing rexglue-sdk command_processor.cpp wholesale
 (it already does 1-5 for this title) wired to variant A's g_base/ring/regs/RPtr-WB. Multi-week.
+
+### Render-wait 0x36E70 — ALL bounded shortcuts exhausted; it requires real PM4 execution (confirmed)
+Drove the render-wait release condition to ground. The main thread blocks on event 0x36E70; it is NOT
+released by any of these (each tested/analyzed):
+1. RPtr advance to WPtr (CP_RB_RPTR + write-back) — verified RPtr=WPtr=25, no release.
+2. Graphics-interrupt callback source=1 (command-complete) — runs, no release.
+3. VdVerifyMEInitCommand — the title never calls it (no stub shortcut).
+4. Per-processor interrupt delivery — REFUTED: FillKPcr zeros the KPCR so every thread is processor 0;
+   the callback (reads KPCR+0x10C) always acts as proc 0 and signals proc-0 events 0x36e30/0x36e54, NOT
+   0x36E70. Callback args are correct (r3=source, r4=interrupt_callback_data_, matching rexglue
+   DispatchInterruptCallback args[]={source, interrupt_callback_data_}).
+⇒ 0x36E70 is the GPU **command-completion** event: the title submits PM4 (ME_INIT + 2 INDIRECT_BUFFER,
+empty so far — it's awaiting CP-ready before filling the real-command IBs) and waits for the GPU to
+EXECUTE it and write a completion fence/EOP that the title's code turns into KeSetEvent(0x36E70). With no
+PM4 interpreter, that never happens. There is no stub/register/interrupt shortcut — only a real command
+processor releases it.
+
+DEFINITIVE: step 5 (renderer) == implement/integrate the GPU command processor (PM4 interpreter w/ IB
+recursion + GPU memory model + EOP/fence + Plume Vulkan + 19 shaders). Reuse rexglue-sdk
+command_processor.cpp. This is the multi-week remainder; every other subsystem boots and the game runs to
+the point of submitting GPU work. Nothing further in this layer is a quick fix — confirmed exhaustively.
