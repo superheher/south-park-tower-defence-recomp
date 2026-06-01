@@ -404,3 +404,86 @@ PPC_FUNC(__imp__KeQuerySystemTime)
 
 // BOOL XexCheckExecutablePrivilege(DWORD privilege) — title has no special privileges during bring-up.
 PPC_FUNC(__imp__XexCheckExecutablePrivilege) { ctx.r3.u64 = 0; }
+
+// ---- video mode (goal step: video) -----------------------------------------------------------------
+// void XGetVideoMode(X_VIDEO_MODE* mode) — report a fixed 1280x720 widescreen hi-def NTSC mode.
+// Layout (rexglue X_VIDEO_MODE): display_width@0x0, display_height@0x4, is_interlaced@0x8,
+// is_widescreen@0xC, is_hi_def@0x10, refresh_rate@0x14 (float), video_standard@0x18,
+// unknown_0x8a@0x1C, unknown_0x01@0x20, reserved[3]@0x24.
+PPC_FUNC(__imp__XGetVideoMode)
+{
+    uint32_t m = ctx.r3.u32;
+    if (!m) return;
+    for (uint32_t i = 0; i < 0x30; i += 4) PPC_STORE_U32(m + i, 0);
+    PPC_STORE_U32(m + 0x00, 1280);          // display_width
+    PPC_STORE_U32(m + 0x04, 720);           // display_height
+    PPC_STORE_U32(m + 0x08, 0);             // is_interlaced
+    PPC_STORE_U32(m + 0x0C, 1);             // is_widescreen
+    PPC_STORE_U32(m + 0x10, 1);             // is_hi_def
+    { float hz = 60.0f; uint32_t b; memcpy(&b, &hz, 4); PPC_STORE_U32(m + 0x14, b); } // refresh_rate
+    PPC_STORE_U32(m + 0x18, 1);             // video_standard = NTSC
+    PPC_STORE_U32(m + 0x1C, 0x4A);          // unknown_0x8a
+    PPC_STORE_U32(m + 0x20, 0x01);          // unknown_0x01
+    KTRACE("XGetVideoMode -> 1280x720\n");
+}
+
+// ---- physical memory (GPU buffers) -----------------------------------------------------------------
+namespace { uint32_t g_physNext = 0xA0000000; }  // Xbox physical-address window (all lazily mmap'd)
+
+// PVOID MmAllocatePhysicalMemoryEx(flags r3, size r4, protect r5, min r6, max r7, align r8)
+PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
+{
+    uint32_t size = ctx.r4.u32, protect = ctx.r5.u32, align = ctx.r8.u32;
+    uint32_t pageSize = 0x1000;
+    if (protect & 0x20000000u)      pageSize = 0x10000;     // X_MEM_LARGE_PAGES
+    else if (protect & 0x80000000u) pageSize = 0x1000000;   // X_MEM_16MB_PAGES
+    uint32_t a = align < pageSize ? pageSize : ((align + pageSize - 1) & ~(pageSize - 1));
+    size = (size + pageSize - 1) & ~(pageSize - 1);
+    g_physNext = (g_physNext + (a - 1)) & ~(a - 1);
+    uint32_t addr = g_physNext;
+    g_physNext += size ? size : pageSize;
+    KTRACE("MmAllocatePhysicalMemoryEx(sz=0x%X prot=0x%X) -> 0x%X\n", size, protect, addr);
+    ctx.r3.u64 = addr;
+}
+
+// PVOID MmGetPhysicalAddress(addr r3) — identity within the physical window for bring-up.
+PPC_FUNC(__imp__MmGetPhysicalAddress) { /* keep r3 as-is */ }
+
+// ---- XConfig --------------------------------------------------------------------------------------
+// NTSTATUS ExGetXConfigSetting(cat r3, setting r4, buffer r5, buffer_size r6, *required_size r7).
+// Return success with sane defaults so config-driven init paths proceed.
+PPC_FUNC(__imp__ExGetXConfigSetting)
+{
+    uint16_t cat = static_cast<uint16_t>(ctx.r3.u32);
+    uint16_t setting = static_cast<uint16_t>(ctx.r4.u32);
+    uint32_t buf = ctx.r5.u32, bufSize = ctx.r6.u32, reqPtr = ctx.r7.u32;
+    uint32_t val = 0; uint16_t valSize = 4;
+    // Common settings the CRT/title queries early.
+    if (cat == 0x0003) {                 // XCONFIG_USER category
+        if (setting == 0x0009) val = 1;  // USER_LANGUAGE = English
+        if (setting == 0x000A) val = 0;  // USER_VIDEO_FLAGS
+        if (setting == 0x0007) { val = 0; valSize = 1; }   // USER_AV_REGION-ish
+    } else if (cat == 0x0002) {          // XCONFIG_CONSOLE category
+        valSize = 4;                     // default 0
+    }
+    if (buf && bufSize) {
+        for (uint32_t i = 0; i < bufSize && i < valSize; i++)
+            PPC_STORE_U8(buf + i, static_cast<uint8_t>(val >> (8 * (valSize - 1 - i))));
+    }
+    if (reqPtr) PPC_STORE_U16(reqPtr, valSize);
+    ctx.r3.u64 = 0;  // STATUS_SUCCESS
+}
+
+// ---- strings ---------------------------------------------------------------------------------------
+// void RtlInitAnsiString(ANSI_STRING* dst r3, const char* src r4)
+// ANSI_STRING: length@0x0 (u16), maximum_length@0x2 (u16), buffer@0x4 (u32).
+PPC_FUNC(__imp__RtlInitAnsiString)
+{
+    uint32_t dst = ctx.r3.u32, src = ctx.r4.u32;
+    if (!dst) return;
+    uint16_t len = 0;
+    if (src) { while (PPC_LOAD_U8(src + len) != 0 && len < 0xFFFE) len++; }
+    PPC_STORE_U16(dst + 0x00, len);
+    PPC_STORE_U16(dst + 0x02, src ? static_cast<uint16_t>(len + 1) : 0);
+    PPC_STORE_U32(dst + 0x04, src);
+}
