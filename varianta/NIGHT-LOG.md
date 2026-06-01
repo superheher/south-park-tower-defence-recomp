@@ -1106,3 +1106,32 @@ WAIT_REG_MEM-chained deferred IBs and executes them (so the fence advances as a 
 renderer lands, or deferred draws would be skipped. Build/run unchanged (ninja -C runtime/out
 sp_td_varianta). Diagnostics added (gated): ExecuteType3 full opcode trace under REX_CPTRACE=1; [fencefwd]
 under REX_KTRACE=1.
+
+## 2026-06-01 (cont.) — boot reaches & PLAYS the intro movie; the wall is now the GPU RENDERER (confirmed)
+Followed the post-join boot to its natural limit. Findings:
+- **The render loop works.** `VdSwap` IS called every frame (from sub_821BFF48) presenting *sequential
+  framebuffers* (r3 = 0xA0013734, 0xA009B3B4, 0xA0123B74, … ~0x88000 apart = distinct frame targets). Our
+  stub was silent so earlier "VdSwap=0" was a logging artifact, not absence. Improved VdSwap to advance the
+  GPU swap counter (g_gpuCounter++) + log the first calls. The title renders to framebuffers + presents;
+  variant A just can't *display* them (no Vulkan backend — DRAW_INDX is a no-op in ExecutePM4).
+- **The intro movie loads & plays.** game:\Media\Assets\Movies\en-en\sp_xbox_0_intro.wmv (path fixed via
+  en-en/ symlink) → NtQueryInformationFile size=8479541 → allocate 0x820000 → NtReadFile reads the whole
+  8.4 MB → RtlInitializeCriticalSection ×~17 (player init) → MmAllocatePhysicalMemoryEx ×N (GPU mem) →
+  ExCreateThread ×4 (tid 11-14, start 0x82339428.. = the VC-1/WMV decoder threads). So the title genuinely
+  enters movie playback.
+- **It is RENDERER-GATED, not slow.** A 180 s run produced **1,099,927 non-spam lines** but NEVER advanced
+  past the movie (no NtClose on the movie handle, no menu assets, no next file). 180 s ≫ enough for even a
+  5-10× slowed CPU VC-1 decode of an 8.4 MB intro. The movie playback (and thus the intro→menu transition)
+  needs frames actually drawn/displayed — i.e. the GPU renderer. Main cycles through the movie-player render
+  fns (sub_821D5910 → sub_822045E0 → …); 13 threads, all healthy (no deadlock, no crash, 0 device-overwrite).
+
+**CONCLUSION — the boot-bring-up frontier is EXHAUSTED; the remaining work is the GPU renderer.** Variant
+A's CP is a minimal PM4 interpreter (IB/INTERRUPT/EVENT_WRITE_SHD-fence/swap; draws = no-ops). To advance
+past the intro (and to display anything) it needs a real PM4→Vulkan translator: GPU-state tracking from
+SET_CONSTANT/type-0 register writes, Xenos-microcode→SPIR-V shader translation, DRAW_INDX→Vulkan draw,
+texture/RT/vertex binding, and a Vulkan swapchain presented on VdSwap/XE_SWAP. That is exactly what
+rexglue's command_processor + Vulkan backend (Xenia-based) already do — so the realistic options are
+(a) port a minimal renderer, (b) integrate rexglue's existing Vulkan backend/Plume into variant A's runtime,
+or (c) the fake-skip-the-intro stopgap to exercise more title LOGIC (menu/gameplay) for recomp coverage
+(no display). This is a multi-week, deliberate phase — flagged for a human scope decision, not autonomous
+loop work.

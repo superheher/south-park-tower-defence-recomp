@@ -1328,8 +1328,13 @@ PPC_FUNC(__imp__VdPersistDisplay)          { if (ctx.r4.u32) PPC_STORE_U32(ctx.r
 PPC_FUNC(__imp__VdCallGraphicsNotificationRoutines) { ctx.r3.u64 = 0; }
 PPC_FUNC(__imp__VdEnableDisableClockGating)         { /* no-op */ }
 PPC_FUNC(__imp__VdInitializeScalerCommandBuffer)    { ctx.r3.u64 = 0; }
-// void VdSwap(...) — frame present. Minimal: acknowledge (real present = renderer phase).
-PPC_FUNC(__imp__VdSwap) { ctx.r3.u64 = 0; }
+// void VdSwap(...) — frame present. Minimal: acknowledge + advance the GPU swap counter so the title's
+// frame-pacing / is_counter fences see presents happen (real present = renderer phase).
+PPC_FUNC(__imp__VdSwap) {
+    uint32_t n = g_gpuCounter.fetch_add(1) + 1;
+    if (g_ktrace && n <= 8) fprintf(stderr, "[VdSwap] #%u (r3=0x%X r4=0x%X)\n", n, ctx.r3.u32, ctx.r4.u32);
+    ctx.r3.u64 = 0;
+}
 
 // ====================================================================================================
 // Dispatch-object synchronization: events, semaphores, single/multiple waits (goal: stable threading).
