@@ -17,6 +17,10 @@
 #include <thread>
 #include <chrono>
 #include <condition_variable>
+#include <string>
+#include <dirent.h>      // case-insensitive VFS path resolution (Xbox FS is case-insensitive)
+#include <strings.h>     // strcasecmp
+#include <sys/stat.h>
 
 // Lightweight import trace (set REX_KTRACE=0 to silence).
 static const bool g_ktrace = []{ const char* e = getenv("REX_KTRACE"); return !e || e[0] != '0'; }();
@@ -952,13 +956,37 @@ std::string GuestAnsiString(uint32_t strPtr) {   // X_ANSI_STRING: len@0(u16), m
     return s;
 }
 
-// "game:\media\foo" / "\Device\...\foo" / "d:\foo" -> <g_gameDir>/media/foo (best-effort).
+// Resolve a relative path case-insensitively under base (Xbox FS is case-insensitive; Linux is not —
+// the title opens "UI\UI.xzp"/"Assets\Audio" but the extracted dir is lowercase "ui"/"audio").
+std::string ResolveCaseInsensitive(const std::string& base, const std::string& rel) {
+    std::string cur = base;
+    size_t i = 0;
+    while (i < rel.size()) {
+        size_t slash = rel.find('/', i);
+        std::string comp = rel.substr(i, slash == std::string::npos ? std::string::npos : slash - i);
+        i = (slash == std::string::npos) ? rel.size() : slash + 1;
+        if (comp.empty() || comp == ".") continue;
+        struct stat st;
+        std::string exact = cur + "/" + comp;
+        if (stat(exact.c_str(), &st) == 0) { cur = exact; continue; }   // exact case wins
+        bool found = false;
+        if (DIR* d = opendir(cur.c_str())) {
+            while (struct dirent* e = readdir(d))
+                if (strcasecmp(e->d_name, comp.c_str()) == 0) { cur += "/"; cur += e->d_name; found = true; break; }
+            closedir(d);
+        }
+        if (!found) { cur += "/" + comp; }   // leave as-is → fopen will MISS
+    }
+    return cur;
+}
+
+// "game:\media\foo" / "\Device\...\foo" / "d:\foo" -> <g_gameDir>/media/foo (case-insensitive).
 std::string TranslatePath(std::string p) {
     size_t colon = p.find(':');
     std::string rel = (colon != std::string::npos) ? p.substr(colon + 1) : p;
     for (char& c : rel) if (c == '\\') c = '/';
     while (!rel.empty() && rel[0] == '/') rel.erase(0, 1);
-    return kernel::g_gameDir + "/" + rel;
+    return ResolveCaseInsensitive(kernel::g_gameDir, rel);
 }
 FILE* FileForHandle(uint32_t h) {
     std::lock_guard<std::mutex> lk(g_fileMutex);
