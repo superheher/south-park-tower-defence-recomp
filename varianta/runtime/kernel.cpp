@@ -914,6 +914,24 @@ PPC_FUNC(__imp__XamUserGetSigninInfo)
     ctx.r3.u64 = 0;                                           // S_OK
 }
 
+// DWORD XamUserReadProfileSettings(title r3, user r4, xuid_count r5, xuids r6, setting_count r7,
+//   setting_ids r8, *buffer_size r9, buffer r10, overlapped r11). First run = no saved settings:
+// report a 0-setting result so the title falls back to defaults.
+// XUSER_READ_PROFILE_SETTING_RESULT: setting_count@0x0, settings_ptr@0x4.
+PPC_FUNC(__imp__XamUserReadProfileSettings)
+{
+    uint32_t bufSizePtr = ctx.r9.u32, bufPtr = ctx.r10.u32, overlapped = ctx.r11.u32;
+    if (!bufPtr) {                                  // size query → need the 8-byte header
+        if (bufSizePtr) PPC_STORE_U32(bufSizePtr, 8);
+        ctx.r3.u64 = overlapped ? 0u : 0x8007007Au; // ERROR_INSUFFICIENT_BUFFER (sync)
+        return;
+    }
+    PPC_STORE_U32(bufPtr + 0x00, 0);                // setting_count = 0 (none saved)
+    PPC_STORE_U32(bufPtr + 0x04, 0);                // settings_ptr = null
+    if (bufSizePtr) PPC_STORE_U32(bufSizePtr, 8);
+    ctx.r3.u64 = 0;                                 // X_ERROR_SUCCESS
+}
+
 // NTSTATUS KeWaitForMultipleObjects(count r3, objects r4, waitType r5, reason r6, mode r7,
 //                                   alertable r8, *timeout r9, waitblocks r10)
 PPC_FUNC(__imp__KeWaitForMultipleObjects)
