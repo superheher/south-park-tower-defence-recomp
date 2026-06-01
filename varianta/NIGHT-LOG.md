@@ -189,3 +189,95 @@ gdb backtraces (recompiled fns are real host frames at `-O0`); `REX_KTRACE=1` im
 
 **Resume:** re-run `/loop go done docs/NEXT-SESSION-VARIANTA-PROMPT.md`, or tackle the systematic steps
 interactively (recommended for the runtime).
+
+## Session 2026-06-01 (continuation) — heap unblocked → full boot env → multithreaded video init
+Goal: fill X_KTHREAD/X_KPROCESS/process heap → static TLS from XEX → import cascade → video → renderer.
+Commits (NOT pushed): `8b6d18b`, `db90322`, `48f217d`, `e0f4e8a`, `b086014`.
+
+- **[8b6d18b] HEAP-INIT BLOCKER FIXED — the root cause was a wrong NtAllocateVirtualMemory ABI.**
+  The pause-point bail (CRT `RtlCreateHeap`=`sub_8244B380` getting a null heap base) was NOT a missing
+  thread/process struct — it was that NtAllocateVirtualMemory used the **Windows 6-arg** signature
+  (`ProcessHandle, *BaseAddress, ZeroBits, *RegionSize, …`) but Xbox 360 passes only
+  `(*BaseAddress=r3, *RegionSize=r4, AllocType=r5, Protect=r6, Debug=r7)`. It read the *size* as the
+  base and never wrote `*BaseAddress` → heap base 0 → lock CS at null+0x618. Rewrote a tracking memory
+  manager (std::map over the lazily-mmap'd 4 GiB) for Nt{Allocate,Query,Free}VirtualMemory. RtlCreateHeap
+  now succeeds (1 MB reserve @ 0x40000000, lock CS at a valid 0x40000618). **This retires the "needs
+  X_KTHREAD/X_KPROCESS" framing of the pause point — the structs weren't the blocker; the ABI was.**
+- **[db90322] Full boot environment + static TLS (goal steps 1-2 DONE).** `SetupEnvironment` builds, 1:1
+  with rexglue (Xenia) layouts: title X_KPROCESS (TLS vars + slot bitmap from XEX_HEADER_TLS_INFO),
+  main-thread X_KTHREAD (InitializeGuestObject, linked into process), X_KPCR (r13). Per-thread TLS block
+  initialized from the XEX TLS directory. Implemented KeTlsAlloc/Free/Get/SetValue (process slot bitmap +
+  per-thread dynamic array via r13→KPCR→thread), KeQueryPerformanceFrequency (50 MHz), KeQuerySystemTime,
+  XexCheckExecutablePrivilege. Switched the 474 stubs to **soft** (log+return 0; REX_STUBTRAP=1 to trap)
+  → one run maps the whole cascade. This title has NO static TLS data (only 64 dynamic slots).
+- **[48f217d] Data imports → boot reaches GPU video init.** XGetVideoMode (1280x720), MmAllocatePhysicalMemoryEx,
+  ExGetXConfigSetting, RtlInitAnsiString. Boot advances through CRT init into the Vd* GPU init cascade
+  (VdInitializeRingBuffer/EnableRingBufferRPtrWriteBack/SetGraphicsInterruptCallback) and parks in the
+  main-thread GPU ring-buffer/vblank spin **sub_821B9270** (no GPU to advance the RPtr/vblank).
+- **[e0f4e8a] Real threading + Vd* vblank pump → boot goes MULTITHREADED, past the GPU spin.**
+  ExCreateThread spawns a host std::thread running the guest start routine (XAPI trampoline / raw) on its
+  own KTHREAD/KPCR/TLS/stack (factored CreateGuestThreadContext + FillKThread/FillKPcr). Handle table:
+  NtResumeThread, ObReferenceObjectByHandle (+NtCurrentThread), ObDereferenceObject, KeSetAffinityThread,
+  KeInitializeDpc. Critical sections are now REAL per-CS recursive host mutexes; memory manager mutex-guarded.
+  A ~60 Hz vblank pump thread fires the guest graphics interrupt callback on its own context. The audio
+  worker is created+resumed+runs; boot reaches audio init.
+- **[b086014] Sync primitives + memory layout.** Events/semaphores/single+multiple waits (one global CV;
+  signal_state in the guest dispatch header @+0x04); threads signal their KTHREAD header on exit. Memory
+  layout: guest virtual bump now starts LOW (0x10000) so the title's big heap reserve (everything below its
+  ~0x70000000 stack) ends below the image (0x82000000) instead of overwriting `.data`; kernel arena +
+  worker structs/stacks moved ABOVE the image (0x90000000+). REX_NOSPAWN diagnostic gate.
+
+### CURRENT FRONTIER — audio-subsystem init logic (race FIXED by the cooperative token, commit e56368f)
+The concurrency race is RESOLVED: the cooperative execution token (`g_waitMutex`; only one guest thread
+runs at a time, released across waits / CS contention) made the boot **deterministic** (3/3 identical).
+Remaining is now a stable LOGIC bug, not a race:
+- A/B (REX_NOSPAWN): workers OFF → main sails to `XamLoaderLaunchTitle` (then hangs waiting for the un-run
+  worker); workers ON (default) → deterministic crash at `sub_8229C4B0` (ppc_recomp.37:11442, `[r3+0]`)
+  called from `sub_8214FFD0:20349` (`r3 = [r27+4] = -1`).
+- Watchpoint: `[0x828C124C]` is written ONCE, by the main thread, to a VALID `0x806F0200` (so that global
+  is fine); the crashing `[r27+4]` is a DIFFERENT subsystem-object slot that stays -1. `sub_8214FFD0` looks
+  like a generic "init subsystem N → register object → spawn its worker (sub_8229C4B0 creates a thread for
+  `[r27+4]`)". When the audio worker (`sub_8230E898`, started via the XAPI trampoline 0x82450FD0) runs, a
+  later subsystem's object pointer is left -1 because its imports are soft-stubs.
+- The crash deref faults only because it reads 4 bytes straddling the top of the 4 GiB mmap (r3 = -1 = top
+  of guest space). Any real pointer there would load fine.
+- ✅ **The cascade DOES advance one step per correct import** (confirmed): implementing XamUserGetSigninInfo
+  (fill the 40-B X_USER_SIGNIN_INFO; the stub returned S_OK without writing it) moved the frontier forward
+  — the user/profile subsystem now calls **XamUserReadProfileSettings** (current last stub). So the path is
+  the import-cascade grind: implement the next profile/file import → advance → repeat. The unset `[r27+4]`
+  object belongs to a subsystem whose init reads profile/file data that the stubs don't provide yet.
+- Memory layout verified correct: the title's 1.88 GB heap reserve now lands at base 0x48D0000 (ends
+  0x749D0000, **below** the image 0x82000000); kernel arena + worker stacks at 0x90000000+.
+
+### Systematic next-steps (priority order)
+1. ✅ **DONE — cooperative execution token** (commit e56368f): the boot is now deterministic. (Ruled out:
+   broken atomics — XenonRecomp emits real `__sync_bool_compare_and_swap` for `lwarx/stwcx`.)
+2. **Resolve the subsystem-init -1.** Find which subsystem `sub_8214FFD0` is initializing when `[r27+4]`
+   is -1: break at `ppc_recomp.6.cpp:20349`, read `r27` (the object-slot global) and trace back which
+   `sub_*`/import was supposed to populate it. Likely it needs a subsystem import currently soft-stubbed
+   (audio: XAudioRegisterRenderDriverClient/GetSpeakerConfig/GetVoiceCategoryVolume; or a Xam/notify one)
+   to return a valid handle/object instead of 0. Implement that import for real (ref rexglue-sdk
+   `src/audio/` + `src/kernel/xam/`). ⚠ gdb live-inspection of `ctx.*` fields interacts badly with the
+   token under all-stop — prefer `REX_KTRACE=1` tracing + targeted `fprintf` over breakpoint scripts, or
+   set `REX_NOSPAWN=1` to inspect the single-threaded path.
+3. ⚠ **Pending hazard — GPU-spin starvation under the token.** The main-thread GPU spin `sub_821B9270`
+   (`db16cyc` busy-loop, calls `sub_8244CE40` each iteration) doesn't yield, so once reached it will hold
+   the token forever and starve the vblank pump → hang. Make `sub_8244CE40` (or the spin) release the
+   token (it's likely a delay/yield), or detect the spin and yield. Needed before the GPU sync can drive.
+4. Implement the spinlock imports (Kf/KeAcquire/ReleaseSpinLock*, KeEnter/LeaveCriticalRegion) as real
+   token-releasing locks (referenced in 3-6 TUs; not yet hit pre-crash).
+5. Then the cascade past audio: file VFS (NtCreateFile/NtReadFile/NtQueryInformationFile/NtClose backed
+   by the extracted game dir), XamLoaderLaunchTitle → GPU command processor (consume the PM4 ring buffer)
+   → native renderer (Plume + 19 shaders).
+2. Implement the spinlock imports (Kf/KeAcquire/ReleaseSpinLock*, KeEnter/LeaveCriticalRegion) as real
+   host locks — these guard kernel-level shared structures the threads touch.
+3. Then continue the cascade past audio: file VFS (NtCreateFile/NtReadFile/NtQueryInformationFile/NtClose
+   backed by the extracted game dir) for asset loading, XamLoaderLaunchTitle.
+4. Then the GPU command processor (consume the PM4 ring buffer the title fills) → native renderer
+   (Plume + 19 shaders). The vblank pump already fires the interrupt callback; RPtr write-back is tracked.
+
+### Tooling added this session
+`REX_STUBTRAP=1` (hard-trap unimplemented imports), `REX_NOSPAWN=1` (create thread handles but don't run
+them — isolates concurrency bugs). gdb hardware watchpoints on `g_base+<guestaddr>` pinpoint who writes a
+guest global (and which host thread). Build: `cmake --build runtime/out --target sp_td_varianta` then
+`./sp_td_varianta <abs path to default.xex>`.

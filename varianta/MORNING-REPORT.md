@@ -1,7 +1,16 @@
 # Variant A — Morning Report (autonomous night session, 2026-05-31 → 06-01)
 
-Branch `experimental/hle-graphics-spike` · 5 commits, **NOT pushed** · prod `.so` `1a3f6076` untouched ·
+Branch `experimental/hle-graphics-spike` · **NOT pushed** · prod `.so` `1a3f6076` untouched ·
 `rexglue-sdk` untouched · superproject pointer not bumped. Full timeline in `NIGHT-LOG.md`.
+
+> **⚡ LATEST (2026-06-01 continuation, +8 commits `8b6d18b..e405734`):** the runtime now **boots
+> multithreaded** well past where this report ends. The heap-init pause-point was a wrong
+> NtAllocateVirtualMemory ABI (not missing structs); fixed → full KPROCESS/KTHREAD/KPCR + XEX-TLS env
+> → real threading + a Vd* vblank pump get it past the GPU spin → a **cooperative execution token**
+> makes it deterministic → it's now grinding the import cascade in the user/profile subsystem init
+> (frontier: `XamUserReadProfileSettings` → file VFS → GPU CP → renderer). **See `NIGHT-LOG.md`
+> "Session 2026-06-01 (continuation)" + "CURRENT FRONTIER" for the authoritative state + next-steps.**
+> Everything below is the earlier (deterministic-front + first-boot) phase.
 
 ## TL;DR
 The entire **deterministic front is done**: the XenonRecomp recompiler now handles **every** instruction
