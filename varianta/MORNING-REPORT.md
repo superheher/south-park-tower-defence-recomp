@@ -13,8 +13,14 @@ imports), and links-with-stubs into a 103 MB executable** (0 undefined symbols).
 4 GiB, loads the XEX, populates the 22,782-entry dispatch table, and the guest entry `0x824499A0`
 executes real code. Imports are implemented via a scalable harness (weak trap-stubs in
 `import_stubs.gen.cpp` overridden by strong impls in `runtime/kernel.cpp`); `NtAllocateVirtualMemory`
-+ `KeGetCurrentProcessType` are done and boot advances import-by-import (frontier:
-`RtlInitializeCriticalSection`). The remaining import cascade → video → renderer is the multi-week tail.
++ `KeGetCurrentProcessType` + the critical-section trio are done. The guest now executes into the
+**CRT startup (`_xstart`)** and reaches the CRT **heap initialization**, which fails on null-based
+pointers read from the (still-zeroed) guest **thread/process structures** — pinpointed via gdb
+backtraces (the KPCR/current-thread link is verified working). **The autonomous loop is paused here**:
+the deterministic front (TASK 1–4) is a complete committed milestone, and the remaining boot is the
+genuine multi-week tail — better advanced as focused systematic work (populate the X_KTHREAD/KPROCESS/
+default-heap environment → XEX TLS static init → the import cascade → video → renderer; full plan +
+"resume" instructions in `NIGHT-LOG.md` "PAUSE POINT"). Re-run `/loop …` to resume autonomously.
 
 ## What landed
 ### TASK 1 — instruction gap closed: 13,183 → 0  ✅

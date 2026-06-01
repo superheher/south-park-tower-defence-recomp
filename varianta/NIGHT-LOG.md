@@ -159,3 +159,33 @@ Prod `.so` `1a3f6076` untouched; rexglue-sdk untouched; superproject pointer not
   `[r31+316]`. **NEXT: populate the guest thread/process/default-heap environment** (X_KTHREAD +
   process object + process heap) so the CRT finds a valid heap base. Velocity low; full boot = the
   multi-week tail. Checkpoint.
+
+## PAUSE POINT — 2026-06-01 ~07:40 (autonomous loop paused for consolidation)
+gdb shows the boot reaches the CRT heap-init with MULTIPLE `RtlInitCS` calls (cs=0/0x618; one with
+`r30=0x100000` = the real NtAlloc heap, so partial heap setup DOES work) failing on null-based pointers
+read from the **zeroed thread/process structures**. The CRT control flow + stack-spilled locals do not
+trace cleanly statically, and per-iteration velocity on this archaeology is low. **Decision: pause the
+self-running loop here.** The deterministic front (doc TASK 1–4) is COMPLETE and committed; the runtime
+boot is the genuine multi-week tail, better advanced as focused systematic work than 20-min autonomous
+null-chasing.
+
+### What works (committed)
+Load+parse XEX → map 17 sections → 22,782-fn dispatch table → init PPCContext+stack+KPCR/KTHREAD → call
+`_xstart`; guest executes real code; imports resolve via weak-stub/`kernel.cpp` (NtAllocateVirtualMemory,
+KeGetCurrentProcessType, critical-section trio, HalReturnToFirmware). KPCR current-thread link verified.
+
+### Systematic next-steps (priority order; the multi-week tail)
+1. **Full guest thread/process env** — populate `X_KTHREAD` (process ptr, TLS, thread id, stack
+   base/limit), a `X_KPROCESS` object, and the **default process heap**, matching what the recompiled
+   CRT reads (ref: rexglue-sdk `X_KTHREAD`/`X_KPROCESS` + its thread-init in `system/xthread.cpp`).
+2. **XEX TLS-directory static init** (`KPCR.tls_ptr` currently → a zeroed block).
+3. **Early-boot import cascade** as it surfaces: `NtQueryVirtualMemory`, `NtFreeVirtualMemory`,
+   `RtlAllocateHeap`, … — behaviour 1:1 from `rexglue-sdk/src/`.
+4. Then threading → `Vd*` video → native renderer (Plume + 19 shaders).
+
+### Tooling that works
+gdb backtraces (recompiled fns are real host frames at `-O0`); `REX_KTRACE=1` import trace; the
+`varianta/runtime/` scaffold (`gen_import_stubs.py`, CMake links prebuilt `libXenonUtils`).
+
+**Resume:** re-run `/loop go done docs/NEXT-SESSION-VARIANTA-PROMPT.md`, or tackle the systematic steps
+interactively (recommended for the runtime).
