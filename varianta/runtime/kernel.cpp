@@ -606,16 +606,21 @@ const bool g_noSpawn = getenv("REX_NOSPAWN") != nullptr;  // diagnostic: create 
 // must NOT re-lock it, and WaitObject adopts the already-held lock.
 std::mutex g_waitMutex;
 std::condition_variable g_waitCv;
+// Cooperative token by default; REX_NOTOKEN=1 runs guest threads PREEMPTIVELY (relies on the title's
+// own critical sections/atomics for correctness — needed when a pure busy-wait would deadlock the token).
+const bool g_coop = (getenv("REX_NOTOKEN") == nullptr);
 
 void SignalObject(uint32_t obj, int32_t state) {
-    GST32(obj + 0x04, static_cast<uint32_t>(state));   // caller already holds the token
+    if (g_coop) { GST32(obj + 0x04, static_cast<uint32_t>(state)); }   // caller already holds the token
+    else { std::lock_guard<std::mutex> lk(g_waitMutex); GST32(obj + 0x04, static_cast<uint32_t>(state)); }
     g_waitCv.notify_all();
 }
 
 // timeout: <0 = infinite, 0 = poll, >0 = milliseconds. Returns 0 (success) or 0x102 (STATUS_TIMEOUT).
 // Releases the execution token while blocked (lets other guest threads run), re-holds it on resume.
 uint32_t WaitObject(uint32_t obj, int64_t timeoutMs) {
-    std::unique_lock<std::mutex> lk(g_waitMutex, std::adopt_lock);   // token already held by caller
+    std::unique_lock<std::mutex> lk = g_coop ? std::unique_lock<std::mutex>(g_waitMutex, std::adopt_lock)
+                                             : std::unique_lock<std::mutex>(g_waitMutex);
     auto signaled = [&]{ return static_cast<int32_t>(GLD32(obj + 0x04)) > 0; };
     bool ok = true;
     if (timeoutMs < 0) g_waitCv.wait(lk, signaled);
@@ -625,7 +630,7 @@ uint32_t WaitObject(uint32_t obj, int64_t timeoutMs) {
         if (type == 1 || type == 2 || type == 5)
             GST32(obj + 0x04, static_cast<uint32_t>(static_cast<int32_t>(GLD32(obj + 0x04)) - 1));
     }
-    lk.release();                                 // keep the token held as we resume running
+    if (g_coop) lk.release();                      // coop: keep the token held as we resume running
     return ok ? 0 : 0x00000102u;
 }
 
@@ -657,8 +662,9 @@ void GuestThreadRun(ThreadRec* rec) {
 
 namespace kernel {
 // The cooperative execution token (see kernel.h). g_waitMutex is held by the running guest thread.
-void LockGuestExecution()   { g_waitMutex.lock(); }
-void UnlockGuestExecution() { g_waitMutex.unlock(); }
+// No-ops under REX_NOTOKEN (preemptive mode).
+void LockGuestExecution()   { if (g_coop) g_waitMutex.lock(); }
+void UnlockGuestExecution() { if (g_coop) g_waitMutex.unlock(); }
 } // namespace kernel
 
 // NTSTATUS ExCreateThread(*handle r3, stack r4, *tid r5, xapi r6, start r7, ctx r8, flags r9)
@@ -751,7 +757,7 @@ void VblankPump() {
         // Fire the guest graphics interrupt callback (source = 0 vblank) on the pump's own context,
         // holding the cooperative execution token (it runs guest code). Per rexglue, the TLS ptr must
         // read 0 during interrupts (some titles check it).
-        g_waitMutex.lock();
+        if (g_coop) g_waitMutex.lock();
         PPCContext ctx{};
         ctx.r1.u64 = g_pumpStack - 0x200;
         ctx.r13.u64 = g_pumpKpcr;
@@ -761,7 +767,7 @@ void VblankPump() {
         GST32(g_pumpKpcr + 0x00, 0);
         CallGuest(cb, ctx);
         GST32(g_pumpKpcr + 0x00, savedTls);
-        g_waitMutex.unlock();
+        if (g_coop) g_waitMutex.unlock();
     }
 }
 
@@ -1090,7 +1096,8 @@ PPC_FUNC(__imp__KeWaitForMultipleObjects)
 {
     uint32_t count = ctx.r3.u32, objects = ctx.r4.u32, waitType = ctx.r5.u32; // 0=WaitAll, 1=WaitAny
     int64_t timeoutMs = TimeoutMs(ctx.r9.u32);
-    std::unique_lock<std::mutex> lk(g_waitMutex, std::adopt_lock);   // token already held by caller
+    std::unique_lock<std::mutex> lk = g_coop ? std::unique_lock<std::mutex>(g_waitMutex, std::adopt_lock)
+                                             : std::unique_lock<std::mutex>(g_waitMutex);
     auto firstReady = [&]() -> int {
         if (waitType == 1) {                       // WaitAny -> index of first signaled, else -1
             for (uint32_t i = 0; i < count; i++) {
@@ -1109,13 +1116,13 @@ PPC_FUNC(__imp__KeWaitForMultipleObjects)
     bool ok = true;
     if (timeoutMs < 0) g_waitCv.wait(lk, pred);
     else ok = g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), pred);
-    if (!ok) { lk.release(); ctx.r3.u64 = 0x102; return; }   // keep the token; report STATUS_TIMEOUT
+    if (!ok) { if (g_coop) lk.release(); ctx.r3.u64 = 0x102; return; }   // STATUS_TIMEOUT
     int idx = firstReady();
     // Consume auto-reset/semaphore/mutant objects we're satisfied on.
     auto consume = [&](uint32_t o){ uint8_t t = g_base[o + 0x00];
         if (t == 1 || t == 2 || t == 5) GST32(o + 0x04, static_cast<int32_t>(GLD32(o + 0x04)) - 1); };
     if (waitType == 1) consume(GLD32(objects + idx * 4));
     else for (uint32_t i = 0; i < count; i++) consume(GLD32(objects + i * 4));
-    lk.release();                                            // keep the token held as we resume
+    if (g_coop) lk.release();                                // coop: keep the token held as we resume
     ctx.r3.u64 = (waitType == 1) ? static_cast<uint32_t>(idx) : 0;   // WAIT_OBJECT_0 + idx
 }
