@@ -1248,3 +1248,29 @@ PPC_FUNC(__imp__KeEnterCriticalRegion)           { /* APC-disable: no-op (no APC
 PPC_FUNC(__imp__KeLeaveCriticalRegion)           { /* no-op */ }
 PPC_FUNC(__imp__KeRaiseIrqlToDpcLevel)           { ctx.r3.u64 = 0; }   // old IRQL
 PPC_FUNC(__imp__KfLowerIrql)                     { /* no-op */ }
+
+// NTSTATUS KeDelayExecutionThread(mode r3, alertable r4, *interval r5) — sleep/yield. THE yield point:
+// release the execution token so other guest threads run (breaks busy-wait token-starvation), then
+// re-acquire. interval: <0 = relative 100ns, 0 = yield, >0 = absolute (treat as short).
+PPC_FUNC(__imp__KeDelayExecutionThread)
+{
+    int64_t t = ctx.r5.u32 ? static_cast<int64_t>(GLD64(ctx.r5.u32)) : 0;
+    int64_t ms = (t < 0) ? (-t) / 10000 : (t == 0 ? 0 : 1);
+    if (ms > 25) ms = 25;                                 // cap so a long guest delay can't stall boot
+    kernel::UnlockGuestExecution();                       // yield the token (no-op under REX_NOTOKEN)
+    if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    else        std::this_thread::yield();
+    kernel::LockGuestExecution();                         // re-acquire (blocks until another yields)
+    ctx.r3.u64 = 0;
+}
+// NTSTATUS NtDelayExecution(alertable r3, *interval r4) — same, args shifted.
+PPC_FUNC(__imp__NtDelayExecution)
+{
+    int64_t t = ctx.r4.u32 ? static_cast<int64_t>(GLD64(ctx.r4.u32)) : 0;
+    int64_t ms = (t < 0) ? (-t) / 10000 : (t == 0 ? 0 : 1);
+    if (ms > 25) ms = 25;
+    kernel::UnlockGuestExecution();
+    if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms)); else std::this_thread::yield();
+    kernel::LockGuestExecution();
+    ctx.r3.u64 = 0;
+}
