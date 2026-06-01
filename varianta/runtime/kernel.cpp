@@ -10,7 +10,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <utility>
+#include <mutex>
+#include <atomic>
+#include <thread>
+#include <chrono>
 
 // Lightweight import trace (set REX_KTRACE=0 to silence).
 static const bool g_ktrace = []{ const char* e = getenv("REX_KTRACE"); return !e || e[0] != '0'; }();
@@ -35,6 +40,7 @@ constexpr uint32_t kStatusMemoryNotAllocated = 0xC00000A0u;
 struct VRegion { uint32_t size; bool reserved; bool committed; uint32_t protect; };
 std::map<uint32_t, VRegion> g_regions;   // base -> region (kept non-overlapping)
 uint32_t g_virtNext = 0x40000000;        // bump cursor for kernel-chosen bases (user virtual range)
+std::mutex g_memMutex;                    // guards g_regions / g_virtNext (multiple guest threads alloc)
 
 inline uint32_t RoundUp(uint32_t v, uint32_t a) { return (v + (a - 1)) & ~(a - 1); }
 
@@ -52,6 +58,7 @@ std::pair<uint32_t, VRegion*> FindRegion(uint32_t addr)
 // NTSTATUS NtAllocateVirtualMemory(*BaseAddress r3, *RegionSize r4, AllocType r5, Protect r6, Debug r7)
 PPC_FUNC(__imp__NtAllocateVirtualMemory)
 {
+    std::lock_guard<std::mutex> lk(g_memMutex);
     uint32_t pBase = ctx.r3.u32, pSize = ctx.r4.u32;
     uint32_t allocType = ctx.r5.u32, protect = ctx.r6.u32;
     if (!pBase || !pSize) { ctx.r3.u64 = kStatusInvalidParameter; return; }
@@ -96,6 +103,7 @@ PPC_FUNC(__imp__NtAllocateVirtualMemory)
 // NTSTATUS NtQueryVirtualMemory(BaseAddress r3, *MEMORY_BASIC_INFORMATION r4, RegionType r5)
 PPC_FUNC(__imp__NtQueryVirtualMemory)
 {
+    std::lock_guard<std::mutex> lk(g_memMutex);
     uint32_t addr = ctx.r3.u32, pMbi = ctx.r4.u32;
     auto [rb, r] = FindRegion(addr);
     if (!r) {
@@ -118,6 +126,7 @@ PPC_FUNC(__imp__NtQueryVirtualMemory)
 // NTSTATUS NtFreeVirtualMemory(*BaseAddress r3, *RegionSize r4, FreeType r5, Debug r6)
 PPC_FUNC(__imp__NtFreeVirtualMemory)
 {
+    std::lock_guard<std::mutex> lk(g_memMutex);
     uint32_t pBase = ctx.r3.u32, pSize = ctx.r4.u32, freeType = ctx.r5.u32;
     if (!pBase) { ctx.r3.u64 = kStatusMemoryNotAllocated; return; }
     uint32_t gbase = PPC_LOAD_U32(pBase);
@@ -179,20 +188,26 @@ PPC_FUNC(__imp__RtlInitializeCriticalSectionAndSpinCount)
     ctx.r3.u64 = 0; // STATUS_SUCCESS
 }
 
-PPC_FUNC(__imp__RtlEnterCriticalSection)
-{
-    // single-thread: no contention, nothing to do.
+// Real per-CS host locks (now that ExCreateThread spawns concurrent guest threads). Keyed by the
+// guest CS address; recursive to match Win32 critical-section re-entry semantics.
+namespace {
+std::mutex g_csMapMutex;
+std::unordered_map<uint32_t, std::recursive_mutex*> g_csLocks;
+std::recursive_mutex* CsLock(uint32_t cs) {
+    std::lock_guard<std::mutex> lk(g_csMapMutex);
+    auto& p = g_csLocks[cs];
+    if (!p) p = new std::recursive_mutex();
+    return p;
 }
+} // namespace
 
-PPC_FUNC(__imp__RtlLeaveCriticalSection)
-{
-    // single-thread: no-op.
-}
+PPC_FUNC(__imp__RtlEnterCriticalSection) { CsLock(ctx.r3.u32)->lock(); }
+PPC_FUNC(__imp__RtlLeaveCriticalSection) { CsLock(ctx.r3.u32)->unlock(); }
 
-// BOOLEAN RtlTryEnterCriticalSection(cs) -> always acquires (single-thread)
+// BOOLEAN RtlTryEnterCriticalSection(cs)
 PPC_FUNC(__imp__RtlTryEnterCriticalSection)
 {
-    ctx.r3.u64 = 1;
+    ctx.r3.u64 = CsLock(ctx.r3.u32)->try_lock() ? 1 : 0;
 }
 
 // ====================================================================================================
@@ -218,12 +233,55 @@ inline void GST16(uint32_t a, uint16_t v) { uint16_t b = __builtin_bswap16(v); m
 inline void GST32(uint32_t a, uint32_t v) { uint32_t b = __builtin_bswap32(v); memcpy(g_base + a, &b, 4); }
 inline void GST64(uint32_t a, uint64_t v) { uint64_t b = __builtin_bswap64(v); memcpy(g_base + a, &b, 8); }
 inline uint32_t GLD32(uint32_t a) { uint32_t b; memcpy(&b, g_base + a, 4); return __builtin_bswap32(b); }
+inline uint16_t GLD16(uint32_t a) { uint16_t b; memcpy(&b, g_base + a, 2); return __builtin_bswap16(b); }
 
 // Read a XEX optional header that stores its value INLINE (key low byte 0) as a BE u32.
 uint32_t XexOptU32(const uint8_t* xex, uint32_t key, uint32_t fallback) {
     const void* p = getOptHeaderPtr(xex, key);
     if (!p) return fallback;
     uint32_t b; memcpy(&b, p, 4); return __builtin_bswap32(b);
+}
+
+// Fill an X_KTHREAD (XThread::InitializeGuestObject) and tail-link it into the process thread list.
+void FillKThread(uint32_t T, uint32_t kpcr, uint32_t P, uint32_t stackBase, uint32_t stackLimit,
+                 uint32_t tlsDynamic, uint32_t threadId, uint32_t startAddr) {
+    memset(g_base + T, 0, 0xAB0);
+    GST8 (T + 0x00, 6);                                      // header.type = ThreadObject
+    GST32(T + 0x10, T + 0x10); GST32(T + 0x14, T + 0x10);
+    GST32(T + 0x40, T + 0x20); GST32(T + 0x44, T + 0x20);   // wait_timeout_block.list_entry
+    GST32(T + 0x48, T);        GST32(T + 0x4C, T + 0x18);
+    GST16(T + 0x54, 0x0100);   GST16(T + 0x56, 0x0201);
+    GST32(T + 0x5C, stackBase); GST32(T + 0x60, stackLimit); GST32(T + 0x64, stackBase - 240);
+    GST32(T + 0x68, tlsDynamic);                             // tls_address (dynamic TLS base)
+    GST8 (T + 0x6C, 2);                                      // thread_state = RUNNING
+    GST32(T + 0x74, T + 0x74); GST32(T + 0x78, T + 0x74);   // apc_lists[0]
+    GST32(T + 0x7C, T + 0x7C); GST32(T + 0x80, T + 0x7C);   // apc_lists[1]
+    GST8 (T + 0x72, kProctypeUser); GST8(T + 0x73, kProctypeUser);
+    GST32(T + 0x84, P);                                      // process
+    GST8 (T + 0x8B, 1);                                      // may_queue_apcs
+    GST32(T + 0x9C, 0xFDFFD7FFu);                            // msr_mask
+    GST32(T + 0xC0, kpcr + 0x100); GST32(T + 0xC4, kpcr + 0x100);
+    GST32(T + 0xD0, stackBase);                              // stack_alloc_base
+    GST32(T + 0x144, T + 0x144); GST32(T + 0x148, T + 0x144); // timer_list
+    GST32(T + 0x14C, threadId);
+    GST32(T + 0x150, startAddr);
+    GST32(T + 0x154, T + 0x154); GST32(T + 0x158, T + 0x154);
+    GST32(T + 0x17C, 1);
+    // XeInsertTailList(head = P+0x04, entry = T+0x110): correct for empty(self-ref) or populated list.
+    uint32_t head = P + 0x04, oldBlink = GLD32(head + 4);
+    GST32(T + 0x110, head); GST32(T + 0x114, oldBlink);
+    GST32(oldBlink + 0, T + 0x110); GST32(head + 4, T + 0x110);
+    GST32(P + 0x14, GLD32(P + 0x14) + 1);                    // thread_count++
+}
+
+void FillKPcr(uint32_t K, uint32_t tlsPtr, uint32_t T, uint32_t stackBase, uint32_t stackLimit) {
+    memset(g_base + K, 0, 0x2D8);
+    GST32(K + 0x00, tlsPtr);              // tls_ptr (this is *(r13))
+    GST8 (K + 0x18, 0);                   // current_irql = PASSIVE
+    GST64(K + 0x30, K);                   // pcr_ptr
+    GST32(K + 0x70, stackBase); GST32(K + 0x74, stackLimit);
+    GST32(K + 0x100, T);                  // prcb_data.current_thread
+    GST32(K + 0x2A8, K + 0x100);          // prcb -> &prcb_data
 }
 } // namespace
 
@@ -282,51 +340,11 @@ uint32_t SetupEnvironment(const uint8_t* xexFile, uint32_t stackBase, uint32_t s
         GST32(P + 0x30 + i * 4, v);
     }
 
-    // ---- X_KTHREAD (main thread) — InitializeGuestObject --------------------------------------------
-    const uint32_t T = kThreadAddr;
-    memset(g_base + T, 0, 0xAB0);
-    GST8 (T + 0x00, 6);                                      // header.type = ThreadObject
-    GST32(T + 0x10, T + 0x10); GST32(T + 0x14, T + 0x10);   // self-ref ptrs
-    GST32(T + 0x40, T + 0x20); GST32(T + 0x44, T + 0x20);   // wait_timeout_block.list_entry
-    GST32(T + 0x48, T);        GST32(T + 0x4C, T + 0x18);   // .thread, .object
-    GST16(T + 0x54, 0x0100);   GST16(T + 0x56, 0x0201);     // .wait_result_xstatus, .wait_type
-    GST32(T + 0x5C, stackBase);                              // stack_base (high)
-    GST32(T + 0x60, stackLimit);                             // stack_limit (low)
-    GST32(T + 0x64, stackBase - 240);                        // stack_kernel
-    GST32(T + 0x68, tlsDynamic);                             // tls_address (dynamic TLS base)
-    GST8 (T + 0x6C, 2);                                      // thread_state = RUNNING
-    GST32(T + 0x74, T + 0x74); GST32(T + 0x78, T + 0x74);   // apc_lists[0]: self-ref
-    GST32(T + 0x7C, T + 0x7C); GST32(T + 0x80, T + 0x7C);   // apc_lists[1]: self-ref
-    GST8 (T + 0x72, kProctypeUser); GST8(T + 0x73, kProctypeUser); // process_type(_dup)
-    GST32(T + 0x84, P);                                      // process
-    GST8 (T + 0x8B, 1);                                      // may_queue_apcs
-    GST32(T + 0x9C, 0xFDFFD7FFu);                            // msr_mask
-    GST32(T + 0xC0, kKpcrAddr + 0x100); GST32(T + 0xC4, kKpcrAddr + 0x100); // a/another_prcb_ptr
-    GST32(T + 0xD0, stackBase);                              // stack_alloc_base
-    GST32(T + 0x110, T + 0x110); GST32(T + 0x114, T + 0x110); // process_threads (relinked below)
-    GST32(T + 0x144, T + 0x144); GST32(T + 0x148, T + 0x144); // timer_list: self-ref
-    GST32(T + 0x14C, 1);                                     // thread_id (main = 1)
-    GST32(T + 0x150, startAddress);                          // start_address
-    GST32(T + 0x154, T + 0x154); GST32(T + 0x158, T + 0x154); // unk_154: self-ref
-    GST32(T + 0x17C, 1);                                     // unk_17C
-
-    // Link the main thread into the process thread list (XeInsertTailList: list was self-ref).
-    GST32(T + 0x110, P + 0x04);   // entry->flink = head
-    GST32(T + 0x114, P + 0x04);   // entry->blink = head (head->blink was head itself)
-    GST32(P + 0x04, T + 0x110);   // head->flink = entry
-    GST32(P + 0x08, T + 0x110);   // head->blink = entry
-    GST32(P + 0x14, 1);           // thread_count = 1
-
-    // ---- X_KPCR -------------------------------------------------------------------------------------
-    const uint32_t K = kKpcrAddr;
-    memset(g_base + K, 0, 0x2D8);
-    GST32(K + 0x00, kTlsAddr);            // tls_ptr (static TLS / block start; this is *(r13))
-    GST8 (K + 0x18, 0);                   // current_irql = PASSIVE
-    GST64(K + 0x30, K);                   // pcr_ptr
-    GST32(K + 0x70, stackBase);           // stack_base_ptr
-    GST32(K + 0x74, stackLimit);          // stack_end_ptr
-    GST32(K + 0x100, T);                  // prcb_data.current_thread
-    GST32(K + 0x2A8, K + 0x100);          // prcb -> &prcb_data
+    // ---- main-thread X_KTHREAD + X_KPCR (shared fill helpers; also used by CreateGuestThreadContext)
+    const uint32_t T = kThreadAddr, K = kKpcrAddr;
+    g_processAddr = P;   // FillKThread links into the process; set this first
+    FillKThread(T, K, P, stackBase, stackLimit, tlsDynamic, /*threadId=*/1, startAddress);
+    FillKPcr(K, kTlsAddr, T, stackBase, stackLimit);
 
     g_kpcrAddr = K; g_mainThreadAddr = T; g_processAddr = P;
     fprintf(stderr, "[env] KPROCESS=0x%X KTHREAD=0x%X KPCR=0x%X TLS=0x%X (slots=%u dataSize=0x%X "
@@ -487,3 +505,227 @@ PPC_FUNC(__imp__RtlInitAnsiString)
     PPC_STORE_U16(dst + 0x02, src ? static_cast<uint16_t>(len + 1) : 0);
     PPC_STORE_U32(dst + 0x04, src);
 }
+
+// ====================================================================================================
+// Threading + GPU/vblank pump (goal steps: import cascade -> video).
+// ExCreateThread spawns a host std::thread that runs the guest start routine on its own
+// X_KTHREAD/X_KPCR/TLS/stack. A vblank pump thread fires the guest graphics interrupt callback at
+// ~60 Hz so the main thread's GPU ring-buffer/vblank spin (sub_821B9270) makes progress.
+// Reference: rexglue-sdk XThread::{Create,Execute} + GraphicsSystem::{MarkVblank,DispatchInterruptCallback}.
+// ====================================================================================================
+namespace {
+
+// Resolve a guest code address to its recompiled host fn via the in-memory dispatch table (the same
+// layout runtime.cpp populates: base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE + (addr - PPC_CODE_BASE)*2).
+PPCFunc* DispatchLookup(uint32_t addr) {
+    return *reinterpret_cast<PPCFunc**>(g_base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE
+        + (uint64_t(addr - PPC_CODE_BASE) * 2));
+}
+void CallGuest(uint32_t addr, PPCContext& ctx) {
+    if (PPCFunc* fn = DispatchLookup(addr)) fn(ctx, g_base);
+    else fprintf(stderr, "[thread] CallGuest: no host fn at 0x%X\n", addr);
+}
+
+// Per-thread arena (KTHREAD+KPCR+TLS) above the main thread; worker stacks above the main stack.
+std::mutex g_threadMutex;
+uint32_t g_threadArenaNext = 0x60010000;
+uint32_t g_threadStackNext = 0x70200000;
+
+// Allocate + fill a new guest thread context (KTHREAD/KPCR/TLS/stack). Returns the KPCR address.
+uint32_t CreateGuestThreadContext(uint32_t stackSize, uint32_t startAddr, uint32_t threadId,
+                                  uint32_t* outThreadAddr, uint32_t* outStackTop) {
+    std::lock_guard<std::mutex> lk(g_threadMutex);
+    uint32_t P = kernel::g_processAddr;
+    uint32_t tlsSlotSize = GLD16(P + 0x2C);
+    uint32_t tlsDataSize = GLD32(P + 0x24);
+    uint32_t tlsRawAddr  = GLD32(P + 0x20);
+    uint32_t tlsRawSize  = GLD32(P + 0x28);
+    uint32_t tlsTotal = tlsSlotSize + tlsDataSize;
+
+    auto bump = [&](uint32_t n){ uint32_t a = g_threadArenaNext;
+                                 g_threadArenaNext = (a + n + 0xFFFu) & ~0xFFFu; return a; };
+    uint32_t T   = bump(0xB00);
+    uint32_t K   = bump(0x300);
+    uint32_t tls = bump(tlsTotal ? tlsTotal : 0x1000);
+
+    if (stackSize == 0) stackSize = 0x40000;            // 256 KiB default
+    stackSize = (stackSize + 0xFFFFu) & ~0xFFFFu;
+    uint32_t stackLimit = g_threadStackNext;
+    uint32_t stackBase  = stackLimit + stackSize;       // high address (stack grows down)
+    g_threadStackNext   = stackBase + 0x10000;          // + guard gap
+
+    memset(g_base + tls, 0, tlsTotal ? tlsTotal : 0x1000);
+    if (tlsDataSize && tlsRawAddr && tlsRawSize) memcpy(g_base + tls, g_base + tlsRawAddr, tlsRawSize);
+    uint32_t tlsDynamic = tls + tlsDataSize;
+
+    FillKThread(T, K, P, stackBase, stackLimit, tlsDynamic, threadId, startAddr);
+    FillKPcr(K, tls, T, stackBase, stackLimit);
+    if (outThreadAddr) *outThreadAddr = T;
+    if (outStackTop) *outStackTop = stackBase;
+    return K;
+}
+
+// ---- guest thread objects + handle table ----------------------------------------------------------
+struct ThreadRec {
+    uint32_t kpcr = 0, threadAddr = 0, stackTop = 0;
+    uint32_t startAddr = 0, startContext = 0, xapiStartup = 0;
+    std::thread th;
+    std::atomic<bool> started{false};
+};
+std::mutex g_handleMutex;
+std::unordered_map<uint32_t, ThreadRec*> g_handles;
+uint32_t g_nextHandle = 0xF1000000;          // private handle space (avoids 0xFFFFFFxx pseudo-handles)
+std::atomic<uint32_t> g_nextThreadId{2};     // main thread is id 1
+
+void GuestThreadRun(ThreadRec* rec) {
+    PPCContext ctx{};
+    ctx.r1.u64 = rec->stackTop - 0x200;
+    ctx.r13.u64 = rec->kpcr;
+    if (rec->xapiStartup) {                  // XAPI trampoline: startup(start_address, start_context)
+        ctx.r3.u64 = rec->startAddr;
+        ctx.r4.u64 = rec->startContext;
+        CallGuest(rec->xapiStartup, ctx);
+    } else {                                 // raw thread: start_address(start_context)
+        ctx.r3.u64 = rec->startContext;
+        CallGuest(rec->startAddr, ctx);
+    }
+}
+} // namespace
+
+// NTSTATUS ExCreateThread(*handle r3, stack r4, *tid r5, xapi r6, start r7, ctx r8, flags r9)
+PPC_FUNC(__imp__ExCreateThread)
+{
+    uint32_t pHandle = ctx.r3.u32, stackSize = ctx.r4.u32, pThreadId = ctx.r5.u32;
+    uint32_t xapi = ctx.r6.u32, startAddr = ctx.r7.u32, startCtx = ctx.r8.u32, flags = ctx.r9.u32;
+    uint32_t tid = g_nextThreadId.fetch_add(1);
+    auto* rec = new ThreadRec{};
+    rec->startAddr = startAddr; rec->startContext = startCtx; rec->xapiStartup = xapi;
+    rec->kpcr = CreateGuestThreadContext(stackSize, startAddr, tid, &rec->threadAddr, &rec->stackTop);
+    uint32_t handle;
+    {
+        std::lock_guard<std::mutex> lk(g_handleMutex);
+        handle = g_nextHandle++;
+        g_handles[handle] = rec;
+    }
+    if (pHandle) PPC_STORE_U32(pHandle, handle);
+    if (pThreadId) PPC_STORE_U32(pThreadId, tid);
+    bool suspended = (flags & 1) != 0;       // X_CREATE_SUSPENDED
+    if (!suspended) { rec->started = true; rec->th = std::thread(GuestThreadRun, rec); rec->th.detach(); }
+    KTRACE("ExCreateThread(start=0x%X ctx=0x%X xapi=0x%X flags=0x%X) -> handle=0x%X tid=%u%s\n",
+        startAddr, startCtx, xapi, flags, handle, tid, suspended ? " (suspended)" : "");
+    ctx.r3.u64 = 0;  // STATUS_SUCCESS
+}
+
+// NTSTATUS NtResumeThread(handle r3, *suspend_count r4)
+PPC_FUNC(__imp__NtResumeThread)
+{
+    uint32_t handle = ctx.r3.u32, pCount = ctx.r4.u32;
+    ThreadRec* rec = nullptr;
+    { std::lock_guard<std::mutex> lk(g_handleMutex); auto it = g_handles.find(handle);
+      if (it != g_handles.end()) rec = it->second; }
+    if (pCount) PPC_STORE_U32(pCount, 1);
+    if (rec && !rec->started.exchange(true)) {
+        rec->th = std::thread(GuestThreadRun, rec); rec->th.detach();
+        KTRACE("NtResumeThread(0x%X) -> started\n", handle);
+    }
+    ctx.r3.u64 = 0;
+}
+
+// NTSTATUS ObReferenceObjectByHandle(handle r3, type r4, *out_object r5) -> guest object ptr (KTHREAD)
+PPC_FUNC(__imp__ObReferenceObjectByHandle)
+{
+    uint32_t handle = ctx.r3.u32, pOut = ctx.r5.u32, obj = 0;
+    if (handle == 0xFFFFFFFE) {                          // NtCurrentThread pseudo-handle
+        obj = PPC_LOAD_U32(ctx.r13.u32 + 0x100);
+    } else {
+        std::lock_guard<std::mutex> lk(g_handleMutex);
+        auto it = g_handles.find(handle);
+        if (it != g_handles.end()) obj = it->second->threadAddr;
+    }
+    if (pOut) PPC_STORE_U32(pOut, obj);
+    ctx.r3.u64 = obj ? 0 : 0xC0000008u;  // STATUS_INVALID_HANDLE
+}
+
+PPC_FUNC(__imp__ObDereferenceObject) { ctx.r3.u64 = 0; }
+
+// LONG KeSetAffinityThread(thread, affinity, *prev) — no-op (host scheduler), report prev=0.
+PPC_FUNC(__imp__KeSetAffinityThread) { if (ctx.r5.u32) PPC_STORE_U32(ctx.r5.u32, 0); ctx.r3.u64 = 0; }
+
+PPC_FUNC(__imp__ExRegisterTitleTerminateNotification) { /* no-op */ }
+
+// void KeInitializeDpc(dpc r3, routine r4, context r5)
+PPC_FUNC(__imp__KeInitializeDpc)
+{
+    uint32_t dpc = ctx.r3.u32;
+    if (!dpc) return;
+    PPC_STORE_U16(dpc + 0x00, 19);          // type
+    PPC_STORE_U8 (dpc + 0x02, 0);
+    PPC_STORE_U8 (dpc + 0x03, 0);
+    PPC_STORE_U32(dpc + 0x10, ctx.r4.u32);  // routine
+    PPC_STORE_U32(dpc + 0x14, ctx.r5.u32);  // context
+}
+
+// ---- GPU / vblank pump (goal step: video) ----------------------------------------------------------
+namespace {
+uint32_t g_ringBufferBase = 0, g_ringBufferSize = 0, g_rptrWriteBack = 0;
+uint32_t g_interruptCallback = 0, g_interruptData = 0;
+std::atomic<bool> g_vblankRunning{false};
+uint32_t g_pumpKpcr = 0, g_pumpStack = 0;
+std::atomic<uint32_t> g_vblankCount{0};
+
+void VblankPump() {
+    while (g_vblankRunning.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));   // ~60 Hz
+        g_vblankCount.fetch_add(1);
+        uint32_t cb = g_interruptCallback;
+        if (!cb) continue;
+        // Fire the guest graphics interrupt callback (source = 0 vblank) on the pump's own context.
+        // Per rexglue, the TLS ptr must read 0 during interrupts (some titles check it).
+        PPCContext ctx{};
+        ctx.r1.u64 = g_pumpStack - 0x200;
+        ctx.r13.u64 = g_pumpKpcr;
+        ctx.r3.u64 = 0;                  // source = vblank
+        ctx.r4.u64 = g_interruptData;
+        uint32_t savedTls = GLD32(g_pumpKpcr + 0x00);
+        GST32(g_pumpKpcr + 0x00, 0);
+        CallGuest(cb, ctx);
+        GST32(g_pumpKpcr + 0x00, savedTls);
+    }
+}
+
+void StartVblankPump() {
+    if (g_vblankRunning.exchange(true)) return;
+    uint32_t t = 0;
+    g_pumpKpcr = CreateGuestThreadContext(0x20000, 0, /*threadId=*/99, &t, &g_pumpStack);
+    std::thread(VblankPump).detach();
+    fprintf(stderr, "[video] vblank pump started (kpcr=0x%X)\n", g_pumpKpcr);
+}
+} // namespace
+
+// void VdInitializeRingBuffer(ptr r3, size_log2 r4)
+PPC_FUNC(__imp__VdInitializeRingBuffer)
+{
+    g_ringBufferBase = ctx.r3.u32;
+    g_ringBufferSize = 1u << (ctx.r4.u32 & 0x1F);
+    KTRACE("VdInitializeRingBuffer(base=0x%X size=0x%X)\n", g_ringBufferBase, g_ringBufferSize);
+}
+
+// void VdEnableRingBufferRPtrWriteBack(ptr r3, block_log2 r4)
+PPC_FUNC(__imp__VdEnableRingBufferRPtrWriteBack)
+{
+    g_rptrWriteBack = ctx.r3.u32;
+    KTRACE("VdEnableRingBufferRPtrWriteBack(ptr=0x%X)\n", g_rptrWriteBack);
+    StartVblankPump();   // GPU sync is now live — start firing vblank interrupts.
+}
+
+// void VdSetGraphicsInterruptCallback(callback r3, user_data r4)
+PPC_FUNC(__imp__VdSetGraphicsInterruptCallback)
+{
+    g_interruptCallback = ctx.r3.u32;
+    g_interruptData = ctx.r4.u32;
+    KTRACE("VdSetGraphicsInterruptCallback(cb=0x%X data=0x%X)\n", g_interruptCallback, g_interruptData);
+}
+
+// DWORD VdInitializeEngines(...) -> 1 (success); the system command buffer id address is a no-op.
+PPC_FUNC(__imp__VdInitializeEngines) { ctx.r3.u64 = 1; }
+PPC_FUNC(__imp__VdSetSystemCommandBufferGpuIdentifierAddress) { /* no-op */ }

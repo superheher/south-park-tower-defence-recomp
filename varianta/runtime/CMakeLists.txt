@@ -30,7 +30,9 @@ target_compile_options(sp_td_varianta PRIVATE -O0 -w -fno-strict-aliasing)
 # Link the prebuilt XenonUtils (XEX parse/decrypt/decompress; AES+LZX compiled in) + its deps.
 # These come from the XenonRecomp build tree; (re)build them with: cmake --build ${XR}/out/build.
 set(XR_BUILD "${XR}/out/build")
+find_package(Threads REQUIRED)   # std::thread (ExCreateThread / vblank pump)
 target_link_libraries(sp_td_varianta PRIVATE
     "${XR_BUILD}/XenonUtils/libXenonUtils.a"
     "${XR_BUILD}/thirdparty/disasm/libdisasm.a"
-    "${XR_BUILD}/thirdparty/fmt/libfmt.a")
+    "${XR_BUILD}/thirdparty/fmt/libfmt.a"
+    Threads::Threads)
