@@ -811,7 +811,11 @@ void VblankPump() {
         if (!cb) continue;
         // Fire the guest graphics interrupt callback (source = 0 vblank) on the pump's own context,
         // holding the cooperative execution token (it runs guest code). Per rexglue, the TLS ptr must
-        // read 0 during interrupts (some titles check it).
+        // read 0 during interrupts (some titles check it). NOTE: the title's cb (sub_821C7170) branches
+        // on source==1 for command-buffer completion, but firing that here without first ADVANCING RPtr
+        // (real CP consumption of the ring buffer @g_ringBufferBase up to the title's WPtr) is a spurious
+        // completion the handler correctly ignores — so the render-wait (event 0x36E70) only releases
+        // once a real command processor advances RPtr. That CP is the remaining GPU-engine work.
         if (g_coop) g_waitMutex.lock();
         PPCContext ctx{};
         ctx.fpscr.csr = 0x1F80;          // default MXCSR: all FP exceptions masked
