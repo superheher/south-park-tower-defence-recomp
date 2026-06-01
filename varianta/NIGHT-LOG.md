@@ -413,3 +413,33 @@ divergence in `sub_821E07A0` (~10k) is likely the same family.
 Method that worked well for this archaeology: `gdb -batch`, `break ppc_recomp.N.cpp:LINE`, inspect
 `ctx.rN.u32` / `base` (the `-O0` host frames + file:line map cleanly; finish/return-value reads are
 flaky inside `commands` blocks — break at the post-call line instead).
+
+### Rule-outs + reframe (the XUI divergence is an earlier systemic root, needs bisection)
+A watchpoint on the XUI object's `+8` field (guest `0xd8a78`) shows that memory is **reused** across
+objects: written `0xf80f70` (valid heap) by the ctor `sub_82244200`, then `0xf87300`, then `0x65007300`
+(UTF-16 "e\0s\0" — string data) by `sub_824294B0`. So the failing validation reads a `+8` that belongs
+to a *recycled* allocation — an object-lifetime/ordering divergence, downstream of an earlier root rather
+than a local bug at `sub_82244378`.
+
+Hypotheses eliminated:
+- **Instruction gap** — full regen: zero "Unrecognized instruction"; only `vcmpgtuh.` (VMX CR-record),
+  irrelevant to this scalar path.
+- **`XamLoaderLaunchTitle`** — called with a NULL path (relaunch-self), BUT the reference build
+  (`third_party/rexglue-sdk`, which renders this title fully) **also stubs it** (`REX_EXPORT_STUB` in
+  `xam_misc.cpp`). So a no-op return is correct; not the divergence.
+- **vtable / function-pointer resolution** — the failing virtual call resolved to the correct guest
+  function (`sub_82469FD0`, a real getter). Dispatch is fine.
+
+⇒ The remaining cause class is a **runtime-HLE import returning different data than rexglue-sdk**, or a
+*handled-but-subtly-wrong* instruction, corrupting object data early (same family as the `sub_821E07A0`
+count divergence). Localizing it efficiently wants a **guest-level reference comparison**: both variant A
+and rexglue-sdk execute the *same* guest code at the *same* guest addresses, so capturing guest
+memory/registers at a shared guest PC (e.g. entry of `sub_82244378` or `sub_821E07A0`) in both builds and
+diffing pinpoints the first divergence — far cheaper than descending each crash by hand. (rexglue-sdk is a
+different *recomp* so host addresses differ, but guest state should match a correct emulation.) Do NOT
+modify the prod `.so`; trace read-only.
+
+Net for the session: boot advanced 127 → ~10,500 trace-lines across video init + UI load; the blocking
+crash is precisely localized and three root hypotheses eliminated. Reaching a rendered frame still
+requires resolving the init divergence (above) AND then building the GPU engine (PM4 → Plume + 19
+shaders) — the latter remains multi-week.
