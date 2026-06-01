@@ -898,6 +898,22 @@ PPC_FUNC(__imp__XGetGameRegion) { ctx.r3.u64 = 0x00FFu; }
 // DWORD XamUserGetSigninState(user_index r3) -> 1 (signed in, local) for user 0, else 0
 PPC_FUNC(__imp__XamUserGetSigninState) { ctx.r3.u64 = (ctx.r3.u32 == 0) ? 1u : 0u; }
 
+// HRESULT XamUserGetSigninInfo(user_index r3, flags r4, X_USER_SIGNIN_INFO* info r5)
+// X_USER_SIGNIN_INFO (40 B): xuid@0x0 (u64), unk08@0x8, signin_state@0xC, unk10@0x10, unk14@0x14,
+// name[16]@0x18. The stub returned success WITHOUT filling info (garbage) — implement for real.
+PPC_FUNC(__imp__XamUserGetSigninInfo)
+{
+    uint32_t user = ctx.r3.u32, info = ctx.r5.u32;
+    if (!info) { ctx.r3.u64 = 0x80070057u; return; }          // E_INVALIDARG
+    for (uint32_t i = 0; i < 40; i++) PPC_STORE_U8(info + i, 0);
+    if (user != 0) { ctx.r3.u64 = 0x80070525u; return; }      // ERROR_NO_SUCH_USER
+    PPC_STORE_U64(info + 0x00, 0xE000000000000001ull);        // offline XUID
+    PPC_STORE_U32(info + 0x0C, 1);                            // signin_state = signed in (local)
+    const char* nm = "Player";
+    for (uint32_t i = 0; nm[i] && i < 15; i++) PPC_STORE_U8(info + 0x18 + i, static_cast<uint8_t>(nm[i]));
+    ctx.r3.u64 = 0;                                           // S_OK
+}
+
 // NTSTATUS KeWaitForMultipleObjects(count r3, objects r4, waitType r5, reason r6, mode r7,
 //                                   alertable r8, *timeout r9, waitblocks r10)
 PPC_FUNC(__imp__KeWaitForMultipleObjects)
