@@ -963,3 +963,44 @@ the boot now ends at two INDIRECT-NULLs, stable across all runs:
   [INDIRECT-NULL] target=0x00000000 (caller lr=0x8224FDEC)  -- a null call in ppc_recomp.30.cpp (likely an
     unfilled out-param/fn-ptr, Update 4 class, OR another table). Characterize after the first.
 Then: more tables (Update 3 noted 9 deferred + 161 markers) -> the GPU CP draws -> VdSwap -> Plume Vulkan.
+
+## 2026-06-01 (cont.) — ✅ jump table sub_8228A208 RECOVERED + vcmpbfp128/blrl IMPLEMENTED → boot 462→1191 lines (commits c10ab1a)
+Past the heap fix, drove the boot through the next two blockers; new frontier is a CRT-init thread-join.
+
+1. **Jump table in sub_8228A208 (the INDIRECT-NULL target=0x8228A3B8).** XenonAnalyse MISSES this table —
+   it is a 16-bit OFFSET table (bctr @0x8228A3B4 → jumpbase 0x8228A3B8 + offtab[r19], offtab(u16) @0x820CCF38
+   via `lhzx r0,0x820CCF38,r19*2`), and XenonAnalyse's prologue patterns don't match this two-level form
+   (it found neighbours 0x822884C8/0x82289B74 but not this one). Recovered manually: bound `cmplwi r19,28;
+   bgt 0x8228B6AC` ⇒ 29 cases (r19∈[0,28]), default 0x8228B6AC; read the 29 offsets from guest .rdata via
+   gdb (/tmp/readtab.gdb), labels[i]=0x8228A3B8+offtab[i]. Added the [[switch]] to sp_switch_tables.toml
+   (NO functions override — sub_8228A208 is already one whole function 0x8228A208..0x8228B858, unlike
+   0x821DC228 which XenonAnalyse split). The downstream null call (lr=0x8224FDEC, a C++ virtual dispatch on
+   a bad object) was a CONSEQUENCE of the skipped case and vanished once the table worked.
+
+2. **vcmpbfp128 + blrl (the SIGTRAP after the jump table).** With the table fixed, the boot crashed (SIGTRAP)
+   at sub_8241D010 (ppc_recomp.59.cpp, a Newton-Raphson reciprocal-refine on the main thread's CRT-init math):
+   XenonRecomp emits `__builtin_debugtrap()` for recognised-but-unimplemented instructions. The crash was
+   `vcmpbfp128` (vector compare-bounds). Implemented it + `blrl` in the emitter
+   (patches/xenonrecomp-sp-instructions.patch, XenonRecomp/recompiler.cpp):
+   - vcmpbfp[128]: per lane bit31=(a>b), bit30=(a<-b), 0 in [-b,b]; a<-b expressed as (-b)>a so only cmpgt
+     is needed (xor flips b's sign); CR6 setFromMask on the `.` form.
+   - blrl: capture lr as the target, set lr=return addr, PPC_CALL_INDIRECT_FUNC (mirror of bctrl).
+   Rebuilt XenonRecomp → clean regen ppc/ (88 TUs) → only the 78 `vupkd3d128` debugtraps remain (D3D vertex
+   unpack default-case, graphics-path, NOT yet reached). Regenerated the patch via `git -C ../../third_party/
+   XenonRecomp diff`.
+   RESULT (verified): 0 INDIRECT-NULL, 0 device-overwrite, NO crash (was SIGTRAP), boot 552→1191 lines, into
+   GPU physical-buffer allocation (MmAllocatePhysicalMemoryEx 3.7MB blocks at 0xA2Fxxxxx). 8 threads.
+
+3. **NEW FRONTIER = CRT-init thread-join deadlock.** Boot now reaches a quiescent steady state: all worker
+   threads parked in KeWaitForMultipleObjects/NtWaitForMultipleObjectsEx on g_waitCv; one render worker
+   (sub_821CC5D0 @0x821CC690) does a benign ~28 Hz KeGetCurrentProcessType poll (NOT the blocker). The
+   **MAIN thread** is blocked forever: still in CRT static-init (sub_8214FFD0 global ctors) → sub_82448D78
+   (thunk) → sub_8244E2D8 → **NtWaitForSingleObjectEx(handle=0xF1000002, timeout=∞)**. Handle 0xF1000002 =
+   **thread tid=4** (start sub_8242B4A8, ppc_recomp.60.cpp:10096; created suspended at boot then resumed). Its
+   KTHREAD resolves to 0x90100C40 (thread-arena 0x90100000+; events are a different arena 0x90400000+), whose
+   dispatcher header is ALL-ZEROS (signal_state=0 = not terminated). So a global constructor spawns worker
+   tid=4 and JOINS it (waits for it to exit), but tid=4 never exits (it is itself parked in a wait). RESUME:
+   identify what tid=4 (sub_8242B4A8) does and what it waits on, and why it never terminates — a missing
+   event signal, a queue it polls that is never fed, or a premature join. Tools: gdb attach + `thread apply
+   all bt` (/tmp/{threads,t1,obj,h}.gdb); the wait is NtWaitForSingleObjectEx kernel.cpp:1272 / WaitObject:734.
+   ⚠ XamLoaderLaunchTitle (a stub) is called around here but is NOT the blocker (the join is).
