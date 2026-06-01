@@ -195,7 +195,7 @@ index d08371e..191d7d1 100644
      f.write(out.data(), out.size());
  
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..a3c7328 100644
+index fa91527..555da24 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -1,3 +1,4 @@
@@ -203,7 +203,25 @@ index fa91527..a3c7328 100644
  #include "pch.h"
  #include "recompiler.h"
  #include <xex_patcher.h>
-@@ -1133,6 +1134,7 @@ bool Recompiler::Recompile(
+@@ -627,8 +628,16 @@ bool Recompiler::Recompile(
+                 }
+             }
+ 
++            // Out-of-range index: fall back to the real computed jump (what the original `bctr`
++            // does) instead of `__builtin_unreachable()`. The latter lets the compiler omit the
++            // switch bounds-check, so a single out-of-range index (e.g. from a data divergence
++            // during bring-up) reads past the host jump table and jumps to address 0 — a fatal,
++            // unrecoverable crash. `ctr` already holds the hardware target (a preceding `mtctr`
++            // set it), so dispatching through it both matches hardware semantics and lets the
++            // PPC_CALL_INDIRECT_FUNC override log+skip an unmapped target rather than crashing.
+             println("\tdefault:");
+-            println("\t\t__builtin_unreachable();");
++            println("\t\tPPC_CALL_INDIRECT_FUNC({}.u32);", ctr());
++            println("\t\treturn;");
+             println("\t}}");
+ 
+             switchTable = config.switchTables.end();
+@@ -1133,6 +1142,7 @@ bool Recompiler::Recompile(
          println("\t{}.s64 = {};", r(insn.operands[0]), int32_t(insn.operands[1] << 16));
          break;
  
@@ -211,7 +229,7 @@ index fa91527..a3c7328 100644
      case PPC_INST_LVEWX:
      case PPC_INST_LVEWX128:
      case PPC_INST_LVX:
-@@ -1684,6 +1686,130 @@ bool Recompiler::Recompile(
+@@ -1684,6 +1694,130 @@ bool Recompiler::Recompile(
          println("{}.u32, {}.u32);", r(insn.operands[2]), r(insn.operands[0]));
          break;
  
@@ -342,7 +360,7 @@ index fa91527..a3c7328 100644
      case PPC_INST_SUBF:
          println("\t{}.s64 = {}.s64 - {}.s64;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]));
          if (strchr(insn.opcode->name, '.'))
-@@ -2087,6 +2213,7 @@ bool Recompiler::Recompile(
+@@ -2087,6 +2221,7 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_ps({}.f32, simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({}.f32))));", v(insn.operands[0]), v(insn.operands[1]));
          break;
  
@@ -350,7 +368,7 @@ index fa91527..a3c7328 100644
      case PPC_INST_VSEL:
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
          break;
-@@ -2263,6 +2390,205 @@ bool Recompiler::Recompile(
+@@ -2263,6 +2398,205 @@ bool Recompiler::Recompile(
          println("\t{}.u64 = {}.u64 ^ {};", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2] << 16);
          break;
  
@@ -556,7 +574,7 @@ index fa91527..a3c7328 100644
      default:
          return false;
      }
-@@ -2381,6 +2707,14 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2381,6 +2715,14 @@ bool Recompiler::Recompile(const Function& fn)
          name = fmt::format("sub_{}", fn.base);
      }
  

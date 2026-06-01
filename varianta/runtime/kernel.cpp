@@ -40,6 +40,23 @@ void PPCIndirectNull(uint32_t target, uint32_t lr)
         fprintf(stderr, "[INDIRECT-NULL] target=0x%08X (caller lr=0x%08X)\n", target, lr);
 }
 
+// Every guest indirect branch/call (bctr/bctrl) routes here via rex_indirect.h's PPC_CALL_INDIRECT_FUNC.
+// CRITICAL: bounds-check the target against the recompiled code range BEFORE indexing the function table.
+// A recovered switch-table's out-of-range fallback (or any corrupted code pointer) can hand us a wild
+// address; PPC_LOOKUP_FUNC would then dereference base + IMAGE_SIZE + (target-CODE_BASE)*2, which for a
+// target far below CODE_BASE wraps to a slot gigabytes past the 4 GiB guest mapping — faulting the lookup
+// READ itself. So: dispatch only in-range, mapped targets; log+skip everything else (in-range-but-unmapped
+// = a still-missing jump-table case; out-of-range = a data divergence the title would also fault on).
+void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
+{
+    if (target >= PPC_CODE_BASE && target < (PPC_IMAGE_BASE + PPC_IMAGE_SIZE))
+    {
+        PPCFunc* fn = PPC_LOOKUP_FUNC(base, target);
+        if (fn) { fn(ctx, base); return; }
+    }
+    PPCIndirectNull(target, static_cast<uint32_t>(ctx.lr));
+}
+
 // ---- guest virtual memory manager ------------------------------------------------------------------
 // Backs Nt{Allocate,Query,Free}VirtualMemory. The full 4 GiB is already mmap'd lazily by the host
 // (runtime.cpp), so a "commit" is essentially free — we only TRACK reservations so that
