@@ -16,6 +16,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <condition_variable>
 
 // Lightweight import trace (set REX_KTRACE=0 to silence).
 static const bool g_ktrace = []{ const char* e = getenv("REX_KTRACE"); return !e || e[0] != '0'; }();
@@ -39,7 +40,9 @@ constexpr uint32_t kStatusMemoryNotAllocated = 0xC00000A0u;
 
 struct VRegion { uint32_t size; bool reserved; bool committed; uint32_t protect; };
 std::map<uint32_t, VRegion> g_regions;   // base -> region (kept non-overlapping)
-uint32_t g_virtNext = 0x40000000;        // bump cursor for kernel-chosen bases (user virtual range)
+uint32_t g_virtNext = 0x00010000;        // bump from LOW memory so the title's big heap reserve
+                                          // (everything below its ~0x70000000 stack) ends below the
+                                          // image (0x82000000) instead of overwriting it.
 std::mutex g_memMutex;                    // guards g_regions / g_virtNext (multiple guest threads alloc)
 
 inline uint32_t RoundUp(uint32_t v, uint32_t a) { return (v + (a - 1)) & ~(a - 1); }
@@ -218,12 +221,14 @@ PPC_FUNC(__imp__RtlTryEnterCriticalSection)
 // → process (KPROCESS), the per-thread TLS block, the stack bounds, and the process TLS slot bitmap.
 // ====================================================================================================
 namespace {
-// Dedicated kernel arena (far from the guest virtual bump at 0x40000000 and the XEX image at
-// 0x82000000); the full 4 GiB is lazily mmap'd so these addresses are already backed.
-constexpr uint32_t kProcessAddr = 0x60000000;
-constexpr uint32_t kThreadAddr  = 0x60001000;
-constexpr uint32_t kKpcrAddr    = 0x60002000;
-constexpr uint32_t kTlsAddr     = 0x60003000;  // per-thread TLS block (main thread)
+// Kernel arena ABOVE the image + dispatch table (image 0x82000000..~0x83500000): the guest reserves
+// its heap as everything BELOW its stack (~0x70000000), so guest allocations must stay below the
+// image and our structures must stay above it, or a big heap reserve overwrites the image's .data.
+// The full 4 GiB is lazily mmap'd, so these high addresses are already backed.
+constexpr uint32_t kProcessAddr = 0x90000000;
+constexpr uint32_t kThreadAddr  = 0x90001000;
+constexpr uint32_t kKpcrAddr    = 0x90002000;
+constexpr uint32_t kTlsAddr     = 0x90003000;  // per-thread TLS block (main thread)
 constexpr uint32_t kDefaultTlsSlots = 1024;
 constexpr uint32_t kProctypeUser = 1;          // X_PROCTYPE_USER (KeGetCurrentProcessType == 1)
 
@@ -234,6 +239,7 @@ inline void GST32(uint32_t a, uint32_t v) { uint32_t b = __builtin_bswap32(v); m
 inline void GST64(uint32_t a, uint64_t v) { uint64_t b = __builtin_bswap64(v); memcpy(g_base + a, &b, 8); }
 inline uint32_t GLD32(uint32_t a) { uint32_t b; memcpy(&b, g_base + a, 4); return __builtin_bswap32(b); }
 inline uint16_t GLD16(uint32_t a) { uint16_t b; memcpy(&b, g_base + a, 2); return __builtin_bswap16(b); }
+inline uint64_t GLD64(uint32_t a) { uint64_t b; memcpy(&b, g_base + a, 8); return __builtin_bswap64(b); }
 
 // Read a XEX optional header that stores its value INLINE (key low byte 0) as a BE u32.
 uint32_t XexOptU32(const uint8_t* xex, uint32_t key, uint32_t fallback) {
@@ -526,10 +532,11 @@ void CallGuest(uint32_t addr, PPCContext& ctx) {
     else fprintf(stderr, "[thread] CallGuest: no host fn at 0x%X\n", addr);
 }
 
-// Per-thread arena (KTHREAD+KPCR+TLS) above the main thread; worker stacks above the main stack.
+// Per-thread arena (KTHREAD+KPCR+TLS) + worker stacks, all ABOVE the image so the title's big
+// guest-heap reserve (which spans low memory up to ~0x70000000) never overlaps them.
 std::mutex g_threadMutex;
-uint32_t g_threadArenaNext = 0x60010000;
-uint32_t g_threadStackNext = 0x70200000;
+uint32_t g_threadArenaNext = 0x90100000;
+uint32_t g_threadStackNext = 0x98000000;
 
 // Allocate + fill a new guest thread context (KTHREAD/KPCR/TLS/stack). Returns the KPCR address.
 uint32_t CreateGuestThreadContext(uint32_t stackSize, uint32_t startAddr, uint32_t threadId,
@@ -576,6 +583,39 @@ std::mutex g_handleMutex;
 std::unordered_map<uint32_t, ThreadRec*> g_handles;
 uint32_t g_nextHandle = 0xF1000000;          // private handle space (avoids 0xFFFFFFxx pseudo-handles)
 std::atomic<uint32_t> g_nextThreadId{2};     // main thread is id 1
+const bool g_noSpawn = getenv("REX_NOSPAWN") != nullptr;  // diagnostic: create handles but don't run
+
+// ---- dispatch-object wait/signal (events, semaphores, mutants, thread-exit) ------------------------
+// Xbox dispatch objects carry an X_DISPATCH_HEADER (type@0x00 u8, signal_state@0x04 s32). We back
+// waits with one global condition variable; the signal_state lives in guest memory. Coarse but
+// correct. Reference: rexglue-sdk xboxkrnl_threading.cpp.
+std::mutex g_waitMutex;
+std::condition_variable g_waitCv;
+
+void SignalObject(uint32_t obj, int32_t state) {
+    { std::lock_guard<std::mutex> lk(g_waitMutex); GST32(obj + 0x04, static_cast<uint32_t>(state)); }
+    g_waitCv.notify_all();
+}
+
+// timeout: <0 = infinite, 0 = poll, >0 = milliseconds. Returns 0 (success) or 0x102 (STATUS_TIMEOUT).
+uint32_t WaitObject(uint32_t obj, int64_t timeoutMs) {
+    std::unique_lock<std::mutex> lk(g_waitMutex);
+    auto signaled = [&]{ return static_cast<int32_t>(GLD32(obj + 0x04)) > 0; };
+    if (timeoutMs < 0) g_waitCv.wait(lk, signaled);
+    else if (!g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), signaled)) return 0x00000102u;
+    uint8_t type = g_base[obj + 0x00];           // consume for auto-reset event / semaphore / mutant
+    if (type == 1 || type == 2 || type == 5)
+        GST32(obj + 0x04, static_cast<uint32_t>(static_cast<int32_t>(GLD32(obj + 0x04)) - 1));
+    return 0;
+}
+
+int64_t TimeoutMs(uint32_t timeoutPtr) {
+    if (!timeoutPtr) return -1;                  // NULL -> infinite
+    int64_t t = static_cast<int64_t>(GLD64(timeoutPtr));
+    if (t == 0) return 0;                        // poll
+    if (t < 0) return (-t) / 10000;              // relative 100ns -> ms
+    return 5000;                                 // absolute -> bound it (bring-up)
+}
 
 void GuestThreadRun(ThreadRec* rec) {
     PPCContext ctx{};
@@ -589,6 +629,7 @@ void GuestThreadRun(ThreadRec* rec) {
         ctx.r3.u64 = rec->startContext;
         CallGuest(rec->startAddr, ctx);
     }
+    SignalObject(rec->threadAddr, 1);        // wake anyone waiting on this thread object (header type 6)
 }
 } // namespace
 
@@ -610,7 +651,7 @@ PPC_FUNC(__imp__ExCreateThread)
     if (pHandle) PPC_STORE_U32(pHandle, handle);
     if (pThreadId) PPC_STORE_U32(pThreadId, tid);
     bool suspended = (flags & 1) != 0;       // X_CREATE_SUSPENDED
-    if (!suspended) { rec->started = true; rec->th = std::thread(GuestThreadRun, rec); rec->th.detach(); }
+    if (!suspended && !g_noSpawn) { rec->started = true; rec->th = std::thread(GuestThreadRun, rec); rec->th.detach(); }
     KTRACE("ExCreateThread(start=0x%X ctx=0x%X xapi=0x%X flags=0x%X) -> handle=0x%X tid=%u%s\n",
         startAddr, startCtx, xapi, flags, handle, tid, suspended ? " (suspended)" : "");
     ctx.r3.u64 = 0;  // STATUS_SUCCESS
@@ -624,7 +665,7 @@ PPC_FUNC(__imp__NtResumeThread)
     { std::lock_guard<std::mutex> lk(g_handleMutex); auto it = g_handles.find(handle);
       if (it != g_handles.end()) rec = it->second; }
     if (pCount) PPC_STORE_U32(pCount, 1);
-    if (rec && !rec->started.exchange(true)) {
+    if (rec && !g_noSpawn && !rec->started.exchange(true)) {
         rec->th = std::thread(GuestThreadRun, rec); rec->th.detach();
         KTRACE("NtResumeThread(0x%X) -> started\n", handle);
     }
@@ -729,3 +770,116 @@ PPC_FUNC(__imp__VdSetGraphicsInterruptCallback)
 // DWORD VdInitializeEngines(...) -> 1 (success); the system command buffer id address is a no-op.
 PPC_FUNC(__imp__VdInitializeEngines) { ctx.r3.u64 = 1; }
 PPC_FUNC(__imp__VdSetSystemCommandBufferGpuIdentifierAddress) { /* no-op */ }
+
+// ====================================================================================================
+// Dispatch-object synchronization: events, semaphores, single/multiple waits (goal: stable threading).
+// Pointer-based Ke* operate on guest dispatch objects directly; the wait core lives above (WaitObject).
+// ====================================================================================================
+
+// void KeInitializeEvent(event r3, type r4, initial_state r5) — type 0=notification(manual), 1=sync(auto)
+PPC_FUNC(__imp__KeInitializeEvent)
+{
+    uint32_t e = ctx.r3.u32;
+    PPC_STORE_U8(e + 0x00, ctx.r4.u32 == 1 ? 1 : 0);   // dispatch type
+    PPC_STORE_U8(e + 0x01, 0);
+    PPC_STORE_U32(e + 0x04, ctx.r5.u32 ? 1 : 0);       // signal_state
+    PPC_STORE_U32(e + 0x08, e + 0x08); PPC_STORE_U32(e + 0x0C, e + 0x08); // wait_list self-ref
+}
+
+// LONG KeSetEvent(event r3, increment r4, wait r5) -> previous signal state
+PPC_FUNC(__imp__KeSetEvent)
+{
+    uint32_t e = ctx.r3.u32;
+    int32_t prev = static_cast<int32_t>(PPC_LOAD_U32(e + 0x04));
+    SignalObject(e, 1);
+    ctx.r3.u64 = static_cast<uint32_t>(prev);
+}
+
+// LONG KeResetEvent(event r3) -> previous signal state
+PPC_FUNC(__imp__KeResetEvent)
+{
+    uint32_t e = ctx.r3.u32;
+    int32_t prev = static_cast<int32_t>(PPC_LOAD_U32(e + 0x04));
+    PPC_STORE_U32(e + 0x04, 0);
+    ctx.r3.u64 = static_cast<uint32_t>(prev);
+}
+
+// LONG KePulseEvent(event r3, increment r4, wait r5) — signal then immediately clear
+PPC_FUNC(__imp__KePulseEvent)
+{
+    uint32_t e = ctx.r3.u32;
+    int32_t prev = static_cast<int32_t>(PPC_LOAD_U32(e + 0x04));
+    SignalObject(e, 1);
+    SignalObject(e, 0);
+    ctx.r3.u64 = static_cast<uint32_t>(prev);
+}
+
+// void KeInitializeSemaphore(sem r3, count r4, limit r5)
+PPC_FUNC(__imp__KeInitializeSemaphore)
+{
+    uint32_t s = ctx.r3.u32;
+    PPC_STORE_U8(s + 0x00, 5);                 // dispatch type = Semaphore
+    PPC_STORE_U8(s + 0x01, 0);
+    PPC_STORE_U32(s + 0x04, ctx.r4.u32);       // signal_state = count
+    PPC_STORE_U32(s + 0x08, s + 0x08); PPC_STORE_U32(s + 0x0C, s + 0x08);
+    PPC_STORE_U32(s + 0x10, ctx.r5.u32);       // limit
+}
+
+// LONG KeReleaseSemaphore(sem r3, increment r4, adjustment r5, wait r6) -> previous count
+PPC_FUNC(__imp__KeReleaseSemaphore)
+{
+    uint32_t s = ctx.r3.u32;
+    int32_t prev = static_cast<int32_t>(PPC_LOAD_U32(s + 0x04));
+    SignalObject(s, prev + static_cast<int32_t>(ctx.r5.u32));
+    ctx.r3.u64 = static_cast<uint32_t>(prev);
+}
+
+// NTSTATUS KeWaitForSingleObject(object r3, reason r4, mode r5, alertable r6, *timeout r7)
+PPC_FUNC(__imp__KeWaitForSingleObject)
+{
+    ctx.r3.u64 = WaitObject(ctx.r3.u32, TimeoutMs(ctx.r7.u32));
+}
+
+// NTSTATUS NtWaitForSingleObjectEx(handle r3, mode r4, alertable r5, *timeout r6)
+PPC_FUNC(__imp__NtWaitForSingleObjectEx)
+{
+    uint32_t handle = ctx.r3.u32, obj = 0;
+    if (handle == 0xFFFFFFFE) obj = PPC_LOAD_U32(ctx.r13.u32 + 0x100);   // current thread
+    else { std::lock_guard<std::mutex> lk(g_handleMutex); auto it = g_handles.find(handle);
+           if (it != g_handles.end()) obj = it->second->threadAddr; }
+    if (!obj) { ctx.r3.u64 = 0; return; }   // unknown handle: don't hang during bring-up
+    ctx.r3.u64 = WaitObject(obj, TimeoutMs(ctx.r6.u32));
+}
+
+// NTSTATUS KeWaitForMultipleObjects(count r3, objects r4, waitType r5, reason r6, mode r7,
+//                                   alertable r8, *timeout r9, waitblocks r10)
+PPC_FUNC(__imp__KeWaitForMultipleObjects)
+{
+    uint32_t count = ctx.r3.u32, objects = ctx.r4.u32, waitType = ctx.r5.u32; // 0=WaitAll, 1=WaitAny
+    int64_t timeoutMs = TimeoutMs(ctx.r9.u32);
+    std::unique_lock<std::mutex> lk(g_waitMutex);
+    auto firstReady = [&]() -> int {
+        if (waitType == 1) {                       // WaitAny -> index of first signaled, else -1
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t o = GLD32(objects + i * 4);
+                if (static_cast<int32_t>(GLD32(o + 0x04)) > 0) return static_cast<int>(i);
+            }
+            return -1;
+        }
+        for (uint32_t i = 0; i < count; i++) {     // WaitAll -> 0 if all signaled, else -1
+            uint32_t o = GLD32(objects + i * 4);
+            if (static_cast<int32_t>(GLD32(o + 0x04)) <= 0) return -1;
+        }
+        return 0;
+    };
+    auto pred = [&]{ return firstReady() >= 0; };
+    if (timeoutMs < 0) g_waitCv.wait(lk, pred);
+    else if (!g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), pred)) { ctx.r3.u64 = 0x102; return; }
+    int idx = firstReady();
+    // Consume auto-reset/semaphore/mutant objects we're satisfied on.
+    auto consume = [&](uint32_t o){ uint8_t t = g_base[o + 0x00];
+        if (t == 1 || t == 2 || t == 5) GST32(o + 0x04, static_cast<int32_t>(GLD32(o + 0x04)) - 1); };
+    if (waitType == 1) consume(GLD32(objects + idx * 4));
+    else for (uint32_t i = 0; i < count; i++) consume(GLD32(objects + i * 4));
+    ctx.r3.u64 = (waitType == 1) ? static_cast<uint32_t>(idx) : 0;   // WAIT_OBJECT_0 + idx
+}
