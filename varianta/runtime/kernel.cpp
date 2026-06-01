@@ -1301,6 +1301,43 @@ PPC_FUNC(__imp__KeWaitForMultipleObjects)
     ctx.r3.u64 = (waitType == 1) ? static_cast<uint32_t>(idx) : 0;   // WAIT_OBJECT_0 + idx
 }
 
+// NTSTATUS NtWaitForMultipleObjectsEx(count r3, handles r4, wait_type r5, wait_mode r6, alertable r7,
+//                                     *timeout r8) — handle-based sibling of KeWaitForMultipleObjects.
+// Resolves each HANDLE to its dispatch object, then runs the identical cooperative WaitAll/WaitAny core.
+// Without this (as a soft stub returning success) a worker's wait loop busy-spins forever (tid=6 here
+// waits WaitAny on its two render/sync events). Reference: rexglue-sdk xeNtWaitForMultipleObjectsEx.
+PPC_FUNC(__imp__NtWaitForMultipleObjectsEx)
+{
+    uint32_t count = ctx.r3.u32, handles = ctx.r4.u32, waitType = ctx.r5.u32;
+    int64_t timeoutMs = TimeoutMs(ctx.r8.u32);
+    uint32_t objs[64];
+    if (count > 64) count = 64;
+    for (uint32_t i = 0; i < count; i++) objs[i] = ResolveObject(GLD32(handles + i * 4));
+    std::unique_lock<std::mutex> lk = g_coop ? std::unique_lock<std::mutex>(g_waitMutex, std::adopt_lock)
+                                             : std::unique_lock<std::mutex>(g_waitMutex);
+    auto signaled = [&](uint32_t o){ return o && static_cast<int32_t>(GLD32(o + 0x04)) > 0; };
+    auto firstReady = [&]() -> int {
+        if (waitType == 1) {                       // WaitAny -> index of first signaled, else -1
+            for (uint32_t i = 0; i < count; i++) if (signaled(objs[i])) return static_cast<int>(i);
+            return -1;
+        }
+        for (uint32_t i = 0; i < count; i++) if (!signaled(objs[i])) return -1;   // WaitAll
+        return 0;
+    };
+    auto pred = [&]{ return firstReady() >= 0; };
+    bool ok = true;
+    if (timeoutMs < 0) g_waitCv.wait(lk, pred);
+    else ok = g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), pred);
+    if (!ok) { if (g_coop) lk.release(); ctx.r3.u64 = 0x102; return; }            // STATUS_TIMEOUT
+    int idx = firstReady();
+    auto consume = [&](uint32_t o){ if (!o) return; uint8_t t = g_base[o + 0x00];
+        if (t == 1 || t == 2 || t == 5) GST32(o + 0x04, static_cast<int32_t>(GLD32(o + 0x04)) - 1); };
+    if (waitType == 1) consume(objs[idx]);
+    else for (uint32_t i = 0; i < count; i++) consume(objs[i]);
+    if (g_coop) lk.release();
+    ctx.r3.u64 = (waitType == 1) ? static_cast<uint32_t>(idx) : 0;
+}
+
 // ---- handle-based events (workers create these to synchronize) -------------------------------------
 // DWORD NtCreateEvent(*handle r3, obj_attr r4, type r5 (0=manual,1=auto), initial_state r6)
 PPC_FUNC(__imp__NtCreateEvent)
