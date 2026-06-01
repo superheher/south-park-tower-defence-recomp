@@ -669,8 +669,15 @@ std::condition_variable g_waitCv;
 // Cooperative token by default; REX_NOTOKEN=1 runs guest threads PREEMPTIVELY (relies on the title's
 // own critical sections/atomics for correctness — needed when a pure busy-wait would deadlock the token).
 const bool g_coop = (getenv("REX_NOTOKEN") == nullptr);
+const bool g_evtrace = (getenv("REX_EVTRACE") != nullptr);
 
+std::map<uint32_t,uint32_t> g_evSignalCount, g_evWaitCount;   // obj -> count (guarded by g_evMutex)
+std::mutex g_evMutex;
 void SignalObject(uint32_t obj, int32_t state) {
+    if (g_evtrace) {
+        std::lock_guard<std::mutex> lk(g_evMutex);
+        g_evSignalCount[obj]++;
+    }
     if (g_coop) { GST32(obj + 0x04, static_cast<uint32_t>(state)); }   // caller already holds the token
     else { std::lock_guard<std::mutex> lk(g_waitMutex); GST32(obj + 0x04, static_cast<uint32_t>(state)); }
     g_waitCv.notify_all();
@@ -682,6 +689,10 @@ uint32_t WaitObject(uint32_t obj, int64_t timeoutMs) {
     std::unique_lock<std::mutex> lk = g_coop ? std::unique_lock<std::mutex>(g_waitMutex, std::adopt_lock)
                                              : std::unique_lock<std::mutex>(g_waitMutex);
     auto signaled = [&]{ return static_cast<int32_t>(GLD32(obj + 0x04)) > 0; };
+    if (g_evtrace) {
+        std::lock_guard<std::mutex> lk2(g_evMutex);
+        g_evWaitCount[obj]++;
+    }
     bool ok = true;
     if (timeoutMs < 0) g_waitCv.wait(lk, signaled);
     else ok = g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), signaled);
@@ -808,10 +819,29 @@ std::atomic<uint32_t> g_vblankCount{0};
 // CP_RB_RPTR (0x1C4) and the title's RPtr write-back location. Ref: rexglue-sdk graphics_system.cpp.
 constexpr uint32_t kReg_CP_RB_RPTR = 0x7FC80000 + 0x1C4 * 4;   // 0x7FC80710
 constexpr uint32_t kReg_CP_RB_WPTR = 0x7FC80000 + 0x1C5 * 4;   // 0x7FC80714
+constexpr uint32_t GpuRegAddr(uint32_t r) { return 0x7FC80000 + r * 4; }
+
+// The Xbox 360 GPU register window (0x7FC80000) is plain guest memory in variant A — there is no MMIO
+// read interception. But rexglue's GraphicsSystem::ReadRegister (graphics_system.cpp:241) returns SPECIFIC
+// non-zero values for several registers that the title polls during graphics init; left at 0, the title's
+// interrupt/vblank machinery never arms. The most important is reg 0x1951 (interrupt status): the guest
+// graphics-interrupt callback sub_821C7170's vblank path reads it (mem 0x7FC86544) and SKIPS the whole
+// vblank handler sub_821BF748 unless bit 0 is set — prod hardcodes ReadRegister(0x1951)==1. We replicate
+// prod's reads by pre-seeding these locations in guest memory (and re-asserting the volatile 0x1951 on
+// every vblank, since the guest may clear it after handling). Values 1:1 with ReadRegister's switch.
+static void InitGpuRegisters() {
+    GST32(GpuRegAddr(0x0F00), 0x08100748);   // RB_EDRAM_TIMING
+    GST32(GpuRegAddr(0x0F01), 0x0000200E);   // RB_BC_CONTROL
+    GST32(GpuRegAddr(0x194C), 720);          // R500_D1MODE_V_COUNTER = min(display_height,0xFFF)
+    GST32(GpuRegAddr(0x1951), 1);            // interrupt status = vblank
+    GST32(GpuRegAddr(0x1961), (1280u << 16) | 720u);  // AVIVO_D1MODE_VIEWPORT_SIZE = w<<16|h
+}
 
 // Fire the guest graphics-interrupt callback (source: 0=vblank, 1=command-buffer complete) on the pump's
 // own context. Caller holds the cooperative token. Per rexglue, the TLS ptr must read 0 during interrupts.
-static void FireGfxInterrupt(uint32_t cb, uint32_t source) {
+// cpu = the logical processor to deliver on (prod's DispatchInterruptCallback sets the active CPU before
+// invoking; vblank is delivered on cpu 2). The callback reads it from KPCR+0x10C (+268).
+static void FireGfxInterrupt(uint32_t cb, uint32_t source, uint32_t cpu = 2) {
     PPCContext ctx{};
     ctx.fpscr.csr = 0x1F80;              // default MXCSR: all FP exceptions masked
     ctx.r1.u64 = g_pumpStack - 0x200;
@@ -820,6 +850,7 @@ static void FireGfxInterrupt(uint32_t cb, uint32_t source) {
     ctx.r4.u64 = g_interruptData;
     uint32_t savedTls = GLD32(g_pumpKpcr + 0x00);
     GST32(g_pumpKpcr + 0x00, 0);
+    GST8(g_pumpKpcr + 0x10C, static_cast<uint8_t>(cpu));   // active processor number
     CallGuest(cb, ctx);
     GST32(g_pumpKpcr + 0x00, savedTls);
 }
@@ -844,8 +875,9 @@ void VblankPump() {
             if (g_rptrWriteBack) GST32(g_rptrWriteBack, wptr);
             lastWptr = wptr;
         }
-        FireGfxInterrupt(cb, 0);                  // vblank
-        if (consumed) FireGfxInterrupt(cb, 1);    // command-buffer complete
+        GST32(GpuRegAddr(0x1951), 1);             // re-assert interrupt-status=vblank (prod ReadRegister)
+        FireGfxInterrupt(cb, 0, /*cpu=*/2);       // vblank (prod delivers on cpu 2)
+        if (consumed) FireGfxInterrupt(cb, 1, /*cpu=*/2);    // command-buffer complete
         if (g_coop) g_waitMutex.unlock();
     }
 }
@@ -854,6 +886,7 @@ void StartVblankPump() {
     if (g_vblankRunning.exchange(true)) return;
     uint32_t t = 0;
     g_pumpKpcr = CreateGuestThreadContext(0x20000, 0, /*threadId=*/99, &t, &g_pumpStack);
+    InitGpuRegisters();   // seed the read-only GPU registers prod's ReadRegister returns (esp. 0x1951)
     std::thread(VblankPump).detach();
     fprintf(stderr, "[video] vblank pump started (kpcr=0x%X)\n", g_pumpKpcr);
 }
