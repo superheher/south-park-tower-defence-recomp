@@ -147,3 +147,15 @@ Prod `.so` `1a3f6076` untouched; rexglue-sdk untouched; superproject pointer not
   rexglue/Xenia — rather than chase individual null derefs. ⚠ Reality check: a full boot is the
   multi-week runtime tail; the loop is grinding it but velocity is now low per iteration. Committed
   (lr/r2/r13 trace); checkpoint.
+- **[07:10] Bail localized to CRT heap-init `sub_8244B380` returning 0 (via gdb backtraces).** Chain:
+  `main→_xstart→sub_82450580→sub_824504A8→sub_8244B380→RtlInitCS(cs=0x618)`. `sub_82450580` bails to
+  `HalReturnToFirmware` IFF `sub_824504A8` returns 0, and `sub_824504A8` returns `(sub_8244B380_result
+  != 0)` — so the CRT heap/pool init `sub_8244B380(type=2, size=4096)` FAILS. ✅ **KPCR works** — gdb
+  shows `r25=0x60001000` = my KTHREAD (current-thread link resolves). ❌ heap control-block base is
+  `null+0x618` (`cs=0x618`, `r30=0x640`) — a NULL pointer, almost certainly read from the **ZEROED
+  KTHREAD/process** objects. `sub_8244B380` also calls `NtQueryVirtualMemory`/`NtFreeVirtualMemory`
+  (still trap-stubs, untaken branch). ⚠ Open puzzle: `r29=[r31+316]=r4(entry)`; static call site
+  (`sub_824504A8:22137`) sets `r4=0`, yet runtime `r29=0x618` — resolve via a gdb watchpoint on
+  `[r31+316]`. **NEXT: populate the guest thread/process/default-heap environment** (X_KTHREAD +
+  process object + process heap) so the CRT finds a valid heap base. Velocity low; full boot = the
+  multi-week tail. Checkpoint.
