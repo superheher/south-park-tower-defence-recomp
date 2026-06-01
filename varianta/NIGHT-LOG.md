@@ -100,3 +100,15 @@ Driver: `docs/NEXT-SESSION-VARIANTA-PROMPT.md`. **NEVER push.** Commit each incr
 | **4. Host runtime** | ✅ (night-scope) scaffold + **link-with-stubs OK** (103 MB exe, 0 undefined) + 474-import enumeration; real runtime = next phase |
 Commits on `experimental/hle-graphics-spike` (NOT pushed): `8e1e0dd`, `d7f16e5`, `ec0f24b`, `4ae4809`, + TASK4.
 Prod `.so` `1a3f6076` untouched; rexglue-sdk untouched; superproject pointer not bumped.
+
+## Continuation 2026-06-01 — host-runtime phase (user chose "start the host runtime")
+- **[06:08] RUNTIME BRING-UP MILESTONE — the guest boots and runs real code.** Wrote
+  `varianta/runtime/runtime.cpp`: reserve 4 GiB (`mmap` MAP_NORESERVE) → load+parse the XEX via
+  XenonUtils `Image` (links prebuilt `libXenonUtils/disasm/fmt`) → map the 17 sections (skip
+  `.reloc`/`.pdata`: not runtime data, and xex.cpp's decompressed image buffer is smaller than
+  `image.size` so `.reloc` straddled the tail and faulted `memcpy`) → populate the **22,782-entry**
+  dispatch table (`PPC_LOOKUP_FUNC` layout) → init `PPCContext` + a guest stack (SP=0x700FFE00) →
+  call entry `0x824499A0`. Result: **the guest executes and runs until the first kernel import,
+  `NtAllocateVirtualMemory`** (CRT heap setup; SIGILL from its trap-stub). The full
+  load→dispatch→execute path works end-to-end. Next: implement the early-boot import cascade
+  (make the 474 stubs `weak`, add strong impls in a `kernel.cpp` + a guest heap allocator).

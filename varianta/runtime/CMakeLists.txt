@@ -26,3 +26,11 @@ target_include_directories(sp_td_varianta PRIVATE
 # -O0 for bring-up (the recompiled TUs are huge — keeps compile fast + RAM low); raise later.
 # -w silences guest-code warnings (unused, signedness, etc.).
 target_compile_options(sp_td_varianta PRIVATE -O0 -w -fno-strict-aliasing)
+
+# Link the prebuilt XenonUtils (XEX parse/decrypt/decompress; AES+LZX compiled in) + its deps.
+# These come from the XenonRecomp build tree; (re)build them with: cmake --build ${XR}/out/build.
+set(XR_BUILD "${XR}/out/build")
+target_link_libraries(sp_td_varianta PRIVATE
+    "${XR_BUILD}/XenonUtils/libXenonUtils.a"
+    "${XR_BUILD}/thirdparty/disasm/libdisasm.a"
+    "${XR_BUILD}/thirdparty/fmt/libfmt.a")
