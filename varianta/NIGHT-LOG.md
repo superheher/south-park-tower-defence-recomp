@@ -465,3 +465,23 @@ Confirmed the working build can serve as a correctness oracle for the init diver
 This won't itself produce frames (the GPU engine — PM4 → Plume → 19 shaders — remains multi-week after
 init is correct), but it is the lowest-cost route to unblock the CRT-init divergence that currently
 stops the boot well before the GPU boundary.
+
+### Reference diff is OPERATIONAL — first cross-build signal captured
+Ran the working build read-only under gdb and confirmed the mechanics work:
+- `cd out/build/linux-amd64-release && timeout N env SDL_VIDEODRIVER=x11 LD_LIBRARY_PATH=. DISPLAY=:0
+  gdb -batch -x <script> --args ./south_park_td --game_data_root=<abs> --user_data_root=<abs>
+  --log_file=run.log --log_level=info`, then `tools/gamectl.sh kill_all` + `rm -f /dev/shm/xenia_memory_*`.
+- The exe is **PIE** → break by SYMBOL (`break sub_821DC228`), NOT by the `nm` link-time address.
+- Prod uses the **same XenonRecomp PPCContext layout** as variant A: at a `PPC_FUNC` breakpoint
+  `rdi`=&ctx, `rsi`=base (prod base = `0x100000000`), and `ctx.rN.u32` reads as `*(uint*)(rdi+off)` with
+  r3@0x00, r1@0x10, r4@0x20. So guest registers/memory are readable identically in both builds.
+
+First signal: in ~70 s of gdb-slowed boot, **prod calls `sub_821DC228` ZERO times** (it entered
+`sub_821E07A0` once, r3=0x40029140, with no dispatcher calls), whereas **variant A calls it 32768 times**
+(count=0x8000). Strongly suggests variant A's float-store loop is spurious / runs with a bogus count.
+⚠ CAVEAT before concluding: gdb-slowed prod may simply not have *reached* the same boot stage yet —
+next step must confirm prod passes the equivalent point (e.g. video init / the `sub_82244378` XUI parse)
+and STILL never loops, and match the same `sub_821E07A0` invocation (it can be called from several sites).
+Then diff the loop-entry guard inputs / count source (`*(orig+144)+31`) between builds to find where
+variant A's count first goes wrong. This capability now makes any divergent function comparable to the
+known-good build in minutes.
