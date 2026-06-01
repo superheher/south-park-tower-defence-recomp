@@ -843,6 +843,53 @@ PPC_FUNC(__imp__VdSetGraphicsInterruptCallback)
     KTRACE("VdSetGraphicsInterruptCallback(cb=0x%X data=0x%X)\n", g_interruptCallback, g_interruptData);
 }
 
+// ---- Rtl helpers (stubs that don't do the work -> caller reads garbage) ----------------------------
+// void RtlFillMemoryUlong(dst r3, length r4, pattern r5) — fill length/4 u32s with the BE pattern.
+PPC_FUNC(__imp__RtlFillMemoryUlong)
+{
+    uint32_t dst = ctx.r3.u32, len = ctx.r4.u32, pat = ctx.r5.u32;
+    for (uint32_t i = 0; i + 4 <= len; i += 4) PPC_STORE_U32(dst + i, pat);
+}
+// void RtlFillMemoryUchar / RtlFillMemory(dst r3, length r4, value r5)
+PPC_FUNC(__imp__RtlFillMemoryUchar)
+{
+    uint32_t dst = ctx.r3.u32, len = ctx.r4.u32; uint8_t v = static_cast<uint8_t>(ctx.r5.u32);
+    for (uint32_t i = 0; i < len; i++) PPC_STORE_U8(dst + i, v);
+}
+// void RtlTimeToTimeFields(*time r3, *fields r4) — TIME_FIELDS: y,mo,d,h,mi,s,ms,wday (8x u16). Fixed date.
+PPC_FUNC(__imp__RtlTimeToTimeFields)
+{
+    uint32_t f = ctx.r4.u32; if (!f) return;
+    static const uint16_t tf[8] = { 2024, 1, 1, 0, 0, 0, 0, 1 };
+    for (uint32_t i = 0; i < 8; i++) PPC_STORE_U16(f + i * 2, tf[i]);
+}
+
+// ---- XamInput (fill out-params: the input worker uses the returned state/caps) ---------------------
+// No controller connected = the clean boot path; zero the out-struct so nothing reads garbage.
+namespace { constexpr uint32_t kErrNotConnected = 0x0000048Fu; }   // ERROR_DEVICE_NOT_CONNECTED
+PPC_FUNC(__imp__XamInputGetState)
+{
+    uint32_t s = ctx.r5.u32; if (s) for (uint32_t i = 0; i < 16; i += 4) PPC_STORE_U32(s + i, 0);
+    ctx.r3.u64 = kErrNotConnected;
+}
+PPC_FUNC(__imp__XamInputGetCapabilities)
+{
+    uint32_t c = ctx.r5.u32; if (!c) { ctx.r3.u64 = 0x80070057u; return; }
+    for (uint32_t i = 0; i < 0x20; i += 4) PPC_STORE_U32(c + i, 0);
+    ctx.r3.u64 = kErrNotConnected;
+}
+PPC_FUNC(__imp__XamInputSetState) { ctx.r3.u64 = 0; }   // vibration: no-op success
+PPC_FUNC(__imp__XamInputGetKeystroke)
+{
+    uint32_t k = ctx.r5.u32; if (k) for (uint32_t i = 0; i < 16; i += 4) PPC_STORE_U32(k + i, 0);
+    ctx.r3.u64 = kErrNotConnected;
+}
+PPC_FUNC(__imp__XamInputGetKeystrokeEx)
+{
+    uint32_t k = ctx.r5.u32; if (k) for (uint32_t i = 0; i < 16; i += 4) PPC_STORE_U32(k + i, 0);
+    ctx.r3.u64 = kErrNotConnected;
+}
+
 // ---- XAudio (fill out-params: the audio worker uses the returned driver/config/volume) -------------
 // DWORD XAudioGetSpeakerConfig(*config r3) -> 0x00010001
 PPC_FUNC(__imp__XAudioGetSpeakerConfig) { if (ctx.r3.u32) PPC_STORE_U32(ctx.r3.u32, 0x00010001u); ctx.r3.u64 = 0; }
