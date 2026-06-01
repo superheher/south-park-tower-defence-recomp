@@ -78,6 +78,13 @@ std::map<uint32_t, VRegion> g_regions;   // base -> region (kept non-overlapping
 uint32_t g_virtNext = 0x00010000;        // bump from LOW memory so the title's big heap reserve
                                           // (everything below its ~0x70000000 stack) ends below the
                                           // image (0x82000000) instead of overwriting it.
+                                          // NOTE (2026-06-01): the .ptc-load device corruption is NOT a base
+                                          // issue — RtlAllocateHeap (sub_8244B950) returns a block at
+                                          // (heapbase-0x7D50) for the 0x78000 .ptc stream buffer, overlapping
+                                          // the live device. Tested base=0x40000000 (prod's; device then lands
+                                          // at prod's exact 0x40016F80): bad block moved to 0x3FFF82B0 =
+                                          // base-0x7D50, STILL overlapping. So it's a heap free-list/segment
+                                          // divergence, base-independent. See NIGHT-LOG "HEAP FREE-LIST".
 std::mutex g_memMutex;                    // guards g_regions / g_virtNext (multiple guest threads alloc)
 
 inline uint32_t RoundUp(uint32_t v, uint32_t a) { return (v + (a - 1)) & ~(a - 1); }

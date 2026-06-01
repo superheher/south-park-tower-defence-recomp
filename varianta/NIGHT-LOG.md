@@ -817,3 +817,69 @@ build (the initial r10 / the source of 0x82B0). Determine which object field sho
 reads 0 in variant A, and trace upstream to where sub_821BE840 stores its allocated buffer ptr into the
 .ptc object — a field-offset / store divergence. Fix that store/read so the stream destinations relocate
 onto 0xA2016000 → no device overwrite → re-test the GPU-completion waits.
+
+## 2026-06-01 (cont.) — ⛔ PRIOR ROOT-CAUSE CORRECTED: it is a HEAP FREE-LIST corruption, NOT un-relocated .ptc offsets
+
+The "ROOT FOUND: .ptc vertex-stream destinations are un-relocated" conclusion ABOVE is **WRONG** (it
+assumed the dest array held raw offsets that should add a buffer base 0xA2016000). Drove it to ground with
+gdb (scripts /tmp/{capture,relo,entry,alloc,site,trace,heaplog,heapdump,heapfl,narrow2,watchfl}.gdb) and
+found the real mechanism:
+
+THE DEST BASE *(obj+192) IS AN ALLOCATOR RETURN, NOT A FILE OFFSET. The .ptc stream-dest array
+(`sub_822A7C08` builds `array[i] = *(obj+192) + i*stride` on its stack at r1+128; `sub_822A58F8` consumes
+it as the r7 arg) gets its base from `sub_822A8150` (called at sub_822A2158:23167, right before
+sub_822A7C08), which **allocates the stream buffer**: `sub_82448090(size=0x78000, flags=0x24870000)` →
+stored at obj+192. gdb trace (/tmp/trace.gdb) caught it: that alloc **returns 0x82B0** — an address BELOW
+the title heap base (0x10000), spanning the live GPU device at 0x26F40. So `*(obj+192)=0x82B0` is the
+**allocator's bogus return**, not a missing relocation. (The object IS a stack struct in sub_822A2158's
+frame, ~0x980AF7B0 because worker stacks live in the 0x98000000 region; +0 holds the "PTC+" magic copied
+from the file header, which misled the prior session into the file-offset theory.)
+
+THE ALLOCATOR PATH: `sub_82448090(sz,flags)` routes by flag bit0. flags 0x24870000 → bit0 clear →
+`sub_8244DF68(0,sz)` → `sub_8244CDF0` (returns the single global heap handle = `*(0x82902448)` = 0x10000)
+→ `sub_8244B950` (the NT classic heap allocator; heap signature 0xEEFFEEFF at heap+0x10). The 0x78000
+request (480 KB) → index 0x7800; heap+0x28 VirtualMemoryThreshold = 0xF000, so 0x7800 < threshold ⇒ the
+**free-list[0] large-block search** (loc_8244BBFC→loc_8244BC08), NOT the virtual-alloc path (loc_8244C08C
+base=0) and NOT the extend helper sub_8244ADD8 (verified absent from the bt).
+
+THE CORRUPT BLOCK (the smoking gun, /tmp/narrow2.gdb — break sub_8244B950 ppc_recomp.65.cpp:7704 when
+ctx.r3.u32 in [0x1000,0x10000)): the free-list[0] walk SELECTS a fabricated block at **r3=0x82A0**
+(= heapbase 0x10000 − 0x7D60), header (BE u32): `+0=0x80000000` (size field 0x8000 *16-byte* units =
+0x80000 B ≥ the 0x78000 request, so the walk accepts it), `+4=0x00100000` (looks like the heap reserve
+size), `+8=0x00010180` (Flink = the free-list[0] sentinel heap+0x180), `+0xC=0x000582A8` (Blink → **into
+the .ptc file-load buffer region**: file buf = 0x50000 (NtAllocate req=0x50000 sz=0x20000), and
+0x582A8 = 0x50000+0x82A8). So **free-list[0] is corrupted with a phantom large free block below the heap
+base whose link points into the .ptc file buffer**; the 0x78000 alloc reuses it → dst array
+0x82B0+i*0x3C00 → entries #8/#9 (0x262B0/0x29EB0) land in the device → device+10900 zeroed → GPU-completion
+waits (main 0x388C4; render workers 0x29CD4/0x29D40) never release.
+
+BASE-INDEPENDENT (so NOT a layout fix): tested g_virtNext bump base 0x10000 → bad block 0x82B0;
+0x40000000 (prod's; the title heap then lands at prod's exact place — device struct = **0x40016F80**, the
+address prod logs in `SetInterruptCallback(821C7170, 40016F80)`) → bad block **0x3FFF82B0 = base−0x7D50,
+STILL spanning the device**. Reverted the base to 0x10000 (the deliberate choice so the title's big
+low-memory reserve stays below the image). The device landing at prod's EXACT address with base
+0x40000000 proves variant A's heap is in sync with prod up to the device — so the divergence is purely in
+the large-alloc free-list state AFTER the device alloc.
+
+⇒ TRUE ROOT (open): a guest-heap free/coalesce produces a phantom free block below the heap base, linked
+into free-list[0], with a Blink into the .ptc file buffer. Same CLASS as the systemic
+NtQueryInformationFile bug (a value/state divergence, not codegen) — but now localized to the heap. Prime
+suspects: (a) a XenonRecomp emitter mis-translation in the heap free/coalesce path (sub_82448128 /
+RtlFreeHeap and its backward-coalesce via a block's PreviousSize — prod uses the *rexglue* recompiler, so
+a variant-A-only emitter bug here would diverge), or (b) variant A's NtAllocateVirtualMemory/
+NtQueryVirtualMemory commit semantics (variant A tracks ONE VRegion per reserve and reports whole-region
+commit state, not per-page — the heap may mis-track its committed/uncommitted ranges and coalesce wrong).
+
+NEXT EXPERIMENT (precise): the corrupt block is linked MID-CHAIN (a watchpoint on just the free-list[0]
+sentinel heap+0x184 did NOT catch it). Catch the corrupting insertion by (1) watching a WIDER window —
+the whole free-list[0] LIST_ENTRY plus the phantom block's eventual location — or instrument RtlFreeHeap
+(sub_82448128) + the coalesce to log every (block, size, prev-size, new free-list links) and flag the
+first below-heap link, with the guest LR; OR (2) PROD-DIFF: prod uses the SAME `__imp__sub_XXX` ABI and
+HAS the heap symbols (nm out/build/linux-amd64-release/south_park_td: sub_82448090/sub_8244B950/
+sub_8244DF68) — log the heap op sequence (alloc/free sizes+results, relative to heap base) in both and
+find the first divergent op after the device alloc. ⚠ prod is Release (no readable ctx) → read its guest
+mem via membase / few breakpoints (hot heap funcs crash prod). Once the corrupting op is found, fix the
+HLE/emitter divergence → the 0x78000 alloc lands in valid heap space → device uncorrupted → re-test the
+GPU-completion waits → VdSwap → DRAW. Tools added this session: /tmp/trace.gdb (path through sub_822A8150),
+/tmp/narrow2.gdb (catch the below-heap block + header + bt), /tmp/heaplog.gdb (alloc size/flags/result map),
+/tmp/heapdump.gdb (heap struct dump). kernel.cpp:78 has an inline NOTE summarizing this.
