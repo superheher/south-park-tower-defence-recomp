@@ -78,13 +78,12 @@ std::map<uint32_t, VRegion> g_regions;   // base -> region (kept non-overlapping
 uint32_t g_virtNext = 0x00010000;        // bump from LOW memory so the title's big heap reserve
                                           // (everything below its ~0x70000000 stack) ends below the
                                           // image (0x82000000) instead of overwriting it.
-                                          // NOTE (2026-06-01): the .ptc-load device corruption is NOT a base
-                                          // issue — RtlAllocateHeap (sub_8244B950) returns a block at
-                                          // (heapbase-0x7D50) for the 0x78000 .ptc stream buffer, overlapping
-                                          // the live device. Tested base=0x40000000 (prod's; device then lands
-                                          // at prod's exact 0x40016F80): bad block moved to 0x3FFF82B0 =
-                                          // base-0x7D50, STILL overlapping. So it's a heap free-list/segment
-                                          // divergence, base-independent. See NIGHT-LOG "HEAP FREE-LIST".
+                                          // NOTE (2026-06-01): the .ptc-load device corruption that used to
+                                          // overwrite the live GPU device here is FIXED — it was the
+                                          // NtFreeVirtualMemory(MEM_DECOMMIT) writeback returning the whole
+                                          // reservation instead of the decommitted sub-range (see that fn
+                                          // below + NIGHT-LOG "DECOMMIT WRITEBACK"). It was base-independent
+                                          // (a heap UnCommittedRanges divergence), so this base stays 0x10000.
 std::mutex g_memMutex;                    // guards g_regions / g_virtNext (multiple guest threads alloc)
 
 inline uint32_t RoundUp(uint32_t v, uint32_t a) { return (v + (a - 1)) & ~(a - 1); }
@@ -140,8 +139,8 @@ PPC_FUNC(__imp__NtAllocateVirtualMemory)
     }
     PPC_STORE_U32(pBase, gbase);
     PPC_STORE_U32(pSize, size);
-    KTRACE("NtAllocateVirtualMemory(req=0x%X sz=0x%X type=0x%X prot=0x%X) -> base=0x%X size=0x%X\n",
-        reqBase, reqSize, allocType, protect, gbase, size);
+    KTRACE("NtAllocateVirtualMemory(req=0x%X sz=0x%X type=0x%X prot=0x%X) -> base=0x%X size=0x%X lr=0x%llX\n",
+        reqBase, reqSize, allocType, protect, gbase, size, (unsigned long long)ctx.lr);
     ctx.r3.u64 = kStatusSuccess;
 }
 
@@ -178,27 +177,38 @@ PPC_FUNC(__imp__NtFreeVirtualMemory)
     uint32_t reqSize = pSize ? PPC_LOAD_U32(pSize) : 0;
     auto [rb, r] = FindRegion(gbase);
     if (!r) { ctx.r3.u64 = kStatusMemoryNotAllocated; return; }
-    // ⚠ Xbox/NT MEM_DECOMMIT/RELEASE LOSE the pages' contents (a later MEM_COMMIT of the same VA returns
-    // ZEROED pages). variant A keeps host pages mapped (lazy), so without this the title's heap re-commits
-    // a decommitted range and reads STALE bytes as a block header — e.g. RtlAllocateHeap's backward-coalesce
-    // (sub_8244A108: prev = block - PreviousSize*16) read a garbage PreviousSize from un-zeroed .ptc data and
-    // underflowed below the heap base (returned 0x82B0), corrupting free-list[0] and overwriting the live GPU
-    // device. Zero the freed range here to match real decommit semantics (the next commit then sees zeros).
-    uint32_t zbase = gbase, zsize = reqSize;
-    if (freeType & kMemRelease) {
+    // 🎯 Writeback semantics matter: the guest heap reads *BaseAddress / *RegionSize BACK after the call to
+    // update its UnCommittedRanges (RtlpDeCommitFreeBlock sub_8244B018 → sub_82449D58 inserts the returned
+    // [base,size) as an uncommitted range). Real NtFreeVirtualMemory(MEM_DECOMMIT) writes back the
+    // PAGE-ALIGNED REQUESTED sub-range — NOT the whole reservation. Returning the whole region (rb/r->size)
+    // made the heap believe the ENTIRE heap was decommitted, so its UCR reset to the heap base; the next
+    // heap-extend then committed at the base, overwrote the live heap header + GPU device, and the
+    // backward-coalesce (sub_8244A108: prev = block − PreviousSize*16) underflowed below the base. Only
+    // MEM_RELEASE returns the whole allocation. (See NIGHT-LOG "HEAP FREE-LIST"; the prior zero-on-decommit
+    // alone did not fix it — the writeback was the root.)
+    //
+    // Xbox/NT MEM_DECOMMIT/RELEASE also LOSE the pages' contents (a later MEM_COMMIT of the same VA returns
+    // ZEROED pages). variant A keeps host pages mapped (lazy), so zero the freed range to match.
+    uint32_t outBase, outSize;
+    if (freeType & kMemRelease) {                          // release frees the whole reservation
         r->reserved = false; r->committed = false;
-        if (zsize == 0) { zbase = rb; zsize = r->size; }   // release whole reservation
-    } else if (freeType & kMemDecommit) {
-        r->committed = false;
-        if (zsize == 0) zsize = rb + r->size - gbase;      // decommit to end of region
+        outBase = rb;
+        outSize = r->size;
+    } else {                                               // MEM_DECOMMIT: a page-aligned sub-range
+        uint32_t aligned = gbase & ~0xFFFu;
+        outBase = aligned;
+        outSize = reqSize ? RoundUp((gbase - aligned) + reqSize, 0x1000u)
+                          : (rb + r->size - aligned);      // size 0 => decommit to end of region
+        if (outBase < rb) outBase = rb;
+        if (outBase + outSize > rb + r->size) outSize = rb + r->size - outBase;
+        if (outBase == rb && outSize >= r->size) r->committed = false;  // whole region decommitted
     }
-    if ((freeType & (kMemRelease | kMemDecommit)) && zsize) {
-        if (zbase >= rb && zbase + zsize <= rb + r->size)  // stay within the tracked reservation
-            std::memset(base + zbase, 0, zsize);
-    }
-    PPC_STORE_U32(pBase, rb);
-    if (pSize) PPC_STORE_U32(pSize, r->size);
-    KTRACE("NtFreeVirtualMemory(0x%X type=0x%X)\n", gbase, freeType);
+    if (outSize && outBase >= rb && outBase + outSize <= rb + r->size)
+        std::memset(base + outBase, 0, outSize);
+    PPC_STORE_U32(pBase, outBase);
+    if (pSize) PPC_STORE_U32(pSize, outSize);
+    KTRACE("NtFreeVirtualMemory(req=0x%X reqsz=0x%X type=0x%X) -> writeback base=0x%X size=0x%X lr=0x%llX\n",
+        gbase, reqSize, freeType, outBase, outSize, (unsigned long long)ctx.lr);
     ctx.r3.u64 = kStatusSuccess;
 }
 
