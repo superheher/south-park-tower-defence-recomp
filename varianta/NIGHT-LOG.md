@@ -262,13 +262,19 @@ GPU to "catch up"; it needs a command processor to advance RPtr — and it holds
 spinning, starving everything else). **This is the GPU-CP / renderer boundary (goal step 5).**
 
 ### Revised next-steps
-1. **GPU command processor (the frontier).** The spin waits for `[RPtr]` (the ring-buffer read pointer
-   write-back, set by VdEnableRingBufferRPtrWriteBack = `g_rptrWriteBack`) to reach the CPU's write pointer.
-   Minimal "null GPU": capture the guest's WPtr writes to the CP register, advance RPtr→WPtr (pretend all
-   PM4 consumed) from a host GPU thread that writes guest memory directly (no token needed — it's a memory
-   write, not guest code). That alone should release the spin → boot proceeds. THEN the real renderer:
-   parse + translate the PM4 stream → draws (Plume + the 19 shaders in `private/extracted/media/shaders/`;
-   Unleashed `gpu/video.cpp` ref). This is the multi-week piece.
+1. **GPU command processor (the frontier).** Mechanism (traced): the spin `sub_821B9270` does
+   `r11=[r29+10896]` (ptr to the RPtr write-back = `g_rptrWriteBack`), `r8=[r11]` (current RPtr),
+   `r9=[r31+8]` (the expected/target = where the CPU's WPtr is) and loops `while (r9 != r8)`. So it waits
+   for **RPtr to reach WPtr**. The guest publishes WPtr by writing GPU register **0x01C5 = CP_RB_WPTR**
+   (rexglue `graphics_system.cpp:278`) via an MMIO store to the GPU register window — which my FLAT 4 GiB
+   map does NOT intercept (the store just lands in memory, no side effect). Two ways to get WPtr:
+   (a) find the CP_RB_WPTR guest address (GPU register base + 0x01C5*4 = +0x714; the base comes from the
+   ring-buffer/Vd* setup or the device struct `r29` — trace `r29` and its +10888/+10896/+11008 fields), then
+   a host GPU thread POLLS it and writes `[g_rptrWriteBack] = WPtr` (no token; pure memory write) → the spin
+   exits; or (b) add real MMIO write-interception for the GPU register range (rexglue `mmio_handler.cpp`).
+   (a) is the quick "null GPU" that should release the spin → boot proceeds. THEN the real renderer: parse +
+   translate the PM4 stream the ring buffer holds → draws (Plume + the 19 shaders in
+   `private/extracted/media/shaders/*.updb`; Unleashed `gpu/video.cpp` ref). Multi-week.
 2. Fix the token-starvation generally (so busy-waits don't starve the pump): once the CP advances RPtr the
    spin exits on its own, but for robustness, detect long token holds or give the GPU-advance thread direct
    memory access without the token (as above).
