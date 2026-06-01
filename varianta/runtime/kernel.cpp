@@ -855,6 +855,119 @@ static void FireGfxInterrupt(uint32_t cb, uint32_t source, uint32_t cpu = 2) {
     GST32(g_pumpKpcr + 0x00, savedTls);
 }
 
+// ---- PM4 command-processor interpreter -------------------------------------------------------------
+// Executes the PM4 stream the title writes to the ring buffer (and the indirect buffers it references),
+// producing the side effects the title's render loop waits on — EVENT_WRITE_SHD memory fences and
+// INTERRUPT graphics-interrupt callbacks — so the GPU-completion events get satisfied. Structure 1:1
+// with rexglue command_processor.cpp (ExecutePrimaryBuffer / ExecutePacket / ExecutePacketType*).
+// ADDRESS MODEL: variant A's flat 4 GiB map places "physical" GPU memory (MmAllocatePhysicalMemoryEx,
+// the ring @0xA0002000, the IBs) in the 0xA0000000 window. The PM4 carries physical addresses with their
+// mirror bits stripped (e.g. IB addr 0x90040), so a physical/GPU address p resolves to guest
+// 0xA0000000 | (p & 0x1FFFFFFF). VERIFIED: IB#1 phys 0x90040 -> 0xA0090040 holds real PM4 (WAIT_REG_MEM),
+// while raw 0x90040 is zero. Ref: xenos.h GpuToCpu/CpuToGpu + xmemory.h TranslatePhysical.
+namespace {
+inline uint32_t TranslatePhys(uint32_t p) { return 0xA0000000u | (p & 0x1FFFFFFFu); }
+
+enum { PM4_ME_INIT=0x48, PM4_NOP=0x10, PM4_INDIRECT_BUFFER=0x3F, PM4_INDIRECT_BUFFER_PFD=0x37,
+       PM4_WAIT_REG_MEM=0x3C, PM4_EVENT_WRITE=0x46, PM4_EVENT_WRITE_SHD=0x58, PM4_EVENT_WRITE_EXT=0x5A,
+       PM4_DRAW_INDX=0x22, PM4_DRAW_INDX_2=0x36, PM4_INTERRUPT=0x54, PM4_XE_SWAP=0x64 };
+constexpr uint32_t XE_GPU_REG_VGT_EVENT_INITIATOR = 0x21F9;
+
+std::atomic<uint32_t> g_gpuCounter{0};   // GPU swap counter — EVENT_WRITE_SHD is_counter fences read it
+std::atomic<uint64_t> g_drawCount{0}, g_swapCount{0};
+const bool g_cptrace = (getenv("REX_CPTRACE") != nullptr);
+
+inline void WriteGpuReg(uint32_t index, uint32_t value) { GST32(0x7FC80000u + index * 4u, value); }
+
+void ExecutePM4(uint32_t addr, uint32_t dwords, int depth);   // fwd
+
+// Execute one type-3 packet body. `addr` is at the first data dword; `count` data dwords follow.
+void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
+    switch (op) {
+      case PM4_INDIRECT_BUFFER:
+      case PM4_INDIRECT_BUFFER_PFD: {
+        uint32_t ibAddr = GLD32(addr), ibLen = GLD32(addr + 4) & 0xFFFFF;
+        if (g_cptrace) fprintf(stderr, "[cp]%*s IB 0x%X (phys 0x%X) len=%u\n", depth*2, "", ibAddr, TranslatePhys(ibAddr), ibLen);
+        ExecutePM4(TranslatePhys(ibAddr), ibLen, depth + 1);
+        break;
+      }
+      case PM4_INTERRUPT: {
+        uint32_t cpuMask = GLD32(addr);
+        if (g_cptrace) fprintf(stderr, "[cp] INTERRUPT mask=0x%X\n", cpuMask);
+        if (g_interruptCallback)
+            for (int n = 0; n < 6; n++) if (cpuMask & (1u << n)) FireGfxInterrupt(g_interruptCallback, 1, n);
+        break;
+      }
+      case PM4_EVENT_WRITE_SHD: {              // VS|PS-done event -> write a fence value to memory
+        uint32_t initiator = GLD32(addr), address = GLD32(addr + 4), value = GLD32(addr + 8);
+        WriteGpuReg(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+        bool isCounter = (initiator >> 31) & 1;
+        uint32_t dataValue = isCounter ? g_gpuCounter.load() : value;
+        address &= ~0x3u;                       // low 2 bits = endianness; the standard fence is k8in32
+        GST32(TranslatePhys(address), dataValue);   // BE store => guest's BE load reads back dataValue
+        if (g_cptrace) fprintf(stderr, "[cp] EVENT_WRITE_SHD addr=0x%X val=0x%X cnt=%d\n", address, dataValue, isCounter);
+        break;
+      }
+      case PM4_EVENT_WRITE:
+      case PM4_EVENT_WRITE_EXT:
+        WriteGpuReg(XE_GPU_REG_VGT_EVENT_INITIATOR, GLD32(addr) & 0x3F);
+        break;
+      case PM4_DRAW_INDX: case PM4_DRAW_INDX_2:
+        g_drawCount.fetch_add(1);
+        break;
+      case PM4_XE_SWAP:
+        g_gpuCounter.fetch_add(1); g_swapCount.fetch_add(1);
+        if (g_cptrace) fprintf(stderr, "[cp] XE_SWAP #%llu\n", (unsigned long long)g_swapCount.load());
+        break;
+      default: break;   // ME_INIT/NOP/SET_CONSTANT/WAIT_REG_MEM/state: not modeled yet (no Vulkan) — skip
+    }
+}
+
+// Walk a PM4 buffer [addr, addr+dwords) dispatching on packet>>30 (rexglue ExecutePacket).
+void ExecutePM4(uint32_t addr, uint32_t dwords, int depth) {
+    if (depth > 8) return;
+    uint32_t end = addr + dwords * 4;
+    while (addr + 4 <= end) {
+        uint32_t packet = GLD32(addr); addr += 4;
+        if (packet == 0) continue;
+        switch (packet >> 30) {
+          case 0: {                              // type-0: write `count` regs starting at base_index
+            uint32_t count = ((packet >> 16) & 0x3FFF) + 1, baseIdx = packet & 0x7FFF;
+            bool writeOne = (packet >> 15) & 1;
+            for (uint32_t m = 0; m < count && addr + 4 <= end; m++, addr += 4)
+                WriteGpuReg(writeOne ? baseIdx : baseIdx + m, GLD32(addr));
+            break;
+          }
+          case 1: {                              // type-1: two reg writes
+            WriteGpuReg(packet & 0x7FF, GLD32(addr));
+            WriteGpuReg((packet >> 11) & 0x7FF, GLD32(addr + 4));
+            addr += 8;
+            break;
+          }
+          case 2: break;                          // type-2: no-op
+          case 3: {                               // type-3: opcode packet
+            uint32_t op = (packet >> 8) & 0x7F, count = ((packet >> 16) & 0x3FFF) + 1;
+            ExecuteType3(addr, op, count, depth);
+            addr += count * 4;                    // advance past the data dwords
+            break;
+          }
+        }
+    }
+}
+
+// Execute the primary ring buffer from rptr to wptr (dword indices); handles wraparound.
+void ExecuteRing(uint32_t rptr, uint32_t wptr) {
+    uint32_t ringDwords = g_ringBufferSize / 4;
+    if (g_cptrace) fprintf(stderr, "[cp] === ExecuteRing rptr=%u wptr=%u (ringDwords=%u) ===\n", rptr, wptr, ringDwords);
+    if (wptr >= rptr) {
+        ExecutePM4(g_ringBufferBase + rptr * 4, wptr - rptr, 0);
+    } else if (ringDwords) {                       // wrapped
+        ExecutePM4(g_ringBufferBase + rptr * 4, ringDwords - rptr, 0);
+        ExecutePM4(g_ringBufferBase, wptr, 0);
+    }
+}
+} // namespace
+
 void VblankPump() {
     uint32_t lastWptr = 0;
     while (g_vblankRunning.load()) {
@@ -863,14 +976,14 @@ void VblankPump() {
         uint32_t cb = g_interruptCallback;
         if (!cb) continue;
         if (g_coop) g_waitMutex.lock();
-        // Null-GPU command processor: the guest kicked by writing the ring-buffer write index to
-        // CP_RB_WPTR. With no real GPU we "consume" instantly — advance RPtr to WPtr in both the
-        // CP_RB_RPTR register and the guest's RPtr write-back location — so the title's render path
-        // sees its submitted PM4 as complete and its render-wait releases. (No PM4 is actually executed
-        // yet, so no pixels; this only lets the title proceed to issue/await draws — the next GPU step.)
+        // Real command processor: the guest kicks by writing the ring write index to CP_RB_WPTR. Execute
+        // the newly-submitted PM4 (lastWptr..wptr) — which recurses into the indirect buffers and applies
+        // the EVENT_WRITE_SHD fences / INTERRUPT callbacks the render loop waits on — then advance RPtr to
+        // wptr (CP_RB_RPTR register + the guest's RPtr write-back) so the title sees the batch consumed.
         uint32_t wptr = GLD32(kReg_CP_RB_WPTR);
         bool consumed = (g_ringBufferBase && wptr != lastWptr);
         if (consumed) {
+            ExecuteRing(lastWptr, wptr);
             GST32(kReg_CP_RB_RPTR, wptr);
             if (g_rptrWriteBack) GST32(g_rptrWriteBack, wptr);
             lastWptr = wptr;
