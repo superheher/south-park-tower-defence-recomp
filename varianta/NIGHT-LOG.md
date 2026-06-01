@@ -577,3 +577,17 @@ this title; strongly prefer REUSING it over a scratch rewrite):
   pixels). PIXELS then require the type-3 draw packets → Plume Vulkan + the 19 shaders
   (private/extracted/media/shaders/*.updb). Wire the CP to variant A's g_base / ring @0xA0002000 /
   regs @0x7FC80000 / RPtr-WB @0x201003C. This is the multi-week remainder; every other subsystem boots.
+
+### Ring-buffer command structure fully decoded (completes the PM4-interpreter spec)
+The 25-dword primary ring buffer @0xA0002000 is: PM4_ME_INIT (op 0x48, dwords 0..18) + TWO
+PM4_INDIRECT_BUFFER packets (op 0x3F, confirmed vs command_processor.cpp:905/937 ExecutePacketType3_
+INDIRECT_BUFFER:1200), each [IB_address, IB_size_dwords]: IB#1 @0x00090040 size 0x0B, IB#2 @0x00010000
+size 0x40. ⇒ the REAL init/draw commands (and the ack that signals render-wait 0x36E70) are inside the
+INDIRECT BUFFERS, not the primary ring. So the interpreter MUST recurse into IBs (read PM4 at IB_address
+for IB_size dwords) — a plain primary-buffer walk won't see the commands. Implementation order for the
+GPU engine: (1) primary-buffer walk RPtr→WPtr dispatch on packet>>30; (2) type-3 INDIRECT_BUFFER →
+recurse; (3) ME_INIT + type-0 register-window writes (into the 0x7FC80000 reg file); (4) find the
+EVENT_WRITE/interrupt opcode in the IBs that the title's handler turns into the KeSetEvent(0x36E70) ack,
+reproduce it → render-wait releases (init done, still no pixels); (5) type-3 DRAW_* packets → Plume
+Vulkan + 19 shaders → pixels. Best path remains reusing rexglue-sdk command_processor.cpp wholesale
+(it already does 1-5 for this title) wired to variant A's g_base/ring/regs/RPtr-WB. Multi-week.
