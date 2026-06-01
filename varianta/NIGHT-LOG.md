@@ -612,3 +612,82 @@ DEFINITIVE: step 5 (renderer) == implement/integrate the GPU command processor (
 recursion + GPU memory model + EOP/fence + Plume Vulkan + 19 shaders). Reuse rexglue-sdk
 command_processor.cpp. This is the multi-week remainder; every other subsystem boots and the game runs to
 the point of submitting GPU work. Nothing further in this layer is a quick fix — confirmed exhaustively.
+
+## 2026-06-01 (cont.) — GPU CP built: register-seed unlock + real PM4 interpreter; main thread advances; hit the GPU-init teardown
+
+Two committed advances (6d85089, f6affa2), both verified via gdb. The boot moved from "stuck at the
+early GPU spin" to "executing the real PM4 stream and walking the multi-stage GPU-init handshake."
+
+### Fix A — seed the GPU registers prod's ReadRegister returns (commit 6d85089)
+ROOT (found via the recompiled graphics-interrupt callback sub_821C7170 + the reference impl): variant
+A's GPU register window 0x7FC80000 is **plain guest memory with no MMIO read interception**, so it read
+0 everywhere. But rexglue `GraphicsSystem::ReadRegister` (graphics_system.cpp:241) returns specific
+non-zero values for several registers the title polls. The decisive one is **reg 0x1951 (interrupt
+status) @ mem 0x7FC86544**: the callback's vblank path does `lwz r11,25924(0x7FC80000); clrlwi. r11,31;
+beq <skip>` — i.e. it SKIPS the whole vblank handler `sub_821BF748` unless bit 0 is set. Prod hardcodes
+`ReadRegister(0x1951)==1`. Left 0 ⇒ the vblank handler never ran ⇒ the title stalled at the early GPU-init
+wait. FIX: `InitGpuRegisters()` pre-seeds 0x0F00=0x08100748, 0x0F01=0x200E, 0x194C=720, 0x1951=1,
+0x1961=(1280<<16|720) (1:1 with ReadRegister's switch); re-assert 0x1951=1 each vblank; deliver the
+interrupt on **cpu 2** (KPCR+0x10C, matching prod `MarkVblank → DispatchInterruptCallback(0,2)`). RESULT:
+boot crossed the `KeGetCurrentProcessType` spin (753→7 hits) through XAudioRegisterRenderDriverClient +
+the 23.5MB UI.xzp load to the deeper render-loop waits. **Main thread reached the exact chain the task
+named**: `_xstart→…→sub_822E2CF0→sub_822F2CE0→sub_8230F368→sub_8230F098→KeWaitForSingleObject(0x36E30,∞)`.
+
+### Fix B — real PM4 command-processor interpreter (commit f6affa2)
+Replaced the null-GPU blind RPtr advance with an actual interpreter in kernel.cpp (ExecutePM4 /
+ExecuteType3 / ExecuteRing), structured 1:1 with rexglue command_processor.cpp. The pump, when WPTR
+advances, runs ExecuteRing(lastWptr, wptr) under the coop token, then advances RPtr.
+- **ADDRESS MODEL (verified, the key detail):** variant A's flat 4 GiB map puts "physical" GPU memory
+  (MmAllocatePhysicalMemoryEx, the ring, the IBs) in the **0xA0000000 window**. The PM4 carries physical
+  addresses with mirror bits stripped (e.g. IB addr 0x90040), so `TranslatePhys(p) = 0xA0000000 | (p &
+  0x1FFFFFFF)`. PROVEN by dumping: IB#1 phys 0x90040 → guest **0xA0090040** holds real PM4 (a
+  WAIT_REG_MEM packet), while raw 0x90040 is zero; IB#2 0x10000 → **0xA0010000** holds PM4, raw 0x10000
+  holds UTF-16 text. ring base 0xA0002000 is self-consistent (TranslatePhys(0xA0002000)=0xA0002000).
+- Ring decode (WPTR=25 dwords): `C0114800`=ME_INIT(0x48,count18) + `C0013F00`=INDIRECT_BUFFER(0x3F)→
+  [0x90040,len11] + INDIRECT_BUFFER→[0x10000,len64]. PM4 opcodes from xenos.h (note PM4_INTERRUPT=0x54,
+  XE_SWAP=0x64). Handlers: type-0/1 reg writes → 0x7FC80000 window; ME_INIT/NOP/SET_CONSTANT/WAIT_REG_MEM
+  skipped; INDIRECT_BUFFER recurses (depth-guarded); EVENT_WRITE_SHD writes the fence value (GST32 = BE,
+  k8in32) the guest polls; INTERRUPT fires the gfx callback per cpu-bit; DRAW_INDX/2 + XE_SWAP counted.
+- VERIFIED RUN (REX_CPTRACE=1): executes the init batch, recurses IB#2 into 3 nested IBs (0xA2014000 /
+  0xA2014D40 / 0xA2015980), writes 2 fences (0xA2010000=0x3, 0xA2010004=0xA00100D4). **The fence
+  side-effects advanced the main thread past 0x36E30 to the next GPU-completion wait 0x388C4** (231620).
+  REX_EVTRACE confirms: 0x36E30/0x36E54/0x388C4/0x388E8 each signaled once; 0x29CD4 waited 1314×, never
+  signaled.
+
+### CURRENT FRONTIER (precise, resume here) — the GPU-device TEARDOWN after init
+After the interpreter executes the init batch, a **worker thread tears down the whole GPU device**.
+Pinpointed with a hardware watchpoint on device+10900 (device = g_interruptData = 0x26F80):
+1. `sub_821C73D8(device, config=0x828C1298)` builds the device (lr=0x821C7FFC, in sub_821C7F08): allocs
+   cmdbuf1=**0xA0002000 (THE RING)**, cmdbuf2=0xA0010000, blk96 @device+10896=0xA2010000 (the GPU
+   identifier/fence block, set by VdSetSystemCommandBufferGpuIdentifierAddress — a no-op in both builds),
+   handler-block @device+10900=0xA2011000 (the command-complete handler block read by callback source==1).
+2. Then a worker (`sub_8214F730→sub_8214F738→sub_822A2158→sub_822A7C08→sub_822A58F8`) memsets 16 buffers
+   (sub_8242BF10 = memset), **zeroing device+10900, +10896, +15044(cmdbuf1 ptr), +15048(cmdbuf2 ptr) all
+   to 0**. The ring @0xA0002000 still holds ME_INIT, but the device's buffer pointers are wiped.
+3. STUCK STATE: main thread waits 0x388C4 (∞); render workers `sub_821CC5D0` wait 0x29CD4 (30ms poll) /
+   0x29D40 (∞) — these GPU-completion events are NEVER signaled. The command-complete callback path
+   (sub_821C7170 source==1) can't help because device+10900 is now 0.
+
+INTERPRETATION (hypothesis, NOT yet proven): the title sets up the GPU, the init handshake isn't
+satisfied by the CP, and a worker tears the device down (or it's a normal "free temp init buffers" step
+the title can't progress past because the next phase's completion never arrives). The teardown is guest
+code (a worker task sub_822A2158, 6 args), reached only BECAUSE the interpreter advanced the title there
+— it is not interpreter-caused corruption (it's a guest memset of guest buffers).
+
+### NEXT STEPS (in priority order)
+1. **Root-cause the teardown / handshake.** Trace what makes the worker run sub_822A2158 and whether it's
+   gated on a fence/identifier value at the GPU id block (0xA2010000 region) or a register — i.e. what
+   "GPU init succeeded" signal the CP must produce. Watchpoint device+15044 / the id block; diff vs the
+   reference oracle (prod renders, so its worker either doesn't tear down or re-inits). ⚠ prod is Release
+   (no ctx symbols) — read its guest memory via its membase + break by guest symbol.
+2. **Verify the EVENT_WRITE_SHD fence semantics** the render workers (0x29CD4/0x29D40) actually poll —
+   they may need a counter fence (is_counter) tied to XE_SWAP, or a specific value the nested IBs request.
+3. Once init completes and the title submits frames (WPTR advances repeatedly, XE_SWAP fires): wire
+   DRAW_INDX/DRAW_INDX_2 → Plume Vulkan + the 19 shaders (private/extracted/media/shaders/*.updb), crib
+   Unleashed gpu/video.cpp. = the multi-week render remainder.
+
+TOOLING: REX_CPTRACE=1 (PM4 packet trace), REX_EVTRACE=1 (event signal/wait count maps g_evSignalCount/
+g_evWaitCount, readable via gdb `p '(anonymous namespace)::g_evSignalCount'`). gdb scripts in /tmp:
+dumpring.gdb (ring+IB dump), threads_va.gdb (thread dump), watch_teardown.gdb (the teardown watchpoint),
+verify_dev.gdb (device-buffer state). Attach to the BINARY pid (filter /proc/PID/comm; pgrep -f also
+matches the shell wrapper). Reading guest memory under attach is safe; live ctx stepping fights the token.
