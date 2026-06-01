@@ -808,6 +808,48 @@ PPC_FUNC(__imp__VdSetGraphicsInterruptCallback)
 PPC_FUNC(__imp__VdInitializeEngines) { ctx.r3.u64 = 1; }
 PPC_FUNC(__imp__VdSetSystemCommandBufferGpuIdentifierAddress) { /* no-op */ }
 
+// ---- the rest of the Vd* video surface (fill the out-params the D3D device init reads) -------------
+// void VdGetSystemCommandBuffer(p0 r3, p1 r4) — zero 0x94 at p0, then the two GPU identifiers.
+PPC_FUNC(__imp__VdGetSystemCommandBuffer)
+{
+    uint32_t p0 = ctx.r3.u32, p1 = ctx.r4.u32;
+    if (p0) { for (uint32_t i = 0; i < 0x94; i += 4) PPC_STORE_U32(p0 + i, 0); PPC_STORE_U32(p0, 0xBEEF0000u); }
+    if (p1) PPC_STORE_U32(p1, 0xBEEF0001u);
+    KTRACE("VdGetSystemCommandBuffer -> 0xBEEF0000/0xBEEF0001\n");
+}
+
+// void VdGetCurrentDisplayInformation(X_DISPLAY_INFO* r3) — 0x58 bytes; fill 1280x720.
+PPC_FUNC(__imp__VdGetCurrentDisplayInformation)
+{
+    uint32_t d = ctx.r3.u32; if (!d) return;
+    for (uint32_t i = 0; i < 0x58; i += 4) PPC_STORE_U32(d + i, 0);
+    PPC_STORE_U16(d + 0x00, 1280); PPC_STORE_U16(d + 0x02, 720);   // front_buffer width/height
+    PPC_STORE_U16(d + 0x48, 1280); PPC_STORE_U16(d + 0x4A, 720);   // display width/height
+    PPC_STORE_U16(d + 0x56, 1280);                                  // actual_display_width
+}
+
+// DWORD VdQueryVideoFlags() -> widescreen(1) | width>=1024(2)
+PPC_FUNC(__imp__VdQueryVideoFlags) { ctx.r3.u64 = 1u | 2u; }
+
+// void VdGetCurrentDisplayGamma(*type r3, *power r4) -> sRGB, 2.2
+PPC_FUNC(__imp__VdGetCurrentDisplayGamma)
+{
+    if (ctx.r3.u32) PPC_STORE_U32(ctx.r3.u32, 1);
+    if (ctx.r4.u32) { float p = 2.2f; uint32_t b; memcpy(&b, &p, 4); PPC_STORE_U32(ctx.r4.u32, b); }
+}
+
+PPC_FUNC(__imp__VdIsHSIOTrainingSucceeded) { ctx.r3.u64 = 1; }           // BOOL TRUE
+PPC_FUNC(__imp__VdSetDisplayMode)          { ctx.r3.u64 = 0; }
+PPC_FUNC(__imp__VdShutdownEngines)         { /* ignored */ }
+PPC_FUNC(__imp__VdRetrainEDRAM)            { ctx.r3.u64 = 0; }
+PPC_FUNC(__imp__VdRetrainEDRAMWorker)      { ctx.r3.u64 = 0; }
+PPC_FUNC(__imp__VdPersistDisplay)          { if (ctx.r4.u32) PPC_STORE_U32(ctx.r4.u32, 0); ctx.r3.u64 = 0; }
+PPC_FUNC(__imp__VdCallGraphicsNotificationRoutines) { ctx.r3.u64 = 0; }
+PPC_FUNC(__imp__VdEnableDisableClockGating)         { /* no-op */ }
+PPC_FUNC(__imp__VdInitializeScalerCommandBuffer)    { ctx.r3.u64 = 0; }
+// void VdSwap(...) — frame present. Minimal: acknowledge (real present = renderer phase).
+PPC_FUNC(__imp__VdSwap) { ctx.r3.u64 = 0; }
+
 // ====================================================================================================
 // Dispatch-object synchronization: events, semaphores, single/multiple waits (goal: stable threading).
 // Pointer-based Ke* operate on guest dispatch objects directly; the wait core lives above (WaitObject).
