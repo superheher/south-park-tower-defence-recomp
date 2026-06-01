@@ -322,3 +322,14 @@ spinning, starving everything else). **This is the GPU-CP / renderer boundary (g
 them — isolates concurrency bugs). gdb hardware watchpoints on `g_base+<guestaddr>` pinpoint who writes a
 guest global (and which host thread). Build: `cmake --build runtime/out --target sp_td_varianta` then
 `./sp_td_varianta <abs path to default.xex>`.
+
+### UPDATE 2 — FP-mask unlock crosses the device build; dual frontier (jump-tables + GPU)
+Major: a zeroed `PPCContext{}.fpscr.csr` made the guest's first `setcsr` unmask host FP exceptions, so
+every `fctidz` trapped (SIGFPE inexact). Init `ctx.fpscr.csr=0x1F80` (all 3 context sites) crossed the
+ENTIRE device-build FP cascade at once. + `VdQueryVideoMode` (device build calls it, was unfilled→div0)
++ `KeDelayExecutionThread`/`NtDelayExecution` as token-yielding sleeps (broke the GPU-init hang). Boot now
+runs deep into GPU/render init on the main thread. NEW frontier is DUAL: (1) the **function-boundary /
+jump-table problem** resurfaces at runtime — `sub_821DC228:17351` computed-jumps through a table @0x8221C244
+that XenonAnalyse missed → recompiler emitted `PPC_CALL_INDIRECT_FUNC(0x821DC29C)` (a mid-function LABEL,
+not a function) → null dispatch → PC=0 SIGSEGV. Fix = recover the table into `sp_switch_tables.toml` +
+regenerate ppc/ (likely several such tables). (2) the GPU engine (device reads 0 GPU registers; CP/PM4/Plume).
