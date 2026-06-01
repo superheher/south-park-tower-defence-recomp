@@ -826,13 +826,23 @@ PPC_FUNC(__imp__VdGetSystemCommandBuffer)
     KTRACE("VdGetSystemCommandBuffer -> 0xBEEF0000/0xBEEF0001\n");
 }
 
-// void VdGetCurrentDisplayInformation(X_DISPLAY_INFO* r3) — 0x58 bytes; fill 1280x720.
+// void VdGetCurrentDisplayInformation(X_DISPLAY_INFO* r3) — 0x58 bytes; fill 1280x720 COMPLETELY
+// (incl. the scaler sub-struct — a zeroed scaled_output_w/h is a div-by-zero source in device build).
 PPC_FUNC(__imp__VdGetCurrentDisplayInformation)
 {
     uint32_t d = ctx.r3.u32; if (!d) return;
     for (uint32_t i = 0; i < 0x58; i += 4) PPC_STORE_U32(d + i, 0);
     PPC_STORE_U16(d + 0x00, 1280); PPC_STORE_U16(d + 0x02, 720);   // front_buffer width/height
+    // scaler_parameters @ 0x8: source_rect.x2/y2 @ +0x10/+0x14, scaled_output_w/h @ +0x18/+0x1C,
+    // horizontal/vertical_filter_type @ +0x30/+0x34.
+    PPC_STORE_U32(d + 0x10, 1280); PPC_STORE_U32(d + 0x14, 720);   // scaler_source_rect.x2/y2
+    PPC_STORE_U32(d + 0x18, 1280); PPC_STORE_U32(d + 0x1C, 720);   // scaled_output_width/height
+    PPC_STORE_U32(d + 0x30, 1);    PPC_STORE_U32(d + 0x34, 1);     // h/v filter_type
+    PPC_STORE_U16(d + 0x40, 320);  PPC_STORE_U16(d + 0x42, 180);   // overscan left/top (w/4, h/4)
+    PPC_STORE_U16(d + 0x44, 320);  PPC_STORE_U16(d + 0x46, 180);   // overscan right/bottom
     PPC_STORE_U16(d + 0x48, 1280); PPC_STORE_U16(d + 0x4A, 720);   // display width/height
+    { float hz = 60.0f; uint32_t b; memcpy(&b, &hz, 4); PPC_STORE_U32(d + 0x4C, b); } // refresh_rate
+    PPC_STORE_U32(d + 0x50, 0);                                     // display_interlaced
     PPC_STORE_U16(d + 0x56, 1280);                                  // actual_display_width
 }
 
