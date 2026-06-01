@@ -597,6 +597,20 @@ uint32_t g_nextHandle = 0xF1000000;          // private handle space (avoids 0xF
 std::atomic<uint32_t> g_nextThreadId{2};     // main thread is id 1
 const bool g_noSpawn = getenv("REX_NOSPAWN") != nullptr;  // diagnostic: create handles but don't run
 
+// Non-thread dispatch objects (events, etc.): handle -> guest dispatch-header address. Backed by a
+// small arena in the kernel region (above the thread structs / worker stacks).
+std::unordered_map<uint32_t, uint32_t> g_objHandles;
+uint32_t g_objArenaNext = 0x90400000;
+uint32_t AllocObject(uint32_t size) { uint32_t a = g_objArenaNext; g_objArenaNext += (size + 0x1F) & ~0x1Fu; return a; }
+
+// Resolve a guest handle to its dispatch-header address (thread KTHREAD or event object); 0 if unknown.
+uint32_t ResolveObject(uint32_t handle) {
+    std::lock_guard<std::mutex> lk(g_handleMutex);
+    auto t = g_handles.find(handle);    if (t != g_handles.end()) return t->second->threadAddr;
+    auto o = g_objHandles.find(handle); if (o != g_objHandles.end()) return o->second;
+    return 0;
+}
+
 // ---- dispatch-object wait/signal (events, semaphores, mutants, thread-exit) ------------------------
 // Xbox dispatch objects carry an X_DISPATCH_HEADER (type@0x00 u8, signal_state@0x04 s32). We back
 // waits with one global condition variable; the signal_state lives in guest memory. Coarse but
@@ -709,14 +723,8 @@ PPC_FUNC(__imp__NtResumeThread)
 // NTSTATUS ObReferenceObjectByHandle(handle r3, type r4, *out_object r5) -> guest object ptr (KTHREAD)
 PPC_FUNC(__imp__ObReferenceObjectByHandle)
 {
-    uint32_t handle = ctx.r3.u32, pOut = ctx.r5.u32, obj = 0;
-    if (handle == 0xFFFFFFFE) {                          // NtCurrentThread pseudo-handle
-        obj = PPC_LOAD_U32(ctx.r13.u32 + 0x100);
-    } else {
-        std::lock_guard<std::mutex> lk(g_handleMutex);
-        auto it = g_handles.find(handle);
-        if (it != g_handles.end()) obj = it->second->threadAddr;
-    }
+    uint32_t handle = ctx.r3.u32, pOut = ctx.r5.u32;
+    uint32_t obj = (handle == 0xFFFFFFFE) ? PPC_LOAD_U32(ctx.r13.u32 + 0x100) : ResolveObject(handle);
     if (pOut) PPC_STORE_U32(pOut, obj);
     ctx.r3.u64 = obj ? 0 : 0xC0000008u;  // STATUS_INVALID_HANDLE
 }
@@ -922,10 +930,8 @@ PPC_FUNC(__imp__KeWaitForSingleObject)
 // NTSTATUS NtWaitForSingleObjectEx(handle r3, mode r4, alertable r5, *timeout r6)
 PPC_FUNC(__imp__NtWaitForSingleObjectEx)
 {
-    uint32_t handle = ctx.r3.u32, obj = 0;
-    if (handle == 0xFFFFFFFE) obj = PPC_LOAD_U32(ctx.r13.u32 + 0x100);   // current thread
-    else { std::lock_guard<std::mutex> lk(g_handleMutex); auto it = g_handles.find(handle);
-           if (it != g_handles.end()) obj = it->second->threadAddr; }
+    uint32_t handle = ctx.r3.u32;
+    uint32_t obj = (handle == 0xFFFFFFFE) ? PPC_LOAD_U32(ctx.r13.u32 + 0x100) : ResolveObject(handle);
     if (!obj) { ctx.r3.u64 = 0; return; }   // unknown handle: don't hang during bring-up
     ctx.r3.u64 = WaitObject(obj, TimeoutMs(ctx.r6.u32));
 }
@@ -1168,3 +1174,50 @@ PPC_FUNC(__imp__KeWaitForMultipleObjects)
     if (g_coop) lk.release();                                // coop: keep the token held as we resume
     ctx.r3.u64 = (waitType == 1) ? static_cast<uint32_t>(idx) : 0;   // WAIT_OBJECT_0 + idx
 }
+
+// ---- handle-based events (workers create these to synchronize) -------------------------------------
+// DWORD NtCreateEvent(*handle r3, obj_attr r4, type r5 (0=manual,1=auto), initial_state r6)
+PPC_FUNC(__imp__NtCreateEvent)
+{
+    uint32_t pHandle = ctx.r3.u32, type = ctx.r5.u32, initState = ctx.r6.u32, obj, handle;
+    { std::lock_guard<std::mutex> lk(g_handleMutex); obj = AllocObject(0x20); handle = g_nextHandle++;
+      g_objHandles[handle] = obj; }
+    PPC_STORE_U8 (obj + 0x00, type == 0 ? 0 : 1);   // dispatch type: notification(0)/synchronization(1)
+    PPC_STORE_U8 (obj + 0x01, 0);
+    PPC_STORE_U32(obj + 0x04, initState ? 1 : 0);   // signal_state
+    PPC_STORE_U32(obj + 0x08, obj + 0x08); PPC_STORE_U32(obj + 0x0C, obj + 0x08);  // wait_list self-ref
+    if (pHandle) PPC_STORE_U32(pHandle, handle);
+    KTRACE("NtCreateEvent(type=%u init=%u) -> handle=0x%X\n", type, initState, handle);
+    ctx.r3.u64 = 0;
+}
+// LONG NtSetEvent(handle r3, *prev r4)
+PPC_FUNC(__imp__NtSetEvent)
+{
+    uint32_t obj = ResolveObject(ctx.r3.u32);
+    if (obj) { int32_t prev = static_cast<int32_t>(PPC_LOAD_U32(obj + 0x04)); SignalObject(obj, 1);
+               if (ctx.r4.u32) PPC_STORE_U32(ctx.r4.u32, static_cast<uint32_t>(prev)); }
+    ctx.r3.u64 = 0;
+}
+PPC_FUNC(__imp__NtClearEvent) { uint32_t o = ResolveObject(ctx.r3.u32); if (o) PPC_STORE_U32(o + 0x04, 0); ctx.r3.u64 = 0; }
+PPC_FUNC(__imp__NtPulseEvent)
+{
+    uint32_t obj = ResolveObject(ctx.r3.u32);
+    if (obj) { int32_t prev = static_cast<int32_t>(PPC_LOAD_U32(obj + 0x04)); SignalObject(obj, 1);
+               SignalObject(obj, 0); if (ctx.r4.u32) PPC_STORE_U32(ctx.r4.u32, static_cast<uint32_t>(prev)); }
+    ctx.r3.u64 = 0;
+}
+
+// ---- spinlocks / critical regions / IRQL (kernel-level serialization) ------------------------------
+namespace { void SpinAcquire(uint32_t lock) {   // per-lock host mutex; release the token if contended
+    auto* m = CsLock(lock);
+    if (!m->try_lock()) { kernel::UnlockGuestExecution(); m->lock(); kernel::LockGuestExecution(); }
+} }
+PPC_FUNC(__imp__KfAcquireSpinLock)               { SpinAcquire(ctx.r3.u32); ctx.r3.u64 = 0; }  // -> old IRQL
+PPC_FUNC(__imp__KfReleaseSpinLock)               { CsLock(ctx.r3.u32)->unlock(); }
+PPC_FUNC(__imp__KeAcquireSpinLockAtRaisedIrql)   { SpinAcquire(ctx.r3.u32); }
+PPC_FUNC(__imp__KeReleaseSpinLockFromRaisedIrql) { CsLock(ctx.r3.u32)->unlock(); }
+PPC_FUNC(__imp__KeTryToAcquireSpinLockAtRaisedIrql) { ctx.r3.u64 = CsLock(ctx.r3.u32)->try_lock() ? 1 : 0; }
+PPC_FUNC(__imp__KeEnterCriticalRegion)           { /* APC-disable: no-op (no APC delivery yet) */ }
+PPC_FUNC(__imp__KeLeaveCriticalRegion)           { /* no-op */ }
+PPC_FUNC(__imp__KeRaiseIrqlToDpcLevel)           { ctx.r3.u64 = 0; }   // old IRQL
+PPC_FUNC(__imp__KfLowerIrql)                     { /* no-op */ }
