@@ -387,3 +387,29 @@ lanes) silently mis-emitting a computation; a missing import returning wrong dat
 mismatch. Method: `gdb -batch`, `break ppc_recomp.N.cpp:LINE`, read `ctx.rN.u32` / `base` (the `-O0`
 host frames + file:line map cleanly). Then: more init → the GPU engine (PM4 / register MMIO / Plume +
 19 shaders) — still multi-week.
+
+### Frontier fully traced — XUI resource-header validation (sub_82244378), and instruction-gap RULED OUT
+Followed the `0x8030001C` error down 8 levels of the static-init virtual-dispatch chain
+(`sub_822009F0:12679 → sub_822000A0:11159 → … → sub_82244378`). `sub_82244378`
+(`ppc_recomp.28.cpp:14315-14353`) is a **XUI resource-header validator**:
+- `*(r1+112) == 0x5855495A` ("XUIZ" magic) — **passes**.
+- `*(r1+80) == 22` (size) — **passes**. ⚠ Read `ctx.rN.u32` (the byte-swapped guest value), not raw
+  `*(uint*)(base+addr)`; the raw bytes read `0x16000000` and *look* like a byte-order bug but are not —
+  `PPC_LOAD_U32`/`lwz` swaps them to 22.
+- **FAILS at `:14351`** `cmplw cr6,r31,r3`: `*(r1+120) = 0x167d346` (a heap object) vs the virtual call
+  at `:14349` — `sub_82469FD0`, a trivial getter `r3 = *(this+8)` — which returns **`0x700ff800`, a
+  STACK address**. They must be equal; they differ → `goto loc_82244740` → builds `0x8030001C`.
+
+Root: the XUI-loader object at `0xd8a70` was constructed with its **+8 field = a stack pointer** where a
+persistent heap object is expected — an object-identity/lifetime divergence during XUI resource
+construction (its own root is further upstream). Next: trace who constructs `object@0xd8a70`, what
+`*(r1+120) = 0x167d346` is, and why `+8` holds a stack address.
+
+**Instruction gap RULED OUT as the cause:** a full regen reports ZERO "Unrecognized instruction"; the
+only warning is `vcmpgtuh.` ×39 (a VMX compare-with-record not setting CR6 — irrelevant to this scalar
+CRT/XUI path). So the divergence is **data/semantic** (object construction), not codegen. The count
+divergence in `sub_821E07A0` (~10k) is likely the same family.
+
+Method that worked well for this archaeology: `gdb -batch`, `break ppc_recomp.N.cpp:LINE`, inspect
+`ctx.rN.u32` / `base` (the `-O0` host frames + file:line map cleanly; finish/return-value reads are
+flaky inside `commands` blocks — break at the post-call line instead).
