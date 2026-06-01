@@ -803,30 +803,49 @@ std::atomic<bool> g_vblankRunning{false};
 uint32_t g_pumpKpcr = 0, g_pumpStack = 0;
 std::atomic<uint32_t> g_vblankCount{0};
 
+// Xbox 360 GPU register window is at guest 0x7FC80000 (reg index r -> 0x7FC80000 + r*4). The guest
+// kicks the ring buffer by writing the write index to CP_RB_WPTR (0x1C5); the GPU reports progress in
+// CP_RB_RPTR (0x1C4) and the title's RPtr write-back location. Ref: rexglue-sdk graphics_system.cpp.
+constexpr uint32_t kReg_CP_RB_RPTR = 0x7FC80000 + 0x1C4 * 4;   // 0x7FC80710
+constexpr uint32_t kReg_CP_RB_WPTR = 0x7FC80000 + 0x1C5 * 4;   // 0x7FC80714
+
+// Fire the guest graphics-interrupt callback (source: 0=vblank, 1=command-buffer complete) on the pump's
+// own context. Caller holds the cooperative token. Per rexglue, the TLS ptr must read 0 during interrupts.
+static void FireGfxInterrupt(uint32_t cb, uint32_t source) {
+    PPCContext ctx{};
+    ctx.fpscr.csr = 0x1F80;              // default MXCSR: all FP exceptions masked
+    ctx.r1.u64 = g_pumpStack - 0x200;
+    ctx.r13.u64 = g_pumpKpcr;
+    ctx.r3.u64 = source;
+    ctx.r4.u64 = g_interruptData;
+    uint32_t savedTls = GLD32(g_pumpKpcr + 0x00);
+    GST32(g_pumpKpcr + 0x00, 0);
+    CallGuest(cb, ctx);
+    GST32(g_pumpKpcr + 0x00, savedTls);
+}
+
 void VblankPump() {
+    uint32_t lastWptr = 0;
     while (g_vblankRunning.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(16));   // ~60 Hz
         g_vblankCount.fetch_add(1);
         uint32_t cb = g_interruptCallback;
         if (!cb) continue;
-        // Fire the guest graphics interrupt callback (source = 0 vblank) on the pump's own context,
-        // holding the cooperative execution token (it runs guest code). Per rexglue, the TLS ptr must
-        // read 0 during interrupts (some titles check it). NOTE: the title's cb (sub_821C7170) branches
-        // on source==1 for command-buffer completion, but firing that here without first ADVANCING RPtr
-        // (real CP consumption of the ring buffer @g_ringBufferBase up to the title's WPtr) is a spurious
-        // completion the handler correctly ignores — so the render-wait (event 0x36E70) only releases
-        // once a real command processor advances RPtr. That CP is the remaining GPU-engine work.
         if (g_coop) g_waitMutex.lock();
-        PPCContext ctx{};
-        ctx.fpscr.csr = 0x1F80;          // default MXCSR: all FP exceptions masked
-        ctx.r1.u64 = g_pumpStack - 0x200;
-        ctx.r13.u64 = g_pumpKpcr;
-        ctx.r3.u64 = 0;                  // source = vblank
-        ctx.r4.u64 = g_interruptData;
-        uint32_t savedTls = GLD32(g_pumpKpcr + 0x00);
-        GST32(g_pumpKpcr + 0x00, 0);
-        CallGuest(cb, ctx);
-        GST32(g_pumpKpcr + 0x00, savedTls);
+        // Null-GPU command processor: the guest kicked by writing the ring-buffer write index to
+        // CP_RB_WPTR. With no real GPU we "consume" instantly — advance RPtr to WPtr in both the
+        // CP_RB_RPTR register and the guest's RPtr write-back location — so the title's render path
+        // sees its submitted PM4 as complete and its render-wait releases. (No PM4 is actually executed
+        // yet, so no pixels; this only lets the title proceed to issue/await draws — the next GPU step.)
+        uint32_t wptr = GLD32(kReg_CP_RB_WPTR);
+        bool consumed = (g_ringBufferBase && wptr != lastWptr);
+        if (consumed) {
+            GST32(kReg_CP_RB_RPTR, wptr);
+            if (g_rptrWriteBack) GST32(g_rptrWriteBack, wptr);
+            lastWptr = wptr;
+        }
+        FireGfxInterrupt(cb, 0);                  // vblank
+        if (consumed) FireGfxInterrupt(cb, 1);    // command-buffer complete
         if (g_coop) g_waitMutex.unlock();
     }
 }
