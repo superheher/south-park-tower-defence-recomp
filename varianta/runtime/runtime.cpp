@@ -77,12 +77,25 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // 6. Init context + a guest stack, then call the guest entry.
-    //    (msr defaults to 0x200A000 via the PPCContext struct; everything else zero.)
-    static PPCContext ctx{};
-    constexpr uint32_t STACK_TOP = 0x70100000;   // below the image, inside the 4 GiB map
+    // 6. Set up a minimal guest thread environment. On Xbox 360 (this recomp's convention) r13 holds
+    //    the KPCR pointer; early CRT init reads the current thread via *(r13 + offsetof(X_KPCR,
+    //    prcb_data.current_thread)). Layout (rexglue X_KPCR, size 0x2D8): tls_ptr@0x0,
+    //    stack_base_ptr@0x70 (high), stack_end_ptr@0x74 (low), prcb_data@0x100 (X_KPRCB;
+    //    current_thread@0x0), prcb@0x2A8. KTHREAD is left zeroed for now (populate as the boot demands).
+    auto store32 = [&](uint32_t addr, uint32_t val) {
+        *reinterpret_cast<uint32_t*>(g_base + addr) = __builtin_bswap32(val);
+    };
+    constexpr uint32_t STACK_TOP = 0x70100000, STACK_BOTTOM = 0x70000000;
+    constexpr uint32_t KPCR = 0x60000000, KTHREAD = 0x60010000, TLS = 0x60020000;
+    store32(KPCR + 0x00, TLS);                  // tls_ptr
+    store32(KPCR + 0x70, STACK_TOP);            // stack_base_ptr (high address)
+    store32(KPCR + 0x74, STACK_BOTTOM);         // stack_end_ptr  (low address)
+    store32(KPCR + 0x100, KTHREAD);             // prcb_data.current_thread
+    store32(KPCR + 0x2A8, KPCR + 0x100);        // prcb -> &prcb_data
+
+    static PPCContext ctx{};                     // msr defaults to 0x200A000; everything else zero
     ctx.r1.u64 = STACK_TOP - 0x200;              // SP with a little headroom; back-chain is zeroed
-    ctx.r13.u64 = 0x60000000;                    // provisional TLS / thread pointer (zeroed region)
+    ctx.r13.u64 = KPCR;                          // KPCR pointer (Xbox 360 thread-base convention)
 
     fprintf(stderr, "[boot] calling guest entry 0x%zX (SP=0x%llX)...\n",
         image.entry_point, (unsigned long long)ctx.r1.u64);
