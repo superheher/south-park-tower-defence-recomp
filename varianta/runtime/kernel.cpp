@@ -672,11 +672,14 @@ const bool g_coop = (getenv("REX_NOTOKEN") == nullptr);
 const bool g_evtrace = (getenv("REX_EVTRACE") != nullptr);
 
 std::map<uint32_t,uint32_t> g_evSignalCount, g_evWaitCount;   // obj -> count (guarded by g_evMutex)
+std::map<uint32_t,uint32_t> g_evSignalLR, g_evWaitLR;         // obj -> first guest caller LR
 std::mutex g_evMutex;
+thread_local uint32_t g_tlSignalLR = 0;   // ctx.lr of the guest fn that called the current signal/wait
 void SignalObject(uint32_t obj, int32_t state) {
     if (g_evtrace) {
         std::lock_guard<std::mutex> lk(g_evMutex);
         g_evSignalCount[obj]++;
+        if (!g_evSignalLR.count(obj)) g_evSignalLR[obj] = g_tlSignalLR;
     }
     if (g_coop) { GST32(obj + 0x04, static_cast<uint32_t>(state)); }   // caller already holds the token
     else { std::lock_guard<std::mutex> lk(g_waitMutex); GST32(obj + 0x04, static_cast<uint32_t>(state)); }
@@ -692,6 +695,7 @@ uint32_t WaitObject(uint32_t obj, int64_t timeoutMs) {
     if (g_evtrace) {
         std::lock_guard<std::mutex> lk2(g_evMutex);
         g_evWaitCount[obj]++;
+        if (!g_evWaitLR.count(obj)) g_evWaitLR[obj] = g_tlSignalLR;
     }
     bool ok = true;
     if (timeoutMs < 0) g_waitCv.wait(lk, signaled);
@@ -1171,6 +1175,7 @@ PPC_FUNC(__imp__KeInitializeEvent)
 // LONG KeSetEvent(event r3, increment r4, wait r5) -> previous signal state
 PPC_FUNC(__imp__KeSetEvent)
 {
+    g_tlSignalLR = ctx.lr;
     uint32_t e = ctx.r3.u32;
     int32_t prev = static_cast<int32_t>(PPC_LOAD_U32(e + 0x04));
     SignalObject(e, 1);
@@ -1189,6 +1194,7 @@ PPC_FUNC(__imp__KeResetEvent)
 // LONG KePulseEvent(event r3, increment r4, wait r5) — signal then immediately clear
 PPC_FUNC(__imp__KePulseEvent)
 {
+    g_tlSignalLR = ctx.lr;
     uint32_t e = ctx.r3.u32;
     int32_t prev = static_cast<int32_t>(PPC_LOAD_U32(e + 0x04));
     SignalObject(e, 1);
@@ -1210,6 +1216,7 @@ PPC_FUNC(__imp__KeInitializeSemaphore)
 // LONG KeReleaseSemaphore(sem r3, increment r4, adjustment r5, wait r6) -> previous count
 PPC_FUNC(__imp__KeReleaseSemaphore)
 {
+    g_tlSignalLR = ctx.lr;
     uint32_t s = ctx.r3.u32;
     int32_t prev = static_cast<int32_t>(PPC_LOAD_U32(s + 0x04));
     SignalObject(s, prev + static_cast<int32_t>(ctx.r5.u32));
@@ -1219,6 +1226,7 @@ PPC_FUNC(__imp__KeReleaseSemaphore)
 // NTSTATUS KeWaitForSingleObject(object r3, reason r4, mode r5, alertable r6, *timeout r7)
 PPC_FUNC(__imp__KeWaitForSingleObject)
 {
+    g_tlSignalLR = ctx.lr;
     ctx.r3.u64 = WaitObject(ctx.r3.u32, TimeoutMs(ctx.r7.u32));
 }
 
@@ -1457,6 +1465,7 @@ PPC_FUNC(__imp__NtClose)
 //                                   alertable r8, *timeout r9, waitblocks r10)
 PPC_FUNC(__imp__KeWaitForMultipleObjects)
 {
+    g_tlSignalLR = ctx.lr;
     uint32_t count = ctx.r3.u32, objects = ctx.r4.u32, waitType = ctx.r5.u32; // 0=WaitAll, 1=WaitAny
     int64_t timeoutMs = TimeoutMs(ctx.r9.u32);
     std::unique_lock<std::mutex> lk = g_coop ? std::unique_lock<std::mutex>(g_waitMutex, std::adopt_lock)
@@ -1497,6 +1506,7 @@ PPC_FUNC(__imp__KeWaitForMultipleObjects)
 // waits WaitAny on its two render/sync events). Reference: rexglue-sdk xeNtWaitForMultipleObjectsEx.
 PPC_FUNC(__imp__NtWaitForMultipleObjectsEx)
 {
+    g_tlSignalLR = ctx.lr;
     uint32_t count = ctx.r3.u32, handles = ctx.r4.u32, waitType = ctx.r5.u32;
     int64_t timeoutMs = TimeoutMs(ctx.r8.u32);
     uint32_t objs[64];
@@ -1545,6 +1555,7 @@ PPC_FUNC(__imp__NtCreateEvent)
 // LONG NtSetEvent(handle r3, *prev r4)
 PPC_FUNC(__imp__NtSetEvent)
 {
+    g_tlSignalLR = ctx.lr;
     uint32_t obj = ResolveObject(ctx.r3.u32);
     if (obj) { int32_t prev = static_cast<int32_t>(PPC_LOAD_U32(obj + 0x04)); SignalObject(obj, 1);
                if (ctx.r4.u32) PPC_STORE_U32(ctx.r4.u32, static_cast<uint32_t>(prev)); }
@@ -1553,6 +1564,7 @@ PPC_FUNC(__imp__NtSetEvent)
 PPC_FUNC(__imp__NtClearEvent) { uint32_t o = ResolveObject(ctx.r3.u32); if (o) PPC_STORE_U32(o + 0x04, 0); ctx.r3.u64 = 0; }
 PPC_FUNC(__imp__NtPulseEvent)
 {
+    g_tlSignalLR = ctx.lr;
     uint32_t obj = ResolveObject(ctx.r3.u32);
     if (obj) { int32_t prev = static_cast<int32_t>(PPC_LOAD_U32(obj + 0x04)); SignalObject(obj, 1);
                SignalObject(obj, 0); if (ctx.r4.u32) PPC_STORE_U32(ctx.r4.u32, static_cast<uint32_t>(prev)); }

@@ -691,3 +691,52 @@ g_evWaitCount, readable via gdb `p '(anonymous namespace)::g_evSignalCount'`). g
 dumpring.gdb (ring+IB dump), threads_va.gdb (thread dump), watch_teardown.gdb (the teardown watchpoint),
 verify_dev.gdb (device-buffer state). Attach to the BINARY pid (filter /proc/PID/comm; pgrep -f also
 matches the shell wrapper). Reading guest memory under attach is safe; live ctx stepping fights the token.
+
+## 2026-06-01 (cont.) — TEARDOWN ROOT-CAUSED: it is guest-heap memory corruption (NOT a GPU-init handshake)
+
+Drove the "GPU-device teardown" to ground with the reference oracle + watchpoints. The teardown is
+**memory corruption from a guest-heap double-allocation**, surfaced (not caused) by the PM4 interpreter
+advancing the title into ArcadeLogo.ptc resource processing.
+
+THE MECHANISM (all gdb-verified):
+- A worker runs `sub_8214F738` which opens `game:\media\ArcadeLogo.ptc` (variant A handle 0xF2000002)
+  and processes it: `sub_822A2158 → sub_822A7C08 → sub_822A58F8`, which does **16 memcpys** (sub_8242BF10)
+  of the .ptc data (src in the .ptc load buffer ~0x5C5xx) into a resource buffer whose base is **0x262B0**
+  (a ~16 KB buffer: dst = base + r26, r26 ∈ {0,0x400,0x1400,0x2800,...}).
+- That buffer **overlaps the live GPU device struct at 0x26F80** (device spans 0x26F80..~0x2AA48; the
+  copies hit 0x276B0/0x28AB0/0x29EB0/0x2A2B0 and a watchpoint caught device+10900 (0x29A14) being set 0).
+  So loading the .ptc OVERWRITES the device — zeroing +10900 (cmd-complete handler block), +10896 (GPU id
+  block), +15044 (cmdbuf1/ring ptr), +15048 (cmdbuf2). That is the "teardown".
+- Corrupting the device is why the downstream GPU-completion waits never release (events 0x29CD4/0x29D40
+  in the device, 0x388C4 in the thread pool — main thread + render workers sub_821CC5D0 stall).
+
+REFERENCE-ORACLE COMPARISON (corrected — earlier "prod never calls sub_822A2158" was breakpoint-
+interference that segv'd prod; with a single breakpoint prod calls it **1×** and renders 55 pipelines):
+- Both prod AND variant A run the .ptc copy (`sub_822A2158`) — it is NORMAL processing, not error-recovery.
+- The divergence is PLACEMENT: prod's heap puts the .ptc buffer where it does NOT hit the device; variant
+  A's heap puts it OVERLAPPING the device.
+- prod's device is at **0x40016F80**; variant A's at **0x26F80** — both = `heap_base + 0x16F80`, but the
+  title heap base differs: prod 0x40000000, variant A 0x10000 (from `NtAllocateVirtualMemory req=0
+  sz=0x100000 → base=0x10000`, a 1 MB reserve; device + .ptc buffer are both sub-allocs inside it).
+  (prod device addr read from its log: `[gpu] SetInterruptCallback(821C7170, 40016F80)`.)
+
+⇒ ROOT: **variant A's guest heap (RtlAllocateHeap, sub_82448090; heap created by RtlCreateHeap
+sub_8244B380) double-allocates** — it hands out 0x262B0 for a 16 KB .ptc buffer while the device is live
+at 0x26F80. The heap's free-list is in a different state than prod's (the device's range isn't treated as
+in-use, or an earlier alloc/free diverged). Same CLASS as the original systemic NtQueryInformationFile
+bug: a subtle kernel-HLE/data divergence corrupting the title's own structures.
+
+NEXT STEPS (the fix):
+1. Find the heap-state divergence. Prime suspects: the heap-backing kernel HLE — `NtAllocateVirtualMemory`
+   / `NtFreeVirtualMemory` / `NtQueryVirtualMemory` semantics feeding RtlCreateHeap (sub_8244B380) wrong
+   region info (e.g. a wrong returned size/base so the heap mis-tracks free space), or a heap-block-header
+   field computed wrong. Watchpoint the device allocation (who allocates 0x26F80, is its range recorded?)
+   and the 0x262B0 allocation; diff the heap free-list vs the prod oracle (guest-level diff — the technique
+   that found the systemic bug).
+2. This is independent of the GPU CP (the CP writes only 0xA0000000+/0x7FC80000); the CP just advanced the
+   boot far enough to surface it. Once the heap stops corrupting the device, re-evaluate the GPU-completion
+   waits (they may then be satisfiable by the interpreter's fences/interrupts) → VdSwap → DRAW → Vulkan.
+
+TOOLING added: REX_EVTRACE now records per-event signaler/waiter guest LRs (g_evSignalLR/g_evWaitLR) —
+this is how the thread-pool producers/consumers were identified (signaler sub_8230E898, waiter
+sub_8230F098). gdb scripts /tmp/{collide,watch_teardown,openchk,prod_f738,prod_a2158}.gdb.
