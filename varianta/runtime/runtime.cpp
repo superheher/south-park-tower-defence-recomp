@@ -91,6 +91,8 @@ int main(int argc, char** argv)
         static_cast<uint32_t>(image.entry_point));
 
     static PPCContext ctx{};                     // msr defaults; everything else zero
+    ctx.fpscr.csr = 0x1F80;                      // default MXCSR: ALL FP exceptions masked (else the
+                                                 // guest's setcsr clears the mask bits -> fctidz traps)
     ctx.r1.u64 = STACK_TOP - 0x200;              // SP with a little headroom; back-chain is zeroed
     ctx.r13.u64 = kpcr;                          // KPCR pointer (Xbox 360 thread-base convention)
 

@@ -674,6 +674,7 @@ int64_t TimeoutMs(uint32_t timeoutPtr) {
 void GuestThreadRun(ThreadRec* rec) {
     g_waitMutex.lock();                      // acquire the execution token (blocks until the creator yields)
     PPCContext ctx{};
+    ctx.fpscr.csr = 0x1F80;                  // default MXCSR: all FP exceptions masked
     ctx.r1.u64 = rec->stackTop - 0x200;
     ctx.r13.u64 = rec->kpcr;
     if (rec->xapiStartup) {                  // XAPI trampoline: startup(start_address, start_context)
@@ -782,6 +783,7 @@ void VblankPump() {
         // read 0 during interrupts (some titles check it).
         if (g_coop) g_waitMutex.lock();
         PPCContext ctx{};
+        ctx.fpscr.csr = 0x1F80;          // default MXCSR: all FP exceptions masked
         ctx.r1.u64 = g_pumpStack - 0x200;
         ctx.r13.u64 = g_pumpKpcr;
         ctx.r3.u64 = 0;                  // source = vblank
