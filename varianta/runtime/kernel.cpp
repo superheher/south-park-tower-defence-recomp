@@ -843,6 +843,27 @@ PPC_FUNC(__imp__VdSetGraphicsInterruptCallback)
     KTRACE("VdSetGraphicsInterruptCallback(cb=0x%X data=0x%X)\n", g_interruptCallback, g_interruptData);
 }
 
+// ---- XAudio (fill out-params: the audio worker uses the returned driver/config/volume) -------------
+// DWORD XAudioGetSpeakerConfig(*config r3) -> 0x00010001
+PPC_FUNC(__imp__XAudioGetSpeakerConfig) { if (ctx.r3.u32) PPC_STORE_U32(ctx.r3.u32, 0x00010001u); ctx.r3.u64 = 0; }
+// DWORD XAudioGetVoiceCategoryVolume(unk r3, *out r4) -> 1.0f
+PPC_FUNC(__imp__XAudioGetVoiceCategoryVolume)
+{
+    if (ctx.r4.u32) { float v = 1.0f; uint32_t b; memcpy(&b, &v, 4); PPC_STORE_U32(ctx.r4.u32, b); }
+    ctx.r3.u64 = 0;
+}
+// DWORD XAudioRegisterRenderDriverClient(*callback r3, *driver r4) -> driver handle 0x41550000|index
+PPC_FUNC(__imp__XAudioRegisterRenderDriverClient)
+{
+    uint32_t cbPtr = ctx.r3.u32, drvPtr = ctx.r4.u32;
+    if (!cbPtr || PPC_LOAD_U32(cbPtr) == 0) { ctx.r3.u64 = 0x80070057u; return; }   // E_INVALIDARG
+    if (drvPtr) PPC_STORE_U32(drvPtr, 0x41550000u);   // valid driver handle (index 0)
+    KTRACE("XAudioRegisterRenderDriverClient -> 0x41550000\n");
+    ctx.r3.u64 = 0;
+}
+PPC_FUNC(__imp__XAudioSubmitRenderDriverFrame) { ctx.r3.u64 = 0; }
+PPC_FUNC(__imp__XAudioUnregisterRenderDriverClient) { ctx.r3.u64 = 0; }
+
 // DWORD VdInitializeEngines(...) -> 1 (success); the system command buffer id address is a no-op.
 PPC_FUNC(__imp__VdInitializeEngines) { ctx.r3.u64 = 1; }
 PPC_FUNC(__imp__VdSetSystemCommandBufferGpuIdentifierAddress) { /* no-op */ }
