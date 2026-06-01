@@ -740,3 +740,30 @@ NEXT STEPS (the fix):
 TOOLING added: REX_EVTRACE now records per-event signaler/waiter guest LRs (g_evSignalLR/g_evWaitLR) —
 this is how the thread-pool producers/consumers were identified (signaler sub_8230E898, waiter
 sub_8230F098). gdb scripts /tmp/{collide,watch_teardown,openchk,prod_f738,prod_a2158}.gdb.
+
+## 2026-06-01 (cont.) — allocation diff: the teardown is a guest-heap free-list divergence (both device & .ptc buffer from sub_82448090)
+
+Ran the allocation-sequence diff (option a). Findings (gdb watchpoints from the guest entry):
+- **The device (0x26F80) is allocated by the GUEST HEAP allocator sub_82448090**, via the main-thread
+  graphics init: `_xstart → … → sub_8212DBA0 → sub_821C7F08 → sub_821D7438` (sub_8212DBA0 calls
+  sub_82448090 at :21083/:21136, then sub_821C7F08(device) at :21170; sub_821D7438 writes the device's
+  first field = 0xFFFFFFFF).
+- **The colliding .ptc buffer (0x262B0) is ALSO a sub_82448090 allocation**, via the worker:
+  `sub_8214F730 → sub_8214F738 → sub_821BE840` (sub_821BE840 calls sub_82448090 ×3 at :8820/:8883/:8910).
+  Watchpoints confirm 0x262B0 is NEVER written before the .ptc data lands (no separate zeroing), i.e. it is
+  a fresh heap block whose header sits just below the watched word.
+- ⇒ **Both come from the SAME guest heap (sub_82448090).** The device is allocated EARLY (heap+0x16F80);
+  the .ptc buffer is allocated LATER but at a LOWER offset (heap+0x162B0) — so the heap is reusing a freed
+  region, and that reused 16 KB block overlaps the live 15 KB device. The heap's **free-list tracks a free
+  block at heap+0x162B0 of ≥16 KB that overlaps the live device at heap+0x16F80** — a free-list divergence.
+- sub_82448090 is the SAME recompiled code in prod, so it can't misbehave on identical inputs ⇒ the
+  divergence is the heap STATE: an earlier alloc/free in variant A differs from prod, leaving the free-list
+  with a block overlapping the device. (heap base also differs: variant A 0x10000 vs prod 0x40000000, both
+  device = base+0x16F80 — but the collision is relative/free-list, not just the base.)
+
+REMAINING (the true root): diff the **full guest-heap alloc/free sequence** between the device allocation
+and the .ptc-buffer allocation, variant A vs prod, to find the one operation that diverges (the bad
+free/coalesce that leaves heap+0x162B0 free over the live device). Candidate tools: break sub_82448090 +
+the heap's free (RtlFreeHeap) and log (size, ptr, caller) into a per-build trace, then diff. ⚠ prod is
+Release (read guest mem by membase, break by symbol; can't read ctx). gdb: /tmp/{earlyalloc,devalloc2,
+allochist}.gdb (watch a guest addr from __imp___xstart, walk the writers).
