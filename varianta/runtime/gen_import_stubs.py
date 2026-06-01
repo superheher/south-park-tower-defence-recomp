@@ -26,6 +26,7 @@ with open(out, 'w') as f:
     for n in names:
         # Imports are declared C++-linkage in ppc_recomp_shared.h via PPC_EXTERN_FUNC, so define
         # with plain PPC_FUNC (NOT PPC_FUNC_IMPL, which is extern "C") to match the symbol linkage.
-        f.write(f'PPC_FUNC(__imp__{n}) {{ static bool w=false; if(!w){{w=true; fprintf(stderr,"[unimpl import] {n}\\n");}} __builtin_trap(); }}\n')
+        # WEAK so a real implementation in kernel.cpp (strong symbol) overrides the trap-stub.
+        f.write(f'__attribute__((weak)) PPC_FUNC(__imp__{n}) {{ static bool w=false; if(!w){{w=true; fprintf(stderr,"[unimpl import] {n}\\n");}} __builtin_trap(); }}\n')
     f.write(f'\n// {len(names)} kernel/xam import stubs\n')
 print(f"wrote {out}: {len(names)} stubs")

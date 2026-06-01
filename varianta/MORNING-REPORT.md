@@ -7,8 +7,14 @@ Branch `experimental/hle-graphics-spike` · 5 commits, **NOT pushed** · prod `.
 The entire **deterministic front is done**: the XenonRecomp recompiler now handles **every** instruction
 South Park uses (gap 13,183 → **0**), its jump tables are recovered (**0 → 93** validated), and **all 90
 generated TUs compile** (`-fsyntax-only`). The host runtime is **scaffolded, fully enumerated (474
-imports), and links-with-stubs into a 103 MB executable** (0 undefined symbols) — its bring-up to an
-actual boot (real runtime + renderer) is the deferred multi-week phase.
+imports), and links-with-stubs into a 103 MB executable** (0 undefined symbols).
+
+**Update (2026-06-01, host-runtime phase started):** the runtime now **boots the guest** — it reserves
+4 GiB, loads the XEX, populates the 22,782-entry dispatch table, and the guest entry `0x824499A0`
+executes real code. Imports are implemented via a scalable harness (weak trap-stubs in
+`import_stubs.gen.cpp` overridden by strong impls in `runtime/kernel.cpp`); `NtAllocateVirtualMemory`
++ `KeGetCurrentProcessType` are done and boot advances import-by-import (frontier:
+`RtlInitializeCriticalSection`). The remaining import cascade → video → renderer is the multi-week tail.
 
 ## What landed
 ### TASK 1 — instruction gap closed: 13,183 → 0  ✅

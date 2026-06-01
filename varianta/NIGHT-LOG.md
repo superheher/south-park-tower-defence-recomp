@@ -112,3 +112,12 @@ Prod `.so` `1a3f6076` untouched; rexglue-sdk untouched; superproject pointer not
   `NtAllocateVirtualMemory`** (CRT heap setup; SIGILL from its trap-stub). The full
   load→dispatch→execute path works end-to-end. Next: implement the early-boot import cascade
   (make the 474 stubs `weak`, add strong impls in a `kernel.cpp` + a guest heap allocator).
+- **[06:15] Import-cascade harness + first imports.** Made the 474 trap-stubs `weak`
+  (`gen_import_stubs.py`) so strong impls in `runtime/kernel.cpp` override them — the scalable pattern.
+  Implemented `NtAllocateVirtualMemory` (guest bump-heap at 0x40000000, 64 KiB granularity) and
+  `KeGetCurrentProcessType` (→1 = title). Boot now advances import-by-import. **Current frontier:
+  `RtlInitializeCriticalSection`** (rexglue-sdk ref `kernel/xboxkrnl/xboxkrnl_rtl.cpp`: header.type=1,
+  lock_count=-1, recursion_count=0, owning_thread=0; then Rtl{Enter,Leave,TryEnter}CriticalSection).
+  The cascade (critical sections → TLS → XConfig → threads → … → Vd* video → render) is the ongoing
+  multi-week grind; each import's behaviour comes 1:1 from `rexglue-sdk/src/`. Checkpointing the loop
+  here (commit + continue) after the boot milestone.
