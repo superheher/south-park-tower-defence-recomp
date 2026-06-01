@@ -878,6 +878,26 @@ PPC_FUNC(__imp__NtWaitForSingleObjectEx)
     ctx.r3.u64 = WaitObject(obj, TimeoutMs(ctx.r6.u32));
 }
 
+// ---- Xam: notifications / region / sign-in (return valid handles/values, not 0) -------------------
+// HANDLE XamNotifyCreateListener(u64 mask r3, u32 max_version r4) -> non-zero listener handle.
+// Bring-up: no real notification queue yet; a stable non-zero handle keeps the title from storing a
+// null listener (which it later dereferences). XNotifyGetNext reports nothing pending.
+PPC_FUNC(__imp__XamNotifyCreateListener) { ctx.r3.u64 = 0xCAFE0001u; }
+
+// BOOL XNotifyGetNext(handle r3, match_id r4, *id r5, *param r6) -> FALSE (no notification)
+PPC_FUNC(__imp__XNotifyGetNext)
+{
+    if (ctx.r5.u32) PPC_STORE_U32(ctx.r5.u32, 0);
+    if (ctx.r6.u32) PPC_STORE_U32(ctx.r6.u32, 0);
+    ctx.r3.u64 = 0;
+}
+
+// DWORD XGetGameRegion() -> region code (0x00FF = NTSC/U-ish, permissive for bring-up)
+PPC_FUNC(__imp__XGetGameRegion) { ctx.r3.u64 = 0x00FFu; }
+
+// DWORD XamUserGetSigninState(user_index r3) -> 1 (signed in, local) for user 0, else 0
+PPC_FUNC(__imp__XamUserGetSigninState) { ctx.r3.u64 = (ctx.r3.u32 == 0) ? 1u : 0u; }
+
 // NTSTATUS KeWaitForMultipleObjects(count r3, objects r4, waitType r5, reason r6, mode r7,
 //                                   alertable r8, *timeout r9, waitblocks r10)
 PPC_FUNC(__imp__KeWaitForMultipleObjects)
