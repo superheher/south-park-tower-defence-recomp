@@ -1234,15 +1234,35 @@ PPC_FUNC(__imp__NtQueryInformationFile)
     FILE* f = FileForHandle(handle);
     if (!f) { ctx.r3.u64 = 0xC0000008u; return; }
     long cur = ftell(f); fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, cur, SEEK_SET);
+    uint64_t sz = static_cast<uint64_t>(size);
     if (info) {
-        if (infoClass == 14) {                          // FILE_POSITION_INFORMATION
-            PPC_STORE_U64(info + 0, static_cast<uint64_t>(cur));
-        } else {                                        // FILE_STANDARD/NETWORK_OPEN: report sizes
-            PPC_STORE_U64(info + 0, static_cast<uint64_t>(size));   // AllocationSize
-            PPC_STORE_U64(info + 8, static_cast<uint64_t>(size));   // EndOfFile
+        // Field offsets MUST match the requested FILE_INFORMATION_CLASS exactly — the title reads the
+        // file size at the class-specific EndOfFile offset to compute its read length. Getting this wrong
+        // (e.g. writing EndOfFile at +8 for class 34, whose EndOfFile is at +40) yields a 0-byte read and
+        // the asset never loads (root-caused: the XGS/.ptc loads here via class-34 size queries).
+        switch (infoClass) {
+        case 14:                                        // FilePositionInformation
+            PPC_STORE_U64(info + 0, static_cast<uint64_t>(cur));   // CurrentByteOffset
+            break;
+        case 34:                                        // FileNetworkOpenInformation (56 bytes)
+            PPC_STORE_U64(info + 0,  0);                 // CreationTime
+            PPC_STORE_U64(info + 8,  0);                 // LastAccessTime
+            PPC_STORE_U64(info + 16, 0);                 // LastWriteTime
+            PPC_STORE_U64(info + 24, 0);                 // ChangeTime
+            PPC_STORE_U64(info + 32, sz);                // AllocationSize
+            PPC_STORE_U64(info + 40, sz);                // EndOfFile
+            PPC_STORE_U32(info + 48, 0x80);              // FileAttributes = FILE_ATTRIBUTE_NORMAL
+            break;
+        case 5:                                         // FileStandardInformation (24 bytes)
+        default:                                         // (AllocationSize @0, EndOfFile @8)
+            PPC_STORE_U64(info + 0, sz);                 // AllocationSize
+            PPC_STORE_U64(info + 8, sz);                 // EndOfFile
+            PPC_STORE_U32(info + 16, 1);                 // NumberOfLinks
+            break;
         }
     }
-    if (ioStatus) { PPC_STORE_U32(ioStatus + 0, 0); PPC_STORE_U32(ioStatus + 4, 0); }
+    KTRACE("NtQueryInformationFile(h=0x%X class=%u) -> size=%lu\n", handle, infoClass, sz);
+    if (ioStatus) { PPC_STORE_U32(ioStatus + 0, 0); PPC_STORE_U32(ioStatus + 4, ctx.r6.u32); }
     ctx.r3.u64 = 0;
 }
 
