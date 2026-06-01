@@ -789,3 +789,31 @@ entries (0x262B0/0x29EB0)? Trace the writers of that array; determine whether *(
 valid structure or a wild pointer, and where the device-pointing entries come from (a .ptc-relocation base,
 a stride/count parsed wrong, or a stale/garbage pointer). This is the .ptc-loader's vertex-stream
 descriptor — several functions deep (sub_822A2158/sub_822A7C08/sub_822A7480/sub_822AC488/sub_822AC328).
+
+## 2026-06-01 (cont.) — ROOT FOUND: .ptc vertex-stream destinations are UN-RELOCATED (missing the buffer base) → overwrite the device
+
+Pinpointed the exact corrupting write with a targeted break (sub_822A58F8:8757, condition: the memcpy
+whose [dst,dst+size) covers device+10900=0x29A14). Captured:
+  dst=0x296B0 base(r11)=0x262B0 off(r26)=0x3400 src=0x5C560 size=0x400
+  buffer-ptr array (16 entries) = 0x82B0, 0xBEB0, 0xFAB0, ... 0x262B0(#8), 0x29EB0(#9), ... 0x406B0
+i.e. **array[i] = 0x82B0 + i*0x3C00** (16 stream buffers, stride 0x3C00=15360, built by the loop at
+sub_822A58F8 loc_822A5E70: `r10 += r9; *(r11+=4)=r10`). dst = array[i] + r26.
+
+THE BUG: these destination bases are **raw offsets (0x82B0 + i*0x3C00 = 0x82B0..0x442B0)** — they are
+MISSING the real buffer base. sub_821BE840 ALLOCATED the real .ptc buffers at **0xA2016000** (3.7 MB,
+0x398000); the 16 stream offsets (240 KB total) fit inside it, so the destinations SHOULD be
+`0xA2016000 + (0x82B0 + i*0x3C00)`. Instead they are just `0x82B0 + i*0x3C00`, which lands in low memory
+(0x82B0) through the title heap — straddling the **device block at 0x26F40** (entries #8/#9 = 0x262B0 /
+0x29EB0 fall in the device), so the .ptc stream copy overwrites the device (incl. +10900 the handler ptr).
+
+⇒ The .ptc vertex-stream destination computation fails to RELOCATE the stream offsets onto the allocated
+buffer base — a missing/zero base. Since the recompiled guest code is identical to prod, the divergence is
+a DATA value: the field that should carry the buffer base (0xA2016000) reads 0 (or the wrong field) when
+the stream-destination array is built, leaving raw offsets. Same CLASS as the NtQueryInformationFile
+systemic bug (a wrong field value, not codegen).
+
+NEXT (the fix): find where sub_822A58F8 / sub_822A7C08 reads the per-stream buffer base for the array
+build (the initial r10 / the source of 0x82B0). Determine which object field should hold 0xA2016000 but
+reads 0 in variant A, and trace upstream to where sub_821BE840 stores its allocated buffer ptr into the
+.ptc object — a field-offset / store divergence. Fix that store/read so the stream destinations relocate
+onto 0xA2016000 → no device overwrite → re-test the GPU-completion waits.
