@@ -2895,3 +2895,16 @@ labels = [
     0x821CF6D0,
 ]
 
+
+# sub_821DC228 — value-returning jump table recovered for the runtime boot (function-boundary override
+# in sp_xenon.toml). 22 cases, no in-code bounds check (masked to 0xFFFF); index reg r11 at the bctr.
+[[switch]]
+base = 0x821DC240
+r = 11
+default = 0x821DC29C
+labels = [
+    0x821DC29C, 0x821DC2AC, 0x821DC2BC, 0x821DC2CC, 0x821DC2DC, 0x821DC2EC,
+    0x821DC2FC, 0x821DC30C, 0x821DC31C, 0x821DC32C, 0x821DC33C, 0x821DC34C,
+    0x821DC35C, 0x821DC36C, 0x821DC374, 0x821DC37C, 0x821DC384, 0x821DC38C,
+    0x821DC394, 0x821DC39C, 0x821DC3A4, 0x821DC3AC,
+]

@@ -195,10 +195,15 @@ index d08371e..191d7d1 100644
      f.write(out.data(), out.size());
  
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..22abbfc 100644
+index fa91527..a3c7328 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
-@@ -1133,6 +1133,7 @@ bool Recompiler::Recompile(
+@@ -1,3 +1,4 @@
++#include <unordered_set>
+ #include "pch.h"
+ #include "recompiler.h"
+ #include <xex_patcher.h>
+@@ -1133,6 +1134,7 @@ bool Recompiler::Recompile(
          println("\t{}.s64 = {};", r(insn.operands[0]), int32_t(insn.operands[1] << 16));
          break;
  
@@ -206,7 +211,7 @@ index fa91527..22abbfc 100644
      case PPC_INST_LVEWX:
      case PPC_INST_LVEWX128:
      case PPC_INST_LVX:
-@@ -1684,6 +1685,130 @@ bool Recompiler::Recompile(
+@@ -1684,6 +1686,130 @@ bool Recompiler::Recompile(
          println("{}.u32, {}.u32);", r(insn.operands[2]), r(insn.operands[0]));
          break;
  
@@ -337,7 +342,7 @@ index fa91527..22abbfc 100644
      case PPC_INST_SUBF:
          println("\t{}.s64 = {}.s64 - {}.s64;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]));
          if (strchr(insn.opcode->name, '.'))
-@@ -2087,6 +2212,7 @@ bool Recompiler::Recompile(
+@@ -2087,6 +2213,7 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_ps({}.f32, simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({}.f32))));", v(insn.operands[0]), v(insn.operands[1]));
          break;
  
@@ -345,7 +350,7 @@ index fa91527..22abbfc 100644
      case PPC_INST_VSEL:
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
          break;
-@@ -2263,6 +2389,205 @@ bool Recompiler::Recompile(
+@@ -2263,6 +2390,205 @@ bool Recompiler::Recompile(
          println("\t{}.u64 = {}.u64 ^ {};", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2] << 16);
          break;
  
@@ -551,6 +556,42 @@ index fa91527..22abbfc 100644
      default:
          return false;
      }
+@@ -2381,6 +2707,14 @@ bool Recompiler::Recompile(const Function& fn)
+         name = fmt::format("sub_{}", fn.base);
+     }
+ 
++    // Skip if this name was already emitted: image.symbols.find() is range-based, so a function whose
++    // base falls inside another function's symbol range resolves to the same name (e.g. overlapping
++    // detections in embedded sections). Emitting it again is a duplicate-definition link error — which
++    // only surfaces once a function-count change (boundary override) shifts the per-256 TU split across
++    // the pair.
++    if (!emittedFunctionNames.insert(name).second)
++        return true;
++
+ #ifdef XENON_RECOMP_USE_ALIAS
+     println("__attribute__((alias(\"__imp__{}\"))) PPC_WEAK_FUNC({});", name, name);
+ #endif
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 8242db5..3992eb1 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -2,6 +2,8 @@
+ 
+ #include "pch.h"
+ #include "recompiler_config.h"
++#include <unordered_set>
++#include <string>
+ 
+ struct RecompilerLocalVariables
+ {
+@@ -33,6 +35,7 @@ struct Recompiler
+     std::vector<Function> functions;
+     std::string out;
+     size_t cppFileIndex = 0;
++    std::unordered_set<std::string> emittedFunctionNames;   // dedup: skip re-emitting a function name
+     RecompilerConfig config;
+ 
+     bool LoadConfig(const std::string_view& configFilePath);
 diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
 index 31a86cd..d1cc2b9 100644
 --- a/XenonUtils/ppc_context.h

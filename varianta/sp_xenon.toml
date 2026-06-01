@@ -9,6 +9,15 @@ file_path = "../private/extracted/default.xex"
 out_directory_path = "ppc"
 switch_table_file_path = "sp_switch_tables.toml"
 
+# Function-boundary overrides for jump-table dispatchers XenonAnalyse split at the computed-jump
+# targets (the deferred function-boundary problem). Each spans the dispatch + all case bodies so the
+# switch's gotos stay in-function. sub_821DC228 = a value-returning switch (dispatch 0x821DC228..240,
+# table @0x821DC244, 22 case bodies 0x821DC29C..0x821DC3B0/blr) — boot crashed calling case-label
+# 0x821DC29C as a function (null dispatch -> PC=0).
+functions = [
+    { address = 0x821DC228, size = 0x18C },
+]
+
 # --- register save/restore (RexGlue south_park_td_register.cpp) ---
 savegprlr_14_address = 0x8242BE60
 restgprlr_14_address = 0x8242BEB0
