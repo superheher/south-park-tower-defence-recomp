@@ -1167,10 +1167,12 @@ PPC_FUNC(sub_821B9270)
 // The kick reads a 2-dword descriptor at r4 ({d0: low-24 used, d1: segment addr}) and emits an IB packet to
 // the ring (advancing CP_RB_WPTR). Renderer route B needs the per-frame segment [addr,len] list; logging the
 // 6 init kicks reveals the descriptor->IB encoding (which we then read from the segment table per-frame).
+std::atomic<uint32_t> g_device{0};   // captured from the first ring-kick (device base, ~0x26F80)
 extern "C" PPC_FUNC(__imp__sub_821C6600);
 PPC_FUNC(sub_821C6600)
 {
     uint32_t dev = ctx.r3.u32, desc = ctx.r4.u32;
+    if (!g_device.load()) g_device.store(dev);
     uint32_t d0 = desc ? GLD32(desc + 0) : 0, d1 = desc ? GLD32(desc + 4) : 0;
     uint32_t w0 = GLD32(0x7FC80714);
     __imp__sub_821C6600(ctx, base);
@@ -1500,6 +1502,22 @@ PPC_FUNC(__imp__VdSwap) {
         static uint32_t s_segLast = 0;
         uint32_t cur = ctx.r3.u32;
         if (s_segLast && cur > s_segLast && (cur - s_segLast) < 0x200000u && cur >= 0xA0000000u) {
+            // One-time brute scan: how many REAL DRAW_INDX_2/INDX packets exist in the whole staging range,
+            // regardless of segment alignment? Tells us whether the textured bulk is inline in this buffer
+            // (need to reach it) or in separate segments referenced elsewhere (device+13568 array).
+            static std::atomic<bool> scanned{false}; bool se = false;
+            if (g_ktrace && scanned.compare_exchange_strong(se, true)) {
+                int draws = 0, shown = 0;
+                for (uint32_t a = s_segLast; a + 8 <= cur; a += 4) {
+                    uint32_t pk = GLD32(a); if ((pk >> 30) != 3) continue;
+                    uint32_t op = (pk >> 8) & 0x7F; if (op != 0x36 && op != 0x22) continue;
+                    uint32_t init = GLD32(a + 4), prim = init & 0x3F, ni = init >> 16;
+                    if (prim < 1 || prim > 0x15 || ni < 1 || ni > 0x4000) continue;   // sane draw
+                    draws++;
+                    if (shown < 16) { fprintf(stderr, "[drawscan] @0x%X init=0x%X numInd=%u prim=%u\n", a, init, ni, prim); shown++; }
+                }
+                fprintf(stderr, "[drawscan] total plausible draws in staging range 0x%X = %d\n", cur - s_segLast, draws);
+            }
             uint64_t before = g_drawCount.load();
             int segs = 0;
             for (uint32_t a = s_segLast; a + 8 <= cur && segs < 4000; a += 4) {
@@ -1520,6 +1538,41 @@ PPC_FUNC(__imp__VdSwap) {
                 (unsigned long long)(g_drawCount.load() - before));
         }
         s_segLast = cur;
+    }
+    // Renderer part 1 (chunk-CP, route B v2, REX_CHUNKCP=1): the REAL command stream is NOT the r3 staging
+    // buffer (0xA01xxxxx) but a pool of command-buffer chunks at 0xA04D-0xA056xxxx tracked in the device
+    // struct (records {base, writeptr, 0x1080, base+4, 0, device}). device+13568=current-chunk base,
+    // +13572=writeptr. Execute [base, writeptr) of the active chunk as an IB — this is where the textured
+    // draws live (0xA0562200, with op 0x22 draws, sits inside the active chunk [A055BF00,A0564608)).
+    if (getenv("REX_CHUNKCP")) {
+        uint32_t dv = g_device.load();
+        if (dv) {
+            uint32_t base = GLD32(dv + 13568), wptr = GLD32(dv + 13572);
+            if (base >= 0xA0000000u && wptr > base && (wptr - base) < 0x100000u) {
+                uint64_t before = g_drawCount.load();
+                ExecutePM4(base, (wptr - base) / 4, 1);
+                if (g_ktrace && n <= 24)
+                    fprintf(stderr, "[chunkcp] swap#%u base=0x%X len=0x%X totaldraws=%llu (+%llu)\n",
+                        n, base, wptr - base, (unsigned long long)g_drawCount.load(),
+                        (unsigned long long)(g_drawCount.load() - before));
+            }
+        }
+    }
+    // One-time (settled frame): dump the device struct's segment-tracking region to find the flush queue /
+    // descriptor array (sub_821C6C80 uses r8=device+13568; flush gate is device+13408). Look for content-
+    // segment descriptors {0x8100_00LL, addr} that the inline-descriptor scan misses (textured draws).
+    if (g_ktrace && g_device.load()) {
+        static std::atomic<bool> ddumped{false}; bool de = false;
+        if (n >= 10 && ddumped.compare_exchange_strong(de, true)) {
+            uint32_t dv = g_device.load();
+            fprintf(stderr, "[devdump] device=0x%X +10896=%08X +10908=%08X +13408=%08X +13568=%08X\n",
+                    dv, GLD32(dv+10896), GLD32(dv+10908), GLD32(dv+13408), GLD32(dv+13568));
+            for (uint32_t off = 13400; off <= 13720; off += 32) {
+                char line[256]; int p = snprintf(line, sizeof line, "[devdump] +%u:", off);
+                for (int k = 0; k < 8; k++) p += snprintf(line+p, sizeof line-p, " %08X", GLD32(dv + off + k*4));
+                fprintf(stderr, "%s\n", line);
+            }
+        }
     }
     if (rex_render::Enabled()) rex_render::Present(ctx.r4.u32);  // non-blocking: publish fetch ptr to render thread
     ctx.r3.u64 = 0;

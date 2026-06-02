@@ -1204,3 +1204,33 @@ array base, r6=count) -> kick. Device fields: +10896 completion-ctr ptr, +10908 
 segment tracking, +10940/10941 gate bytes (flush skips the segment block if device+13408!=0). NEXT:
 empirically hook sub_821C6C80 / read the device+13568 array to enumerate ALL segments (incl. textured), then
 present the movie quad's bound texture (shortcut to visible content).
+
+## 2026-06-02 (post-reboot, cont. 2) — the intro emits only ~5-8 untextured rects/frame; content is GATED
+
+Pushed route B further to locate the textured/movie draws. Findings:
+- Device struct segment-tracking (one-time devdump): device=0x26F80, +10896=A2010000 (completion-ctr ptr),
+  +10908=0x45 (head fence, grew from init), +13408=0 (flush segment-gate is OPEN, not skipping), +13568=
+  current command-buffer base (GROWS ~0x88680/frame: 0xA0090180 -> ... -> 0xA055BF00 -> 0xA066D000 — i.e.
+  the SAME growing per-frame buffer r3 points into, just another cursor). The struct also holds a pool of
+  0x1080-byte chunk records {base, writeptr, 0x1080, base+4, 0, device}.
+- REX_CHUNKCP=1 (execute the device+13568 active command buffer [base,writeptr) linearly as an IB): DESYNCS
+  exactly like the r3-staging linear parse — recovers init=0xC0000000 (x118, packet headers read as draws),
+  prim=60 (invalid) garbage; only a handful of real init=0x30088 rects. So the device chunk is the SAME
+  mixed buffer (PM4 + inline vertex data + 0x8100xxxx segment descriptors), NOT a clean IB.
+- BRUTE draw-scan of a whole frame's staging range: only ~5 real DRAW packets, ALL init=0x30088 prim=8
+  (kRectangleList), untextured. REX_SEGCP (descriptor-referenced segments) likewise: ~8/frame, 100% of 500
+  logged draws = init=0x30088 rects, ZERO bound textures across the entire run.
+
+CONCLUSION (leading hypothesis, strong evidence): during the intro variant A's title emits only ~5-8
+untextured rectangle draws per frame and NEVER builds the movie/textured draws. prod renders the intro (54
+pipelines, real shaders) from the SAME guest, so on the correct path the title DOES build movie draws. The
+difference is the GPU<->CPU handshake: the fence-forward stopgap lets the boot's waits return (so it loops)
+but does NOT truly drive GPU/decode progress, so the title idles in a minimal per-frame loop (clear rects +
+VdGetSystemCommandBuffer) and never advances to decode+present the movie. Ring stays frozen (6 init kicks).
+=> Route B validated the segment model + the descriptor format + the command-buffer pool, and produces clean
+aligned draws from descriptor segments — but the MOVIE will not appear until the handshake (route A) drives
+the title forward. The two routes CONVERGE: the root blocker is the real GPU<->CPU fence/sync handshake, not
+the segment parsing. NEXT: (A) model the handshake — make fences advance as a true RESULT of CP execution of
+kicked ring content (replace the fence-forward stopgap), so the title proceeds to build+render the movie; or
+investigate whether the intro movie uses a non-PM4 path (VdInitializeScalerCommandBuffer / overlay) we stub.
+New diags (gated): REX_CHUNKCP, [drawscan], [devdump], g_device capture.
