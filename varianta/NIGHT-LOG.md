@@ -1307,3 +1307,15 @@ event.) STRATEGIC: visible content needs ONE of (a) a better scheduler/threading
 plays -> intro auto-advances to menu/gameplay (then the renderer for the drawn content); (b) force the
 movie-player "done" state to skip the intro (movie-player RE); (c) the renderer's full command-buffer
 enumeration (needed regardless). All multi-session, title-specific. Added REX_SKIPINTRO (gated input inject).
+
+## 2026-06-02 (cont. 6) — the decoder is STUCK, not merely starved (90s run = zero progress)
+
+90s run, late sample (swap#220) of the VC-1 frame pool: the 16 buffers are BIT-IDENTICAL to the frame-40
+sample (buf0 nz=0; buf1 nz=131728; buf2 nz=65864; ... varied=0 everywhere) — ZERO progress over 90s. So the
+decoder is NOT just slow/starved (that would accrue partial frames) — it is STUCK: it never writes real
+content into its pool. The decoder threads cycle on the coop token but are blocked BEFORE the decode (the
+playback never starts/feeds), so nothing decodes. => refines cont.5: the intro hang is a STUCK movie-PLAYBACK
+pipeline (decoder waits for work; main thread loops presenting empty frames without driving playback), not
+pure scheduler starvation. Reaching visible content needs deep RE of the movie-player start/feed path (or
+the menu, which sits behind the same stuck intro). NET for the session: the wall is now COMPLETELY mapped,
+but visible content was not reached — every remaining path is multi-session title-specific RE.

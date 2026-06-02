@@ -1618,25 +1618,20 @@ PPC_FUNC(__imp__VdSwap) {
     // decoded movie frame (high non-zero ratio + varied content vs an empty/uniform buffer).
     if (g_ktrace) {
         static std::atomic<bool> vsamp{false}; bool ve = false;
-        if (n >= 40 && g_videoBufN.load() && vsamp.compare_exchange_strong(ve, true)) {
-            // BROAD scan: hunt the whole title heap for any region with real image texture (a decoded video
-            // frame has high adjacent-byte variation; uniform fills / PM4 / structs do not). Report the
-            // 0x10000 chunks with the most variation — that's where the decoded frame is, if it exists.
-            fprintf(stderr, "[video] broad heap scan for image-like (high-varied) regions:\n");
-            int reported = 0;
-            for (uint32_t base = 0x1000000; base < 0x9000000 && reported < 40; base += 0x10000) {
-                uint32_t varied = 0;
-                for (uint32_t o = 0; o < 0x10000; o += 4) {
-                    uint32_t w = GLD32(base + o);
+        // LATE sample (after a long run): did the VC-1 decoder ever write real content into its frame pool?
+        // If buffers gain adjacent-byte variation -> it IS decoding (just slow/starved); if still uniform
+        // black -> the decode is stuck/gated, not merely starved.
+        if (n >= 220 && g_videoBufN.load() && vsamp.compare_exchange_strong(ve, true)) {
+            int cnt = g_videoBufN.load();
+            fprintf(stderr, "[video] LATE (swap#%u) %d frame-pool buffers (full 0x101440 scan):\n", n, cnt);
+            for (int i = 0; i < cnt; i++) {
+                uint32_t b = g_videoBufs[i]; uint32_t nz = 0, varied = 0;
+                for (uint32_t o = 0; o + 4 <= 0x101440; o += 4) {
+                    uint32_t w = GLD32(b + o); if (w) nz++;
                     if ((w & 0xFF) != ((w >> 8) & 0xFF) || ((w >> 16) & 0xFF) != ((w >> 24) & 0xFF)) varied++;
                 }
-                if (varied > 6000) {   // >~37% of 16384 dwords vary => textured/image data
-                    fprintf(stderr, "[video]  chunk @0x%X varied=%u/16384 head=%08X %08X %08X\n",
-                            base, varied, GLD32(base), GLD32(base+4), GLD32(base+8));
-                    reported++;
-                }
+                fprintf(stderr, "[video]  buf%d @0x%X nz=%u varied=%u\n", i, b, nz, varied);
             }
-            fprintf(stderr, "[video] broad scan done (%d image-like chunks)\n", reported);
         }
     }
     if (rex_render::Enabled()) rex_render::Present(ctx.r4.u32);  // non-blocking: publish fetch ptr to render thread
