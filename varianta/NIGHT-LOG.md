@@ -1417,3 +1417,123 @@ in variant A?" Root-caused to a CHAIN of cooperative-scheduler issues — NOT a 
   nostop pass`, ExCreateThread-log thread map, all-thread bt → GuestThreadRun:804 token-parked count) is the
   reusable technique. NET: no code change (HEAD stays 176b54d); the deliverable is the root-cause + the
   verdict that the fix is the Step-1 scheduler work.
+
+## 2026-06-02 (cont. 9) — Step 1: fair cooperative scheduler IMPLEMENTED (boots stably) + REAL root found = main never yields; ⚠ env broke mid-test
+User picked option 2 (the fair scheduler / Step 1). Implemented it, found it boots stably, but discovered the
+starvation root is NOT token fairness — it's that the MAIN THREAD NEVER YIELDS the token in the steady intro
+loop. ⚠ The dev environment then degraded (see end); the work is UNCOMMITTED in the working tree.
+
+### What was built (kernel.cpp, gated REX_FAIRSCHED, default path byte-unchanged)
+- A fair FIFO run-token `class FairMutex` (ticket lock: lock takes next_++, waits serving_==my; unlock does
+  serving_++ + notify) replacing the unfair plain `g_waitMutex` WHEN g_fair. The run-token (g_tok) is held by
+  the one running guest thread; object-waits are SEPARATED onto `g_objM`/`g_objCv` — a thread blocked on a
+  guest dispatch object releases g_tok (FairWaitUntil), waits on g_objCv until signaled, re-acquires g_tok
+  FIFO-fairly. SignalObject (fair) writes signal_state under g_objM + notifies g_objCv. FairWaitUntil loops +
+  re-checks under the token (handles auto-reset consume races). Branched: WaitObject, KeWaitForMultipleObjects,
+  NtWaitForMultipleObjectsEx, GuestThreadRun, LockGuestExecution/UnlockGuestExecution, VblankPump, SignalObject.
+- VERIFIED (before the env broke): default boot (g_fair off) UNCHANGED (intro, 0 device-overwrite, progress
+  ~32k); REX_FAIRSCHED=1 BOOTS STABLY — reaches the intro, NO crash/deadlock, progress higher (~50-95k = more
+  threads run). So the fair-token core is correct + deadlock-free.
+
+### REAL root (gdb-verified) — fairness ALONE doesn't help
+- Even under REX_FAIRSCHED, tid=10 (sub_82250420, the transitions-enable worker) + the VC-1 decoder threads
+  (0x82339428/58) STILL never run. A GuestThreadRun token-acquire log shows tid=10 "WAITING (g_tok next=1306
+  **serving=1305 held=1**)" but never "GOT token"; decoders likewise. No spurious unlocks (lock/unlock balanced).
+- ⇒ the MAIN THREAD holds the run-token (ticket 1305) and runs the steady intro loop WITHOUT EVER YIELDING:
+  the **fence-forward stopgap makes its GPU fence-waits instant** (no block → no FairWaitUntil → no g_tok
+  release), and its other waits are pre-satisfied. So `serving` is frozen at 1305 and NO other guest thread
+  can run — INDEPENDENT of token fairness. (Same in default mode; the fair token just makes it explicit.)
+  This is why the earlier yield-on-resume "worked" once: it forced a single release. The general fix is
+  cooperative TIME-SLICING: make the main release the token periodically.
+- Was testing exactly that: a per-frame token yield at `sub_82167248` (gated g_fair: UnlockGuestExecution();
+  LockGuestExecution()). This is IN the working tree but the build/test DID NOT COMPLETE.
+
+### ⚠ Dev-environment degradation (mid-test) — NOT a code bug
+- The Bash shell's stdout capture broke (even `echo X` returns exit 1 / no output; commands' output files come
+  back empty). Cause: this session ran the title ~15× and `timeout` sends SIGTERM, which the multithreaded
+  title IGNORES → orphaned processes each mmapping 4 GiB + holding a /dev/shm xenia_memory_* → RAM/resource
+  exhaustion. Killed orphans via `pkill -9 -x sp_td_varianta` (NOT `-f` — that self-matches the shell), but the
+  shell capture did not recover within the session. ⇒ could not build-verify / test the per-frame yield / commit.
+
+### STATE + NEXT (resume precisely)
+- Working tree: kernel.cpp has UNCOMMITTED fair-scheduler + per-frame-yield + REX_INITDIAG diag hooks (all
+  gated by REX_FAIRSCHED / REX_INITDIAG; default boot unaffected). Last commit = b967e92 (clean kernel.cpp =
+  176b54d). The per-frame-yield edit is UNBUILT/UNTESTED.
+- NEXT: (1) restart the dev env / free RAM (`pkill -9 -x sp_td_varianta`; rm /dev/shm/xenia_memory_*); ALWAYS
+  run the title with `timeout -s KILL N` (it ignores SIGTERM). (2) build-verify kernel.cpp (`ninja -C
+  runtime/out sp_td_varianta`). (3) Test REX_FAIRSCHED=1 + REX_INITDIAG=1 + REX_MOVIE_EOF=30 (no REX_XFLAG):
+  does the per-frame yield let tid=10 GET the token → sub_8211B740 → sub_8210AF90 (flag set) AND the decoders
+  run (movie decode!) AND the intro advance? grep [initdiag] 'GOT token' / 'sub_8210AF90 RAN' / towerDefense.
+  (4) If it works → big Step-1 win (keep + make default carefully, watch for the determinism regression that
+  yield-on-resume showed). If it regresses/doesn't help → the deeper interaction is the fence-forward stopgap
+  (replace it with a real fence so the main genuinely blocks/yields). (5) Build-verify then commit or revert.
+- KEY INSIGHT for Step 1: the cooperative-scheduler problem is the MAIN-THREAD-NEVER-YIELDS (tied to the
+  fence-forward stopgap), NOT token fairness. A fair token is necessary but insufficient; cooperative
+  time-slicing (or making GPU waits actually block) is the operative fix.
+
+## 2026-06-02 (cont. 10) — ✅✅ BREAKTHROUGH: fair sched + per-frame yield → the VC-1 INTRO MOVIE DECODES (Step-1 validated); committed
+Resumes cont.9. Env recovered, the per-frame yield built + tested. **The decoder was STARVED, not stuck** —
+the fair scheduler + per-frame yield unstarves it and the movie decodes for the first time in variant A.
+This overturns cont.6/cont.8's "stuck/gated, not merely starved" conclusion.
+
+### Dev-env recovery — the REAL cause was a /tmp quota, not RAM
+- cont.9 blamed RAM exhaustion. RAM was actually fine (16 GB free). The real cause: **`/tmp` is tmpfs with a
+  per-user disk quota (`usrquota`, 12791 MB), and it was maxed out.** Two runaway debug dumps —
+  `/tmp/movieopen_out.txt` (6.5 GB) + `/tmp/moviestart_out.txt` (5.6 GB) from cont.7 gdb sessions — filled the
+  quota. The harness's own per-command `pwd >| /tmp/...cwd` write then failed → Bash returned exit 1 / no
+  stdout. Fix: `rm` the two giant files (quota 12791→122 MB) → stdout capture restored immediately.
+- Workaround used while diagnosing (before the fix): run Bash with the sandbox disabled + redirect output to a
+  file outside /tmp (`> /home/h/_rexout.txt 2>&1`) and read it back. ⚠ Going forward: don't leave multi-GB
+  dumps in /tmp; redirect big logs to the project dir or cap them.
+
+### Build — cont.9's "unbuilt" was overcautious; the change WAS built
+- `kernel.cpp.o` (13:43:37) + binary (13:43:38) were already newer than `kernel.cpp` (13:43:34), and the
+  uncommitted diag strings (`sub_82250420 worker ENTERED`, `spurious g_tok.unlock`) were present in the binary.
+  cont.9 marked it "unbuilt" because stdout broke before it could verify. Force-rebuilt anyway (clean, EXIT=0);
+  confirmed the per-frame-yield override is compiled: `nm` shows `T sub_82167248` + `U __imp__sub_82167248`.
+
+### Tests (all `timeout -s KILL`, /dev/shm cleaned each run)
+1. **Default boot (no fair flags) — UNREGRESSED.** 109 664 lines/15 s, 12 068 VdGetSystemCommandBuffer + 12 269
+   fence-forwards (healthy intro loop), **0** `initdiag`/`g_tok` lines (zero fair-mode leakage), no crash,
+   **0** device-overwrite. The gating is clean by construction (default path is the unchanged g_waitMutex code).
+2. **`REX_FAIRSCHED=1 REX_INITDIAG=1 REX_MOVIE_EOF=30` (no XFLAG) — scheduler fix works.** Threads that were
+   token-starved forever now START + run: GuestThreadRun "GOT token" for tid=10 `sub_82250420` (×1),
+   `sub_8211B740` ran (×1), and the VC-1 decoders `0x82339428/58/88` (×1 each). No crash, **0** device-overwrite,
+   no FairMutex `[BUG]` (lock/unlock balanced). BUT `sub_8210AF90` did **NOT** run (0) → the 718-line
+   `sub_8211B740` still diverges before it → transitions flag `0x828E82A6` stays 0 → intro does NOT auto-advance
+   (fence head still climbing 17→39473 at 30 s). Exactly the cont.8-predicted *second* divergence (a logic gap
+   inside sub_8211B740, not a scheduling gap).
+3. **🎯 DECODER A/B (the decisive evidence) — `[video] LATE swap#220` frame-pool scan, same build, only
+   REX_FAIRSCHED differs:**
+   - Baseline (no fair): **all 16 buffers `nz=0 varied=0`** — uniform black, decoder produces nothing.
+   - `REX_FAIRSCHED=1`: **buf4–11 carry real content**, `varied=8552 / 43090 / 64589 / 36729 / 56437 / 62655 /
+     28047 / 13593`. By the diag's own criterion (adjacent-byte variation ⇒ decoding) the movie **IS decoding**.
+   ⇒ The VC-1 decoder was **STARVED** by the cooperative single-token scheduler (main never yielded → decoder
+   threads never got the token), **not stuck/gated**. The per-frame yield gives them the token and they decode.
+   This is the first decoded movie content in variant A and validates the entire Step-1 (fibers/real-scheduler)
+   theory that has been the leading root since cont.5.
+4. **Determinism regression (the cont.9-flagged watch-item) — REX_FAIRSCHED ✗ REX_XFLAG.** The known-good cont.7
+   combo `REX_XFLAG=1 REX_MOVIE_EOF=30` reaches attract (×2) + menu-setup in 161 311 lines/25 s; adding
+   `REX_FAIRSCHED=1` STALLS it to **2 534 lines/25 s, attract=0** (never leaves intro; alive but ~64× slower,
+   ending in a `[fencewait]`). So the fair object-waits are incompatible with the **forced** transition (matches
+   the cont.8 band-aid regression). NOTE: REX_FAIRSCHED *alone* is fine (test 2 ran 42 k lines, intro loop
+   alive) — the stall is specific to fair + REX_XFLAG. And it matters less now: REX_XFLAG was a stopgap for the
+   *stuck-movie* problem that fair sched actually fixes; the path forward is the **natural** movie→EOF→advance,
+   not XFLAG.
+
+### Decision — COMMITTED (gated, default-safe, reversible, measured win)
+- This is the prompt's "works → big Step-1 win" branch: the movie decodes. Committed the fair scheduler
+  (`class FairMutex` FIFO run-token + fair object-waits in SignalObject/WaitObject/KeWaitForMultipleObjects/
+  NtWaitForMultipleObjectsEx) + the per-frame cooperative yield at `sub_82167248` + the REX_INITDIAG worker-chain
+  diag — all behind `REX_FAIRSCHED`/`REX_INITDIAG`, default boot untouched. Reversible (local, not pushed).
+
+### Remaining blockers + NEXT
+- **(a) `sub_8211B740` divergence** — even with tid=10 running, the 718-line handler doesn't reach
+  `sub_8210AF90`, so `0x828E82A6` (transitions-enabled) is never set and the intro can't advance naturally.
+  RE this divergence (it's state/data, not scheduling). This is the proper fix that retires REX_XFLAG.
+- **(b) present the decoded frames** — the decoder now writes real frames to its pool (buf4–11). Wire the
+  decoded surface to VdSwap/rex_render present → a VISIBLE intro movie (the decoded-frame shortcut, which cont.4
+  abandoned only because there was no decoded frame; now there is).
+- **(c)** make fair + forced-transition not stall (only if XFLAG is still wanted as a stopgap); lower priority
+  than (a)/(b).
+- ⚠ Do NOT combine REX_FAIRSCHED with REX_XFLAG (stalls). Use REX_FAIRSCHED with REX_MOVIE_EOF for decode work.

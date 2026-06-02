@@ -754,6 +754,50 @@ std::condition_variable g_waitCv;
 const bool g_coop = (getenv("REX_NOTOKEN") == nullptr);
 const bool g_evtrace = (getenv("REX_EVTRACE") != nullptr);
 
+// ---- Fair cooperative scheduler (REX_FAIRSCHED) ------------------------------------------------------
+// The default token (g_waitMutex, a plain std::mutex) is UNFAIR: when the main loop yields it and re-locks,
+// it wins the race, so resumed/ready worker threads parked at g_waitMutex.lock() (GuestThreadRun startup,
+// LockGuestExecution) can starve forever (observed: tid=10 sub_82250420, which runs the screen-transitions-
+// enable teardown, never ran its entry). REX_FAIRSCHED swaps in a FIFO run-token so every ready thread gets
+// a turn. Self-contained: when off, the existing g_waitMutex/g_waitCv path below runs UNCHANGED (zero
+// default regression). The run-token (g_tok) is held by the one running guest thread; a thread blocked on a
+// guest dispatch object releases g_tok and re-acquires it FIFO-fairly when SignalObject wakes it (g_objM/
+// g_objCv). g_fair implies g_coop. Full rationale: NIGHT-LOG 'cont. 8/9'.
+class FairMutex {
+public:
+    std::mutex m_; std::condition_variable cv_; uint64_t next_ = 0, serving_ = 0; bool held_ = false;
+    void lock()   { std::unique_lock<std::mutex> lk(m_); uint64_t my = next_++;
+                    cv_.wait(lk, [&]{ return !held_ && serving_ == my; }); held_ = true; }
+    void unlock() { { std::lock_guard<std::mutex> lk(m_);
+                    if (!held_ && getenv("REX_INITDIAG")) fprintf(stderr, "[BUG] spurious g_tok.unlock (serving=%llu next=%llu)\n", (unsigned long long)serving_, (unsigned long long)next_);
+                    held_ = false; serving_++; } cv_.notify_all(); }
+};
+const bool g_fair = g_coop && (getenv("REX_FAIRSCHED") != nullptr);
+FairMutex g_tok;                  // the fair run-token: one guest thread runs at a time, granted FIFO
+std::mutex g_objM;                // guards guest dispatch-object signal_state for fair object-waits
+std::condition_variable g_objCv;  // notified by SignalObject (fair mode)
+// Caller holds the run-token. If pred() (a guest object is signaled) isn't already true, release the token
+// so other threads run, block on g_objCv until pred()/timeout, then re-acquire the token FIFO-fairly.
+// Returns true iff pred satisfied. pred reads guest state under g_objM (SignalObject writes it under g_objM).
+template <class Pred> bool FairWaitUntil(Pred pred, int64_t timeoutMs) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs < 0 ? 0 : timeoutMs);
+    for (;;) {
+        { std::unique_lock<std::mutex> ol(g_objM); if (pred()) return true; }  // satisfied while holding token
+        g_tok.unlock();                                                        // yield the run-token
+        bool sig;
+        { std::unique_lock<std::mutex> ol(g_objM);
+          if (timeoutMs < 0) { g_objCv.wait(ol, pred); sig = true; }
+          else sig = g_objCv.wait_until(ol, deadline, pred); }
+        g_tok.lock();                                                          // re-acquire FIFO-fairly
+        if (timeoutMs >= 0 && !sig) { std::unique_lock<std::mutex> ol(g_objM); return pred(); }   // timed out
+        // loop: re-check pred under the run-token (so an auto-reset consumed by another waiter re-waits)
+    }
+}
+inline void FairSetSignal(uint32_t obj, int32_t state) {   // write a dispatch-object signal_state (fair mode)
+    { std::lock_guard<std::mutex> ol(g_objM); GST32(obj + 0x04, static_cast<uint32_t>(state)); }
+    g_objCv.notify_all();
+}
+
 std::map<uint32_t,uint32_t> g_evSignalCount, g_evWaitCount;   // obj -> count (guarded by g_evMutex)
 std::map<uint32_t,uint32_t> g_evSignalLR, g_evWaitLR;         // obj -> first guest caller LR
 std::mutex g_evMutex;
@@ -764,6 +808,7 @@ void SignalObject(uint32_t obj, int32_t state) {
         g_evSignalCount[obj]++;
         if (!g_evSignalLR.count(obj)) g_evSignalLR[obj] = g_tlSignalLR;
     }
+    if (g_fair) { FairSetSignal(obj, state); return; }                 // fair: write under g_objM + notify g_objCv
     if (g_coop) { GST32(obj + 0x04, static_cast<uint32_t>(state)); }   // caller already holds the token
     else { std::lock_guard<std::mutex> lk(g_waitMutex); GST32(obj + 0x04, static_cast<uint32_t>(state)); }
     g_waitCv.notify_all();
@@ -772,14 +817,21 @@ void SignalObject(uint32_t obj, int32_t state) {
 // timeout: <0 = infinite, 0 = poll, >0 = milliseconds. Returns 0 (success) or 0x102 (STATUS_TIMEOUT).
 // Releases the execution token while blocked (lets other guest threads run), re-holds it on resume.
 uint32_t WaitObject(uint32_t obj, int64_t timeoutMs) {
-    std::unique_lock<std::mutex> lk = g_coop ? std::unique_lock<std::mutex>(g_waitMutex, std::adopt_lock)
-                                             : std::unique_lock<std::mutex>(g_waitMutex);
     auto signaled = [&]{ return static_cast<int32_t>(GLD32(obj + 0x04)) > 0; };
     if (g_evtrace) {
         std::lock_guard<std::mutex> lk2(g_evMutex);
         g_evWaitCount[obj]++;
         if (!g_evWaitLR.count(obj)) g_evWaitLR[obj] = g_tlSignalLR;
     }
+    if (g_fair) {                                  // fair: release the run-token, wait on g_objCv, re-acquire FIFO
+        bool ok = FairWaitUntil(signaled, timeoutMs);
+        if (ok) { std::lock_guard<std::mutex> ol(g_objM); uint8_t type = g_base[obj + 0x00];
+            if (type == 1 || type == 2 || type == 5)
+                GST32(obj + 0x04, static_cast<uint32_t>(static_cast<int32_t>(GLD32(obj + 0x04)) - 1)); }
+        return ok ? 0 : 0x00000102u;
+    }
+    std::unique_lock<std::mutex> lk = g_coop ? std::unique_lock<std::mutex>(g_waitMutex, std::adopt_lock)
+                                             : std::unique_lock<std::mutex>(g_waitMutex);
     bool ok = true;
     if (timeoutMs < 0) g_waitCv.wait(lk, signaled);
     else ok = g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), signaled);
@@ -801,7 +853,10 @@ int64_t TimeoutMs(uint32_t timeoutPtr) {
 }
 
 void GuestThreadRun(ThreadRec* rec) {
-    g_waitMutex.lock();                      // acquire the execution token (blocks until the creator yields)
+    if (g_fair && getenv("REX_INITDIAG")) fprintf(stderr, "[initdiag] GuestThreadRun start=0x%X WAITING (g_tok next=%llu serving=%llu held=%d)\n",
+        rec->startAddr, (unsigned long long)g_tok.next_, (unsigned long long)g_tok.serving_, (int)g_tok.held_);
+    if (g_fair) g_tok.lock(); else g_waitMutex.lock();   // acquire the execution token (FIFO-fair if g_fair)
+    if (g_fair && getenv("REX_INITDIAG")) fprintf(stderr, "[initdiag] GuestThreadRun start=0x%X GOT token -> running\n", rec->startAddr);
     PPCContext ctx{};
     ctx.fpscr.csr = 0x1F80;                  // default MXCSR: all FP exceptions masked
     ctx.r1.u64 = rec->stackTop - 0x200;
@@ -815,15 +870,15 @@ void GuestThreadRun(ThreadRec* rec) {
         CallGuest(rec->startAddr, ctx);
     }
     SignalObject(rec->threadAddr, 1);        // wake anyone waiting on this thread object (header type 6)
-    g_waitMutex.unlock();
+    if (g_fair) g_tok.unlock(); else g_waitMutex.unlock();
 }
 } // namespace
 
 namespace kernel {
 // The cooperative execution token (see kernel.h). g_waitMutex is held by the running guest thread.
 // No-ops under REX_NOTOKEN (preemptive mode).
-void LockGuestExecution()   { if (g_coop) g_waitMutex.lock(); }
-void UnlockGuestExecution() { if (g_coop) g_waitMutex.unlock(); }
+void LockGuestExecution()   { if (g_fair) g_tok.lock();   else if (g_coop) g_waitMutex.lock(); }
+void UnlockGuestExecution() { if (g_fair) g_tok.unlock(); else if (g_coop) g_waitMutex.unlock(); }
 } // namespace kernel
 
 // NTSTATUS ExCreateThread(*handle r3, stack r4, *tid r5, xapi r6, start r7, ctx r8, flags r9)
@@ -1118,7 +1173,10 @@ void VblankPump() {
         g_vblankCount.fetch_add(1);
         uint32_t cb = g_interruptCallback;
         if (!cb) continue;
-        if (g_coop) g_waitMutex.lock();
+        if (g_fair && getenv("REX_INITDIAG")) { static int d=0; if ((d++ % 30)==0)
+            fprintf(stderr, "[initdiag] g_tok next=%llu serving=%llu held=%d (churn=serving)\n",
+                    (unsigned long long)g_tok.next_, (unsigned long long)g_tok.serving_, (int)g_tok.held_); }
+        if (g_fair) g_tok.lock(); else if (g_coop) g_waitMutex.lock();
         // Real command processor: the guest kicks by writing the ring write index to CP_RB_WPTR. Execute
         // the newly-submitted PM4 (lastWptr..wptr) — which recurses into the indirect buffers and applies
         // the EVENT_WRITE_SHD fences / INTERRUPT callbacks the render loop waits on — then advance RPtr to
@@ -1134,7 +1192,7 @@ void VblankPump() {
         GST32(GpuRegAddr(0x1951), 1);             // re-assert interrupt-status=vblank (prod ReadRegister)
         FireGfxInterrupt(cb, 0, /*cpu=*/2);       // vblank (prod delivers on cpu 2)
         if (consumed) FireGfxInterrupt(cb, 1, /*cpu=*/2);    // command-buffer complete
-        if (g_coop) g_waitMutex.unlock();
+        if (g_fair) g_tok.unlock(); else if (g_coop) g_waitMutex.unlock();
     }
 }
 
@@ -1240,6 +1298,29 @@ PPC_FUNC(sub_82161920)
     static const bool xflag = getenv("REX_XFLAG") != nullptr;
     if (xflag) g_base[0x828E82A6] = 1;     // screen-transitions-enabled flag (prod: set by sub_8210AF90)
     __imp__sub_82161920(ctx, base);
+}
+// Diag (REX_INITDIAG): does the transitions-enable worker run? sub_82250420 (work-loop) -> sub_8211B740
+// (handler) -> sub_8210AF90 (sets 0x828E82A6). Used to verify REX_FAIRSCHED unstarves tid=10.
+extern "C" PPC_FUNC(__imp__sub_82250420);
+PPC_FUNC(sub_82250420) { if (getenv("REX_INITDIAG")) { static std::atomic<int> k{0};
+    if (k.fetch_add(1)==0) fprintf(stderr, "[initdiag] sub_82250420 worker ENTERED (tid=10 runs)\n"); }
+    __imp__sub_82250420(ctx, base); }
+extern "C" PPC_FUNC(__imp__sub_8211B740);
+PPC_FUNC(sub_8211B740) { if (getenv("REX_INITDIAG")) { static std::atomic<int> k{0};
+    if (k.fetch_add(1)<3) fprintf(stderr, "[initdiag] sub_8211B740 work-handler ran\n"); }
+    __imp__sub_8211B740(ctx, base); }
+extern "C" PPC_FUNC(__imp__sub_8210AF90);
+PPC_FUNC(sub_8210AF90) { if (getenv("REX_INITDIAG")) fprintf(stderr, "[initdiag] *** sub_8210AF90 RAN — 0x828E82A6 set, transitions enabled ***\n");
+    __imp__sub_8210AF90(ctx, base); }
+// Cooperative time-slice (REX_FAIRSCHED): the main thread's steady intro loop never blocks (the fence-forward
+// satisfies its GPU waits instantly), so it holds the run-token forever and every other guest thread (the
+// transitions worker tid=10, the VC-1 decoders) starves — regardless of token fairness. Yield the token once
+// per frame at sub_82167248 (the per-frame update) so the FIFO serves the other ready threads, then re-acquire.
+extern "C" PPC_FUNC(__imp__sub_82167248);
+PPC_FUNC(sub_82167248)
+{
+    if (g_fair) { kernel::UnlockGuestExecution(); kernel::LockGuestExecution(); }   // per-frame cooperative yield
+    __imp__sub_82167248(ctx, base);
 }
 // Diag (gated): confirm the title's own completion poster fires after a forced EOS (sub_82425BF8 EOF branch).
 extern "C" PPC_FUNC(__imp__sub_8222A9F8);
@@ -2021,8 +2102,6 @@ PPC_FUNC(__imp__KeWaitForMultipleObjects)
     g_tlSignalLR = ctx.lr;
     uint32_t count = ctx.r3.u32, objects = ctx.r4.u32, waitType = ctx.r5.u32; // 0=WaitAll, 1=WaitAny
     int64_t timeoutMs = TimeoutMs(ctx.r9.u32);
-    std::unique_lock<std::mutex> lk = g_coop ? std::unique_lock<std::mutex>(g_waitMutex, std::adopt_lock)
-                                             : std::unique_lock<std::mutex>(g_waitMutex);
     auto firstReady = [&]() -> int {
         if (waitType == 1) {                       // WaitAny -> index of first signaled, else -1
             for (uint32_t i = 0; i < count; i++) {
@@ -2038,14 +2117,26 @@ PPC_FUNC(__imp__KeWaitForMultipleObjects)
         return 0;
     };
     auto pred = [&]{ return firstReady() >= 0; };
+    // Consume auto-reset/semaphore/mutant objects we're satisfied on.
+    auto consume = [&](uint32_t o){ uint8_t t = g_base[o + 0x00];
+        if (t == 1 || t == 2 || t == 5) GST32(o + 0x04, static_cast<int32_t>(GLD32(o + 0x04)) - 1); };
+    if (g_fair) {
+        bool ok = FairWaitUntil(pred, timeoutMs);
+        if (!ok) { ctx.r3.u64 = 0x102; return; }
+        int idx = firstReady();
+        { std::lock_guard<std::mutex> ol(g_objM);
+          if (waitType == 1) consume(GLD32(objects + idx * 4));
+          else for (uint32_t i = 0; i < count; i++) consume(GLD32(objects + i * 4)); }
+        ctx.r3.u64 = (waitType == 1) ? static_cast<uint32_t>(idx) : 0;
+        return;
+    }
+    std::unique_lock<std::mutex> lk = g_coop ? std::unique_lock<std::mutex>(g_waitMutex, std::adopt_lock)
+                                             : std::unique_lock<std::mutex>(g_waitMutex);
     bool ok = true;
     if (timeoutMs < 0) g_waitCv.wait(lk, pred);
     else ok = g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), pred);
     if (!ok) { if (g_coop) lk.release(); ctx.r3.u64 = 0x102; return; }   // STATUS_TIMEOUT
     int idx = firstReady();
-    // Consume auto-reset/semaphore/mutant objects we're satisfied on.
-    auto consume = [&](uint32_t o){ uint8_t t = g_base[o + 0x00];
-        if (t == 1 || t == 2 || t == 5) GST32(o + 0x04, static_cast<int32_t>(GLD32(o + 0x04)) - 1); };
     if (waitType == 1) consume(GLD32(objects + idx * 4));
     else for (uint32_t i = 0; i < count; i++) consume(GLD32(objects + i * 4));
     if (g_coop) lk.release();                                // coop: keep the token held as we resume
@@ -2065,8 +2156,6 @@ PPC_FUNC(__imp__NtWaitForMultipleObjectsEx)
     uint32_t objs[64];
     if (count > 64) count = 64;
     for (uint32_t i = 0; i < count; i++) objs[i] = ResolveObject(GLD32(handles + i * 4));
-    std::unique_lock<std::mutex> lk = g_coop ? std::unique_lock<std::mutex>(g_waitMutex, std::adopt_lock)
-                                             : std::unique_lock<std::mutex>(g_waitMutex);
     auto signaled = [&](uint32_t o){ return o && static_cast<int32_t>(GLD32(o + 0x04)) > 0; };
     auto firstReady = [&]() -> int {
         if (waitType == 1) {                       // WaitAny -> index of first signaled, else -1
@@ -2077,13 +2166,24 @@ PPC_FUNC(__imp__NtWaitForMultipleObjectsEx)
         return 0;
     };
     auto pred = [&]{ return firstReady() >= 0; };
+    auto consume = [&](uint32_t o){ if (!o) return; uint8_t t = g_base[o + 0x00];
+        if (t == 1 || t == 2 || t == 5) GST32(o + 0x04, static_cast<int32_t>(GLD32(o + 0x04)) - 1); };
+    if (g_fair) {
+        bool ok = FairWaitUntil(pred, timeoutMs);
+        if (!ok) { ctx.r3.u64 = 0x102; return; }
+        int idx = firstReady();
+        { std::lock_guard<std::mutex> ol(g_objM);
+          if (waitType == 1) consume(objs[idx]); else for (uint32_t i = 0; i < count; i++) consume(objs[i]); }
+        ctx.r3.u64 = (waitType == 1) ? static_cast<uint32_t>(idx) : 0;
+        return;
+    }
+    std::unique_lock<std::mutex> lk = g_coop ? std::unique_lock<std::mutex>(g_waitMutex, std::adopt_lock)
+                                             : std::unique_lock<std::mutex>(g_waitMutex);
     bool ok = true;
     if (timeoutMs < 0) g_waitCv.wait(lk, pred);
     else ok = g_waitCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), pred);
     if (!ok) { if (g_coop) lk.release(); ctx.r3.u64 = 0x102; return; }            // STATUS_TIMEOUT
     int idx = firstReady();
-    auto consume = [&](uint32_t o){ if (!o) return; uint8_t t = g_base[o + 0x00];
-        if (t == 1 || t == 2 || t == 5) GST32(o + 0x04, static_cast<int32_t>(GLD32(o + 0x04)) - 1); };
     if (waitType == 1) consume(objs[idx]);
     else for (uint32_t i = 0; i < count; i++) consume(objs[i]);
     if (g_coop) lk.release();
