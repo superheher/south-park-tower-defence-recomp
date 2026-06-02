@@ -993,9 +993,29 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
       case PM4_EVENT_WRITE_EXT:
         WriteGpuReg(XE_GPU_REG_VGT_EVENT_INITIATOR, GLD32(addr) & 0x3F);
         break;
-      case PM4_DRAW_INDX: case PM4_DRAW_INDX_2:
+      case PM4_DRAW_INDX: case PM4_DRAW_INDX_2: {
+        uint32_t init = GLD32(addr), numInd = init >> 16, prim = init & 0x3F;
         g_drawCount.fetch_add(1);
+        // REX_DRAWLOG: log non-degenerate draws + their bound texture fetch constants (reg 0x4800,
+        // 6 dwords/slot) — to find the intro movie's full-screen quad and its decoded-frame texture.
+        static const bool drawlog = getenv("REX_DRAWLOG") != nullptr;
+        static std::atomic<int> dn{0};
+        if (drawlog && numInd > 2 && dn.load() < 24) {
+            int k = ++dn;
+            fprintf(stderr, "[draw] #%d init=0x%X numInd=%u prim=%u\n", k, init, numInd, prim);
+            for (uint32_t slot = 0; slot < 32; slot++) {
+                uint32_t fb = 0x7FC80000u + (0x4800u + slot*6u)*4u;
+                uint32_t d0 = GLD32(fb), d1 = GLD32(fb+4), d2 = GLD32(fb+8);
+                uint32_t baseAddr = ((d1 >> 12) & 0xFFFFF) << 12;
+                if (baseAddr >= 0xA0000000u) {   // a bound texture (physical window)
+                    fprintf(stderr, "[draw]   tex slot%u base=0x%X %ux%u fmt=%u tiled=%u type=%u @base=%08X\n",
+                            slot, baseAddr, (d2 & 0x1FFF)+1, ((d2 >> 13) & 0x1FFF)+1, d1 & 0x3F,
+                            (d0 >> 31) & 1, d0 & 3, GLD32(baseAddr));
+                }
+            }
+        }
         break;
+      }
       case PM4_XE_SWAP:
         g_gpuCounter.fetch_add(1); g_swapCount.fetch_add(1);
         if (g_cptrace) fprintf(stderr, "[cp] XE_SWAP #%llu\n", (unsigned long long)g_swapCount.load());
@@ -1011,6 +1031,16 @@ void ExecutePM4(uint32_t addr, uint32_t dwords, int depth) {
     while (addr + 4 <= end) {
         uint32_t packet = GLD32(addr); addr += 4;
         if (packet == 0) continue;
+        // REX_CPDUMP: trace top-level packets of the deferred buffer to locate where the parse desyncs.
+        static const bool cpdump = getenv("REX_CPDUMP") != nullptr;
+        static std::atomic<int> pn{0};
+        if (cpdump && depth == 0 && pn.load() < 400) {
+            int k = ++pn; uint32_t t = packet >> 30, op = (packet >> 8) & 0x7F;
+            // flag draws + the suspicious low-byte!=0 "headers" (likely chain/jump packets or misaligned data)
+            const char* note = (t == 3 && (op == 0x36 || op == 0x22)) ? " <<DRAW" : ((packet & 0xFF) && t == 3 ? " <<lowbyte" : "");
+            fprintf(stderr, "[pm4] #%d @0x%X type%u op=0x%X cnt=%u raw=%08X%s\n",
+                    k, addr - 4, t, t == 3 ? op : 0, ((packet >> 16) & 0x3FFF) + 1, packet, note);
+        }
         switch (packet >> 30) {
           case 0: {                              // type-0: write `count` regs starting at base_index
             uint32_t count = ((packet >> 16) & 0x3FFF) + 1, baseIdx = packet & 0x7FFF;
