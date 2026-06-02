@@ -1702,3 +1702,27 @@ sub_8211B740) with its return value (the post-bctrl branches gate on it). Gated,
 - NEXT (to finish): trace those direct calls (gdb breakpoints on the mid-section callees filtered to the
   sub_8211B740 invocation, or temporary fprintf in the recompiled body) to find the one that hangs/returns-
   early/diverges; compare to prod. The 2 early bctrls + their returns are now the verified-good prefix.
+
+### ⭐ sub_8211B740 "divergence" ROOT-CAUSED (cont.11) — it's STARVATION, not a code divergence (UNIFIES with slow movie)
+Continued the natural-transition RE with gdb on the live boot (REX_FAIRSCHED REX_MOVIE_EOF=30 REX_TRACEB740).
+Decisive chain of evidence:
+- sub_8211B740 makes EXACTLY 2 indirect calls (0x82118E10→1, 0x82248F18→valid ptr) over an 85s run and NEVER
+  reaches the later sub_8210AF90 dispatch (the 0x828E82A6 setter).
+- gdb backtrace of the worker tid=10: it IS executing sub_8211B740, grinding in its heavy SIMD init chain
+  `sub_82132918 (call site 0x8211B854) → sub_8212F6F0 → sub_822C14E8` — a vector matrix/transform loop
+  (vperm/vpermwi/float-adds, stvewx128 to strided addrs). Samples show it at different lines (11190, 11195)
+  across time ⇒ PROGRESSING, not hung on a sync (top frame = simde_mm_shuffle_epi8, pure compute).
+- ⭐ PER-THREAD CPU (`ps -L`): ONLY the main thread burns CPU (82%); tid=10 and the other 12 threads are ~0%.
+  ⇒ sub_822C14E8 is NOT an infinite/busy loop — tid=10 is STARVED. The main thread's fence-forward makes its
+  GPU waits instant, so it holds the cooperative token ~continuously; the worker's heavy one-shot init gets
+  near-zero CPU and barely advances → never finishes → never reaches sub_8210AF90 → 0x828E82A6 stays 0.
+- ⇒ This OVERTURNS cont.8/cont.10's "sub_8211B740 diverges (state/data)" — it is NOT a code divergence. It is
+  the SAME cooperative-scheduler starvation as the slow movie (worker/decoder threads starved by the
+  CPU-bound main thread). The per-frame yield (cont.10) gives the decoders enough for slow decode but NOT
+  enough for the worker's heavy SIMD init.
+- ⇒ FIX (unified, deep): Step-1 real scheduler (true concurrency) OR replace the fence-forward stopgap with a
+  REAL blocking fence so the main thread BLOCKS on GPU waits and yields CPU to the worker + decoders. Either
+  makes sub_8211B740 finish → natural transition AND smooth movie. REX_XFLAG stays the stopgap meanwhile.
+  This is THE Step-1 item; it gates both the natural intro→menu transition (→ real draws for the renderer)
+  and smooth playback. Next concrete sub-task: prototype a real blocking fence (replace fence-forward in the
+  ~6 sub_821B9270 waiters) and re-measure per-thread CPU + whether sub_8210AF90 fires.
