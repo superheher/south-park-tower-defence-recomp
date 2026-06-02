@@ -1191,6 +1191,66 @@ PPC_FUNC(sub_821C6600)
     }
 }
 
+// ---- Force intro-movie end-of-stream (REX_MOVIE_EOF=N) ----------------------------------------------
+// The intro plays Movies/en-en/sp_xbox_0_intro.wmv and advances to the menu ONLY on movie end-of-stream:
+// each frame the movie widget's per-frame driver sub_82425BF8 calls its player's AdvanceFrame dispatch
+// sub_8232AAE0 (= (*(*player+72))(player, ...)); when that returns 0x16660026 (the demuxer EOS code,
+// produced by sub_8233A7D0) sub_82425BF8 POSTS the completion event on channel 0xAAC0CCDD (sub_8222A9F8),
+// which the intro owner (an event/state machine: sub_82163118 <- ... <- sub_82150770) handles by tearing
+// the movie down and switching to the menu (verified on the prod oracle: the movie runs ~534 frames /
+// ~22 s, then this exact path fires). In variant A the VC-1 decoder is stuck, so AdvanceFrame never
+// returns EOS and the intro hangs forever; REX_MOVIE_EOF=N synthesizes that EOS after N advance calls,
+// driving the title's OWN intro->menu transition. Precise: only the movie widget's player (captured as
+// *(widget+76) in sub_82425BF8) is forced, so the other AdvanceFrame caller (sub_8224EE20, a different
+// media object) is untouched. Default-off (gate unset => boot unchanged).
+namespace { std::atomic<uint32_t> g_moviePlayer{0}; }
+extern "C" PPC_FUNC(__imp__sub_82425BF8);
+PPC_FUNC(sub_82425BF8)
+{
+    g_moviePlayer.store(GLD32(ctx.r3.u32 + 76));   // movie widget 'this' -> player object
+    __imp__sub_82425BF8(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_8232AAE0);
+PPC_FUNC(sub_8232AAE0)
+{
+    static const char* eofEnv = getenv("REX_MOVIE_EOF");
+    uint32_t player = ctx.r3.u32;                  // arg: the player object being advanced
+    __imp__sub_8232AAE0(ctx, base);                // real AdvanceFrame; r3 = status on return
+    if (eofEnv && player && player == g_moviePlayer.load()) {
+        static std::atomic<int> n{0};
+        int c = n.fetch_add(1), thr = atoi(eofEnv);
+        if (g_ktrace && (c % 60 == 0 || c == thr))
+            fprintf(stderr, "[movie-eof] advance #%d player=0x%X ret=0x%X%s\n", c, player, ctx.r3.u32,
+                    (c >= thr) ? "  -> FORCING EOS 0x16660026" : "");
+        if (c >= thr) ctx.r3.u64 = 0x16660026u;  // synthesize demuxer EOS -> title posts completion
+    }
+}
+// REX_XFLAG: forcing the movie EOS alone is NOT enough to reach the menu. The intro->menu advance logic
+// sub_82163118 is dispatched by the per-frame screen state machine sub_82161920 ONLY in its state==2 branch,
+// behind a global "screen-transitions-enabled" byte at 0x828E82A6. prod's sub_8210AF90 sets that byte to 1;
+// in variant A sub_8210AF90 is never reached, so the byte stays 0 and sub_82163118 never runs -> the title
+// cannot leave the intro even once the movie has ended (gdb-verified: owner reaches state 2, owner+72=1,
+// but g(0x828E82A6)=0). REX_XFLAG forces the byte so the state machine advances. Combined with REX_MOVIE_EOF
+// (+ REX_SKIPINTRO START), this drives intro movie -> attract loop -> menu/frontend setup, hitting the next
+// blocker (INDIRECT-NULL 0xFFFFFFFF at sub_8215DE84, a null screen vtable/jump-table). STOPGAP: the proper
+// fix is to find why sub_8210AF90 isn't called in variant A. Default-off (gate unset => boot unchanged).
+extern "C" PPC_FUNC(__imp__sub_82161920);
+PPC_FUNC(sub_82161920)
+{
+    static const bool xflag = getenv("REX_XFLAG") != nullptr;
+    if (xflag) g_base[0x828E82A6] = 1;     // screen-transitions-enabled flag (prod: set by sub_8210AF90)
+    __imp__sub_82161920(ctx, base);
+}
+// Diag (gated): confirm the title's own completion poster fires after a forced EOS (sub_82425BF8 EOF branch).
+extern "C" PPC_FUNC(__imp__sub_8222A9F8);
+PPC_FUNC(sub_8222A9F8)
+{
+    static const bool log = g_ktrace && getenv("REX_MOVIE_EOF") != nullptr;
+    if (log) { static std::atomic<int> k{0};
+        if (k.fetch_add(1) < 4) fprintf(stderr, "[movie-eof] completion-post (sub_8222A9F8) r3=0x%X r4=0x%X\n", ctx.r3.u32, ctx.r4.u32); }
+    __imp__sub_8222A9F8(ctx, base);
+}
+
 // ---- GPU fence-wait completion: forward the completion fence past deferred segments (sub_821C6E58) --
 // sub_821C6E58 spins until the GPU completion fence *(*(device+10896)) reaches `target` (r4), measured
 // relative to the latest built fence head=*(device+10908). The title builds PM4 into command-buffer
@@ -1355,16 +1415,28 @@ PPC_FUNC(__imp__XamInputGetCapabilities)
     ctx.r3.u64 = kErrNotConnected;
 }
 PPC_FUNC(__imp__XamInputSetState) { ctx.r3.u64 = 0; }   // vibration: no-op success
-PPC_FUNC(__imp__XamInputGetKeystroke)
-{
-    uint32_t k = ctx.r5.u32; if (k) for (uint32_t i = 0; i < 16; i += 4) PPC_STORE_U32(k + i, 0);
+// REX_SKIPINTRO: pulse a VK_PAD_START (0x5814) keystroke so an attract/title "press START" poll (which uses
+// XamInputGetKeystrokeEx, per the boot-logo loop sub_8214F738) advances to the menu. X_INPUT_KEYSTROKE:
+// VirtualKey@0(u16), Unicode@2, Flags@4 (KEYDOWN=1), UserIndex@6, HidCode@7. Return ERROR_EMPTY (0x10D5)
+// between pulses so the title keeps polling instead of treating the pad as absent.
+namespace { void InjectKeystroke(PPCContext& ctx) {
+    uint32_t k = ctx.r5.u32; if (k) for (uint32_t i = 0; i < 16; i += 4) GST32(k + i, 0);
+    static const bool skip = getenv("REX_SKIPINTRO") != nullptr;
+    if (skip && k) {
+        static std::atomic<uint32_t> p{0}; uint32_t c = p.fetch_add(1);
+        if ((c % 24) < 2) {                            // periodic START keydown
+            GST16(k + 0, 0x5814);                      // VirtualKey = VK_PAD_START
+            GST16(k + 4, 0x0001);                      // Flags = XINPUT_KEYSTROKE_KEYDOWN
+            static std::atomic<bool> once{false}; bool e=false;
+            if (g_ktrace && once.compare_exchange_strong(e,true)) fprintf(stderr, "[skipintro] injecting VK_PAD_START keystroke\n");
+            ctx.r3.u64 = 0; return;                    // ERROR_SUCCESS
+        }
+        ctx.r3.u64 = 0x000010D5u; return;             // ERROR_EMPTY
+    }
     ctx.r3.u64 = kErrNotConnected;
-}
-PPC_FUNC(__imp__XamInputGetKeystrokeEx)
-{
-    uint32_t k = ctx.r5.u32; if (k) for (uint32_t i = 0; i < 16; i += 4) PPC_STORE_U32(k + i, 0);
-    ctx.r3.u64 = kErrNotConnected;
-}
+} }
+PPC_FUNC(__imp__XamInputGetKeystroke)   { InjectKeystroke(ctx); }
+PPC_FUNC(__imp__XamInputGetKeystrokeEx) { InjectKeystroke(ctx); }
 
 // ---- XAudio (fill out-params: the audio worker uses the returned driver/config/volume) -------------
 // DWORD XAudioGetSpeakerConfig(*config r3) -> 0x00010001

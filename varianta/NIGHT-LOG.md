@@ -1319,3 +1319,64 @@ pipeline (decoder waits for work; main thread loops presenting empty frames with
 pure scheduler starvation. Reaching visible content needs deep RE of the movie-player start/feed path (or
 the menu, which sits behind the same stuck intro). NET for the session: the wall is now COMPLETELY mapped,
 but visible content was not reached — every remaining path is multi-session title-specific RE.
+
+## 2026-06-02 (cont. 7) — ✅ intro→menu transition RE'd + FORCED: title now advances intro→attract→menu-setup (NOT pushed)
+User directive: "force «movie ended» (pinpoint-RE the intro→menu transition condition)". Done, and the intro
+hang is now BROKEN — the title advances past the intro into the attract loop and into menu/frontend setup.
+
+### The transition mechanism (RE'd end-to-end; prod oracle confirms)
+- Per frame the movie widget's driver `sub_82425BF8` calls the player AdvanceFrame dispatch `sub_8232AAE0`
+  (= `(*(*player+72))(player,...)`, player = `*(widget+76)`). It returns a status in facility 0x1666:
+  **0x166600E8** = "no frame / buffering" (variant A's stuck-decoder steady state), **0x16660026** = EOS
+  (produced by `sub_8233A7D0`). On EOS, `sub_82425BF8` POSTS the completion (`sub_822221C8` + `sub_8222A9F8`,
+  channel 0xAAC0CCDD, event type 8).
+- The completion is consumed by the per-frame screen state machine `sub_82161920` (driven by the event/state
+  pump `sub_82150770`), which in its **state==2** branch dispatches `sub_82163118` = the intro→menu advance.
+- PROD ORACLE (gdb, SIGSEGV passed through so its write-watch handler runs): the intro movie runs **~534
+  frames / ~22 s** (t=25.2→47.3s under gdb), then EOS fires and the completion path tears the movie down
+  (`sub_82425648` via `sub_824259F8`/`sub_82425F50` and via `sub_82150770→sub_82161920→sub_82163118→…→
+  sub_824267B0`) and advances. ⚠ NOTE: the transition does NOT swap the screen-manager's current-screen
+  (`*(0x828EAB18+12)` unchanged in prod) — a hardware watchpoint there never fires; the intro/menu is a
+  sub-state, not a top screen swap. (`+0x8C`/child-list reads are unreliable — discard.)
+
+### Two gates, both forced (env-gated levers in kernel.cpp; default-off, boot unregressed)
+1. **`REX_MOVIE_EOF=N`** — variant A's VC-1 decoder is stuck, so AdvanceFrame returns 0x166600E8 FOREVER
+   (no EOS). Wrap `sub_8232AAE0`: after N advances of the movie player (captured as `*(widget+76)` in a
+   `sub_82425BF8` wrap), force its return to 0x16660026. PROVEN: movie pump stops (no-force = 44,820 advances
+   in 30s and climbing; force@30 = plateaus at 30) and the completion poster `sub_8222A9F8` fires. But ALONE
+   it does NOT advance — the movie self-stops, the intro keeps running.
+2. **`REX_XFLAG=1`** — `sub_82163118` (the advance) is gated, even in state 2, behind a global
+   "screen-transitions-enabled" byte **`0x828E82A6`**, which prod's `sub_8210AF90` sets to 1 but which is **0
+   in variant A** (`sub_8210AF90` never reached). gdb-verified: owner reaches state 2, `owner+72=1`,
+   `g(0x828EEF1C)=1`, but `g(0x828E82A6)=0` → `sub_82163118` ticks=0. Forcing the byte in the `sub_82161920`
+   wrap makes `sub_82163118` run.
+
+### Result (REX_MOVIE_EOF=30 + REX_XFLAG=1 [+ REX_SKIPINTRO])
+- With both: `sub_82163118` runs, the completion is processed, and the title ADVANCES out of the intro into
+  the **attract loop** — it opens `towerDefense_attract_movie.wmv` (symlinked into `Movies/en-en/` like the
+  intro; it exists in `Movies/`) and cycles intro↔attract (the classic console demo loop). No crash,
+  0 device-overwrite. The long-standing intro hang is GONE.
+- `REX_SKIPINTRO` now also injects a pulsed **VK_PAD_START (0x5814) keystroke via XamInputGetKeystrokeEx**
+  (the title/logo poll path; the old XamInputGetState-only inject didn't reach it). With all three gates the
+  title leaves the attract loop and enters **menu/frontend setup**: main thread runs the screen state machine
+  `sub_82150770 → sub_8215DBD0`, allocates menu GPU buffers (`MmAllocatePhysicalMemoryEx 0x195000/0x3000/
+  0x10000`), then hits the **NEXT BLOCKER: `[INDIRECT-NULL] target=0xFFFFFFFF (caller lr=0x8215DE84)`** — a
+  null screen vtable/jump-table slot in the frontend setup (the project's known function-boundary/jump-table
+  class, Update-3 workflow; OR a method unimplemented because the renderer is absent).
+
+### Diagnostics / method
+- prod oracle under gdb is viable IF `handle SIGSEGV nostop noprint pass` (prod uses SIGSEGV for GPU
+  write-watch; default gdb intercepts it and looks like a crash in sub_821C6AF8). prod base = 0x100000000.
+- Hooks added (all gated, passthrough when off): `g_moviePlayer` capture (sub_82425BF8 wrap), `sub_8232AAE0`
+  (REX_MOVIE_EOF), `sub_82161920` (REX_XFLAG), `sub_8222A9F8` completion-post log, `XamInputGetKeystroke(Ex)`
+  START inject (REX_SKIPINTRO). Build `ninja -C runtime/out sp_td_varianta`.
+
+### NEXT (resume here)
+- **Reach the menu fully:** root-cause the INDIRECT-NULL `0xFFFFFFFF @ sub_8215DE84` (read the vtable/jump
+  table at the call site in sub_8215Dxxx; recover it per the Update-3 workflow, or implement the missing
+  screen method). This is the gateway from frontend-setup to a live menu.
+- **Proper fix for the REX_XFLAG stopgap:** find why `sub_8210AF90` (sets 0x828E82A6=1) is never called in
+  variant A (an init divergence; trace its caller, diff prod) so transitions enable themselves.
+- The movie still never DECODES (decoder stuck) — these forces make the title BEHAVE as if the movie ended;
+  for a visible intro the decoder/scheduler work (cont. 5/6) is still open. But for exercising menu/gameplay
+  rendering, the force chain is the way in.
