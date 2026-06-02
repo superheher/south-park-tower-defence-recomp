@@ -1380,3 +1380,40 @@ hang is now BROKEN — the title advances past the intro into the attract loop a
 - The movie still never DECODES (decoder stuck) — these forces make the title BEHAVE as if the movie ended;
   for a visible intro the decoder/scheduler work (cont. 5/6) is still open. But for exercising menu/gameplay
   rendering, the force chain is the way in.
+
+## 2026-06-02 (cont. 8) — proper fix for REX_XFLAG: root = cooperative-scheduler starvation (multi-session); band-aid reverted
+User picked "proper fix instead of the REX_XFLAG stopgap: why is sub_8210AF90 (sets 0x828E82A6) never called
+in variant A?" Root-caused to a CHAIN of cooperative-scheduler issues — NOT a one-liner. No code kept
+(the band-aid regressed; reverted to HEAD 176b54d). Findings:
+
+- **0x828E82A6 is a one-time init flag**: the ONLY writer is `sub_8210AF90` (`li r11,1; stb r11,-32090(0x828F0000)`),
+  which is a TEARDOWN of the global app object `0x828E8AF8` (frees fields +184..+200 via sub_82448D78/
+  sub_8244D670/sub_82448B50, clears +237) that — as a side effect — enables screen transitions. BSS-zero
+  until set, never cleared. So REX_XFLAG (force `g_base[0x828E82A6]=1`) faithfully replicates its flag effect.
+- **sub_8210AF90 has no direct callers** — it's a vtable method invoked indirectly. PROD bt (gdb, `handle
+  SIGSEGV nostop pass` so prod's GPU write-watch runs; prod base=0x100000000): worker thread `sub_82450FD0`
+  (xapi trampoline) → `sub_82250420` (a work-queue loop: wait `sub_8244DC18` → `*(workobj)->vtable[0]()`) →
+  `sub_8211B740` (work handler, vtable[0] of workobj 0x828E8BB0) → `sub_8210AF90`, at t≈0 (early boot).
+- **variant A DOES spawn + resume that worker**: `ExCreateThread(start=0x82250420 ctx=0x828E8BB0 flags=1
+  SUSPENDED) -> tid=10`, and `NtResumeThread(0xF100000F) -> started`. BUT tid=10 **never runs its guest
+  entry** (`sub_82250420` ENTER=0 via a hook): an all-thread gdb bt shows **3 resumed guest threads parked
+  at `GuestThreadRun:804` = `g_waitMutex.lock()`** (the cooperative single-token acquire) — they never won
+  the token. The main thread's tight per-frame intro loop holds/re-wins the token; tid=10 was resumed LATE
+  (after the boot window where the earlier workers tids 5/7/8 got their turns), so it STARVES. This is the
+  long-flagged Step-1 issue (the cooperative token is not fair).
+- **Targeted band-aid TESTED + REVERTED**: a yield-on-resume in NtResumeThread (release the token after
+  spawning so the new thread runs its init to its first wait). Result: tid=10 now STARTS and processes its
+  init work (`sub_82250420` ENTER=1, `sub_8211B740` runs) — BUT (a) `sub_8211B740` STILL doesn't reach
+  `sub_8210AF90` even over 40s (a FURTHER divergence: sub_8211B740's work/state differs from prod's; it's a
+  718-line init fn with many vtable dispatches), and (b) it **REGRESSED** the existing REX_XFLAG advance
+  (changing the cooperative scheduling breaks the determinism the design relies on: attract no longer
+  reached). Reverted (git checkout); confirmed the committed REX_XFLAG advance is restored (attract reached).
+- **CONCLUSION**: REX_XFLAG masks (1) cooperative-scheduler startup-starvation of tid=10 AND (2) a deeper
+  `sub_8211B740 → sub_8210AF90` state divergence. The proper fix = a FAIR cooperative scheduler (the
+  long-deferred RENDERER-PHASE-PLAN Step 1: fibers/real scheduler) + resolving the sub_8211B740 init-state
+  divergence — multi-session, title-specific. A naive band-aid regresses the boot. **REX_XFLAG stays as the
+  pragmatic stopgap** (it replicates sub_8210AF90's flag side-effect exactly). Diagnostics this session were
+  temporary (REX_INITDIAG) and were reverted with the band-aid; the prod-oracle method (`handle SIGSEGV
+  nostop pass`, ExCreateThread-log thread map, all-thread bt → GuestThreadRun:804 token-parked count) is the
+  reusable technique. NET: no code change (HEAD stays 176b54d); the deliverable is the root-cause + the
+  verdict that the fix is the Step-1 scheduler work.
