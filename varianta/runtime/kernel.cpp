@@ -26,6 +26,8 @@
 
 // Lightweight import trace (set REX_KTRACE=0 to silence).
 static const bool g_ktrace = []{ const char* e = getenv("REX_KTRACE"); return !e || e[0] != '0'; }();
+// REX_TRACEB740: trace sub_8211B740's indirect calls (transitions-init divergence RE).
+static const bool g_traceB740 = getenv("REX_TRACEB740") != nullptr;
 #define KTRACE(...) do { if (g_ktrace) { fprintf(stderr, "[kernel] " __VA_ARGS__); } } while (0)
 // Renderer (decoded-frame shortcut): the VC-1 video decoder allocates its frame-pool buffers from a single
 // site (LR 0x8244DD2C). Each FRAME is 3 separate allocations in order: Y plane (req 0x101440, pitch 1344,
@@ -55,12 +57,24 @@ void PPCIndirectNull(uint32_t target, uint32_t lr)
 // = a still-missing jump-table case; out-of-range = a data divergence the title would also fault on).
 void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
 {
+    // REX_TRACEB740: log every indirect (bctrl) call made from within sub_8211B740 (its call sites'
+    // return-LRs fall in [0x8211B748, 0x8211C000)) WITH the call's return value (the post-bctrl branches
+    // gate on it). Reveals how far the 718-line transitions-init handler gets and whether the indirect
+    // dispatch to sub_8210AF90 (the 0x828E82A6 setter) ever fires.
+    uint32_t lr = static_cast<uint32_t>(ctx.lr);
+    bool trace = g_traceB740 && lr >= 0x8211B748u && lr < 0x8211C000u;
     if (target >= PPC_CODE_BASE && target < (PPC_IMAGE_BASE + PPC_IMAGE_SIZE))
     {
         PPCFunc* fn = PPC_LOOKUP_FUNC(base, target);
-        if (fn) { fn(ctx, base); return; }
+        if (fn) {
+            fn(ctx, base);
+            if (trace) fprintf(stderr, "[b740] bctrl lr=0x%08X -> 0x%08X returned r3=0x%08X%s\n",
+                               lr, target, ctx.r3.u32, target == 0x8210AF90u ? "  <== sub_8210AF90!" : "");
+            return;
+        }
     }
-    PPCIndirectNull(target, static_cast<uint32_t>(ctx.lr));
+    if (trace) fprintf(stderr, "[b740] bctrl lr=0x%08X -> 0x%08X (NULL/unmapped, SKIPPED)\n", lr, target);
+    PPCIndirectNull(target, lr);
 }
 
 // ---- guest virtual memory manager ------------------------------------------------------------------

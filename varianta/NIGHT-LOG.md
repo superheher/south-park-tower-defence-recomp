@@ -1686,3 +1686,19 @@ it and made the verifiable foundation; surfaced the gating blocker.
    VkPipeline (ported PS + generic VS) and vkCmdDraw into the swapchain image (the render thread already owns
    it). Verify against the menu.
 3. **Port the remaining 14 shaders**; add generic vertex shaders; texture upload/detile.
+
+### sub_8211B740 divergence — NARROWED (cont.11, REX_TRACEB740) to the mid-section direct calls
+Toward unblocking the screen progression (the renderer's prerequisite), traced sub_8211B740's indirect calls.
+Added REX_TRACEB740: PPCInvokeGuest logs every bctrl whose call-site LR ∈ [0x8211B748,0x8211C000) (i.e. from
+sub_8211B740) with its return value (the post-bctrl branches gate on it). Gated, default boot unregressed.
+- Result (REX_FAIRSCHED=1, tid=10 runs sub_8211B740): it makes EXACTLY 2 indirect calls, both returning
+  NORMAL values, then never reaches any later bctrl (the sub_8210AF90 dispatch never fires):
+  - `0x8211B7D4 -> 0x82118E10 ret=0x1` (the first loop body; loop ran once, r31=1).
+  - `0x8211B804 -> 0x82248F18 ret=0x0133F260` (a vtable[1] call returning a VALID pointer).
+- The branch right after the 2nd bctrl (`beq 0x8211B818` on r3==0) therefore goes the EXPECTED non-zero way
+  (calls sub_8211BC40, stores the ptr at [r30+64]). So the early part is FINE — the divergence is DEEPER, in
+  the direct-call init section after 0x8211B814 (sub_82131758 / sub_8213E7E8 / sub_82132918 / sub_8212BE48 /
+  sub_8211BD60 ...), which my indirect-only trace can't see, BEFORE the later sub_8210AF90 indirect dispatch.
+- NEXT (to finish): trace those direct calls (gdb breakpoints on the mid-section callees filtered to the
+  sub_8211B740 invocation, or temporary fprintf in the recompiled body) to find the one that hangs/returns-
+  early/diverges; compare to prod. The 2 early bctrls + their returns are now the verified-good prefix.
