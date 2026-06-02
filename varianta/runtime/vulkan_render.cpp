@@ -71,6 +71,8 @@ uint64_t       g_vidSettledAt[24] = {0};          // present index at which each
 uint32_t       g_vidStable[24] = {0};             // consecutive presents a buffer has been unchanged
 int            g_vidLastSel = -1;
 uint64_t       g_vidFrame   = 0;                  // count of presents that showed a decoded frame
+uint32_t       g_vidShownSig = 0;                 // luma sig of the last DISPLAYED frame (motion measure)
+uint64_t       g_vidDistinct = 0;                 // count of distinct movie frames actually displayed
 
 #define VKCHECK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[render] %s = %d\n", #x, (int)_r); return false; } } while (0)
@@ -178,6 +180,9 @@ bool PickAndFillVideo() {
     }
     if (sel < 0) sel = g_vidLastSel;        // nothing complete+settled yet — hold the last good frame
     if (sel < 0) return false;              // no frame yet
+    // Motion measure: count how many DISTINCT movie frames we actually display (does playback advance, or
+    // is it stuck re-decoding the same ~2 frames?). g_vidSig[sel] is this frame's luma signature.
+    if (g_vidSig[sel] != g_vidShownSig) { g_vidShownSig = g_vidSig[sel]; g_vidDistinct++; }
     g_vidLastSel = sel;
     // YUV->RGB (planar I420, full-range BT.601). U/V are the next two pool slots (size 0x40520) when present.
     const uint8_t* yp = g_base + bufs[sel] + kVidYOff;
@@ -444,8 +449,9 @@ bool PresentOnce() {
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) { vkDeviceWaitIdle(g_device); CreateSwapchain(); }
 
     if ((g_frame % 300) == 0)
-        fprintf(stderr, "[render] presented frame %llu (guest swaps=%llu, video buf=%d/%d)\n",
-                (unsigned long long)g_frame, (unsigned long long)g_swaps.load(), g_vidLastSel, g_vbufN.load());
+        fprintf(stderr, "[render] presented frame %llu (guest swaps=%llu, video buf=%d/%d, distinct movie frames=%llu)\n",
+                (unsigned long long)g_frame, (unsigned long long)g_swaps.load(), g_vidLastSel, g_vbufN.load(),
+                (unsigned long long)g_vidDistinct);
     g_frame++;
     return true;
 }

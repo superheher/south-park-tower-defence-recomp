@@ -1635,3 +1635,14 @@ After the grayscale present + the sub_8211B740 characterization, cracked the chr
   matches the offline proof, 0 device-overwrite, no crash. Default boot UNREGRESSED (0 [render], 0 overwrite).
   Screenshot delivered to user. ⇒ **Task (a) COLOR is DONE.** Remaining: (b) smooth motion (coop-throttle),
   (c) sub_8211B740 RE for the natural transition.
+
+### Motion investigation (cont.11, task b) — the movie PLAYS but ~10× too slow (scheduler-bound)
+Added a distinct-displayed-frame counter to the render thread. Decisive result (REX_RENDER=1 REX_FAIRSCHED=1,
+55s): the count climbs steadily 15→28→41→…→126 — so playback **advances** (NOT stuck on ~2 frames; the
+buf6↔buf9 alternation is just the decoder double-buffering into 2 Y slots whose CONTENTS change each frame).
+But 126 distinct frames / 55s = **~2.3 movie-fps** vs the movie's 24 fps ≈ **10× too slow**, tracking the
+guest's slow progress (~3.6 swaps/s without REX_MOVIE_EOF). Root: the cooperative single-token scheduler runs
+ONE guest thread at a time, so the 4-thread VC-1 decoder can't use multiple cores → decode throughput starved.
+No safe quick lever (the recompiled code assumes one-at-a-time execution; running decoder threads truly
+concurrently would race/corrupt). ⇒ **smooth motion = the deep Step-1 real-concurrency scheduler**, multi-
+session. (This refines cont.7's "stuck movie" to "slow movie": with REX_FAIRSCHED it genuinely plays through.)
