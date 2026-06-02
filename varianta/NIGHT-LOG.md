@@ -1593,3 +1593,25 @@ unregressed. (User picked "both: present first, then RE" at the session fork.)
 Diagnostics added (all env-gated, default boot unregressed): REX_VIDEODUMP, REX_RENDER_DUMPSEL.
 Build: `ninja -C runtime/out sp_td_varianta`. Visible movie:
 `REX_RENDER=1 REX_FAIRSCHED=1 ./runtime/out/sp_td_varianta ../private/extracted/default.xex`.
+
+### RE progress on path (a) — sub_8211B740 divergence (prod-oracle call chain captured)
+After the present milestone, pivoted to the prompt's option (a) per the user. Findings (a START, multi-session):
+- `sub_8210AF90` (sets the 0x828E82A6 transitions flag; teardown of app-object 0x828E8AF8) has **ZERO direct
+  callers** in the whole variant-A recompiled image — it is reached ONLY via an indirect (vtable) dispatch.
+- **Prod-oracle gdb backtrace at `__imp__sub_8210AF90`** (prod reaches it; variant A doesn't) gives the exact
+  chain: `sub_82450FD0` (trampoline) → `sub_82250420` (tid=10 work-loop) → **`sub_8211B740`** → `sub_8210AF90`.
+  In prod sub_8211B740 calls it directly at +0x1220; in variant A (XenonRecomp) the SAME call is one of the
+  function's **7 indirect `PPC_CALL_INDIRECT_FUNC(ctr)` vtable calls** — which is why it's invisible statically.
+  Run: `cd out/build/linux-amd64-release && SDL_VIDEODRIVER=x11 LD_LIBRARY_PATH=. gdb -batch -x /tmp/oracle.gdb
+  --args ./south_park_td --game_data_root=.../private/extracted --user_data_root=.../private/userdata
+  --license_mask=1 --mnk_mode=true --always_win=true --window_width=960 --window_height=540` with a breakpoint
+  on `__imp__sub_8210AF90` + `handle SIGSEGV nostop noprint pass`.
+- `sub_8211B740` (720 C-lines, ppc_recomp.3.cpp:11035) structure: ~7 indirect vtable calls gated by ~6
+  conditional branches (first at guest 0x8211B7A4: `beq` on `sub_8224FB68`'s return = a name/registry lookup;
+  others at 0x8211B818 / 0x8211B8EC / 0x8211B9C0 / 0x8211B9AC / 0x8211BBE8). The divergence (cont.10: "state/
+  data, not scheduling") is ONE of these branches going the wrong way in variant A (a failed lookup / unset
+  state), skipping the vtable call that dispatches to sub_8210AF90.
+- NEXT (to finish path a): instrument variant A's sub_8211B740 branch path (which loc_ labels it reaches under
+  REX_FAIRSCHED, where tid=10 runs it) and diff against prod's path (gdb-step prod through sub_8211B740 to the
+  sub_8210AF90 bctrl) → the first divergent branch + its state input is the fix target. Then RE that input
+  (likely one of the sub_82248AF8 / sub_82108E20 / sub_82253540 / sub_8224FB68 lookups returning differently).

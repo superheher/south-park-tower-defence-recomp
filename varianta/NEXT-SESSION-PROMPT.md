@@ -26,7 +26,13 @@
   декодера / отдельный chroma-буфер) → YUV→RGB present (luma-путь + upload УЖЕ готовы). **(b) ПЛАВНОЕ ДВИЖЕНИЕ**
   — тайтл ползёт без REX_MOVIE_EOF (декодер коп-троттлен); быстрее планировщик / настоящий блок-fence ускорит
   воспроизведение (Step 1). **(c)** [опция (a) исходного промпта] RE sub_8211B740 дивергенции → ЕСТЕСТВЕННЫЙ
-  intro→menu (ретайрит REX_XFLAG). ЗАПУСК ВИДИМОГО ФИЛЬМА: `REX_RENDER=1 REX_FAIRSCHED=1
+  intro→menu (ретайрит REX_XFLAG). ✅НАЧАТО (cont.11): prod-оракул gdb-bt на __imp__sub_8210AF90 дал ТОЧНУЮ
+  цепочку sub_82450FD0→sub_82250420(tid=10)→**sub_8211B740**→sub_8210AF90 (в prod прямой вызов +0x1220; в
+  varianta — ОДИН из 7 индирект-vtable PPC_CALL_INDIRECT_FUNC(ctr), потому статически невидим — у sub_8210AF90
+  НОЛЬ прямых вызовов). sub_8211B740 (ppc_recomp.3.cpp:11035, 720 строк) = ~7 индирект-вызовов под ~6 ветками
+  (0x8211B7A4 beq на sub_8224FB68 lookup; +818/8EC/9C0/9AC/BBE8). Дивергенция (state/data) = ОДНА ветка идёт не
+  туда. СЛЕДУЮЩЕЕ: инструментировать branch-path sub_8211B740 в varianta (REX_FAIRSCHED, tid=10 бежит) + diff с
+  prod (gdb-step до bctrl→sub_8210AF90) → первая расходящаяся ветка + её входное состояние = цель фикса. ЗАПУСК ВИДИМОГО ФИЛЬМА: `REX_RENDER=1 REX_FAIRSCHED=1
   ./runtime/out/sp_td_varianta ../private/extracted/default.xex`. Диаг (env-gated): REX_VIDEODUMP (дамп
   буферов пула /tmp/vbufN.raw на swap#220), REX_RENDER_DUMPSEL (дамп выбранного рендером буфера /tmp/selbuf.raw),
   REX_RENDER_SHOT=N (скрин N-го декод-кадра → /tmp/varianta_shot.ppm). Хост-визуализатор кадра: stride 1344, 8bpp gray.
