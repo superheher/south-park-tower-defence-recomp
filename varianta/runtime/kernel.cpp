@@ -1209,6 +1209,15 @@ PPC_FUNC(sub_821C6E58)
         uint32_t fenceptr = GLD32(device + 10896);
         if (fenceptr) {
             uint32_t head = GLD32(device + 10908), current = GLD32(fenceptr);
+            // ROUTE A instrumentation: log the fence dynamics at each wait (target vs current vs head) +
+            // the command-build cursor (device+13568 base / +13572 writeptr) — to design a real CP that
+            // advances the counter by executing the built EVENT_WRITE_SHD fence-writes instead of forwarding.
+            static std::atomic<int> wn{0};
+            if (g_ktrace && wn.load() < 240) {
+                int k = ++wn;
+                fprintf(stderr, "[fencewait] #%d tgt=%u cur=%u head=%u gap=%d build=0x%X..0x%X\n",
+                        k, target, current, head, (int)(target - current), GLD32(device + 13568), GLD32(device + 13572));
+            }
             // Stuck on an OLDER fence (target != head) that hasn't been reached: the title built this
             // fence's command-buffer segment but deferred kicking it to the ring, relying on real-GPU
             // auto-flush as segments fill (its own target==head gate does not cover target<head, and its

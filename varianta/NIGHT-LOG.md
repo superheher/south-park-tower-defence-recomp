@@ -1234,3 +1234,27 @@ the segment parsing. NEXT: (A) model the handshake — make fences advance as a 
 kicked ring content (replace the fence-forward stopgap), so the title proceeds to build+render the movie; or
 investigate whether the intro movie uses a non-PM4 path (VdInitializeScalerCommandBuffer / overlay) we stub.
 New diags (gated): REX_CHUNKCP, [drawscan], [devdump], g_device capture.
+
+## 2026-06-02 (cont. 3) — route A fence instrumentation REVISES the premise: the title is NOT fence-gated
+
+Started route A (model the handshake); instrumented the fence wait sub_821C6E58 ([fencewait], capped). The
+data revises the "gated" hypothesis from cont.2:
+- target = head - 8 ALWAYS; gap (target-current) is a constant 6; head climbs smoothly 17 -> 1439+ over 240
+  waits (and far beyond, capped). The title builds ~3 segments (~6 fences)/frame and waits only for the GPU
+  to stay within 8 fences (4 segments) — a PIPELINE-DEPTH THROTTLE, not a stuck wait.
+- The forward satisfies the throttle every frame (28380 load-bearing forwards); the title progresses frame
+  after frame the whole run, presenting each frame (framebuffer empty — only rects drawn).
+=> The title is NOT fence-blocked; it actively runs its per-frame render loop, just emitting only untextured
+rects. So route A's premise (a gated title the handshake unblocks) does NOT hold — replacing the forward with
+real fence execution keeps the same smooth loop and would NOT change what is drawn.
+
+REFRAME: the textured draws DO exist (prod renders the same guest with 54 pipelines, so the guest builds
+textured PM4 draws each frame), but variant A is NOT CAPTURING them — they live in per-frame command-buffer
+content our CP/scan doesn't reach. Evidence: brute draw-scan + SEGCP of the r3-staging range find only ~5-9
+draws/frame, all init=0x30088 rects; the textured bulk is in other segments/buffers (the device-tracked
+cmd-buffer pool, device+13568, grows ~0x88680/frame; its records reference 0xA04D-0xA056xxxx chunks). So the
+real problem is COMPLETE per-frame command-buffer COVERAGE/enumeration, not the fence handshake. Options:
+(1) decoded-frame shortcut — find the VC-1 decoder's output surface (4 threads @0x82339428) and present it
+    directly (visible intro, sidesteps buffer RE); (2) full cmd-buffer enumeration — crack the device-tracked
+    pool / segment format so ALL per-frame draws reach the CP (the general renderer path, hard).
+Added [fencewait] instrumentation (gated).
