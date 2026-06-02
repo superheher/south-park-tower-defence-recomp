@@ -4,6 +4,7 @@
 // Guest pointers are guest addresses — dereference via PPC_LOAD_*/PPC_STORE_* (base + addr, byte-swapped).
 #include "ppc_recomp_shared.h"
 #include "kernel.h"
+#include "rex_render.h"   // minimal Vulkan renderer (VdSwap present), active under REX_RENDER=1
 #include <xex.h>     // getOptHeaderPtr, XEX_HEADER_*
 #include <cstdint>
 #include <cstdio>
@@ -1333,6 +1334,7 @@ PPC_FUNC(__imp__VdInitializeScalerCommandBuffer)    { ctx.r3.u64 = 0; }
 PPC_FUNC(__imp__VdSwap) {
     uint32_t n = g_gpuCounter.fetch_add(1) + 1;
     if (g_ktrace && n <= 8) fprintf(stderr, "[VdSwap] #%u (r3=0x%X r4=0x%X)\n", n, ctx.r3.u32, ctx.r4.u32);
+    if (rex_render::Enabled()) rex_render::Present(ctx.r3.u32);  // non-blocking: publishes fb to render thread
     ctx.r3.u64 = 0;
 }
 

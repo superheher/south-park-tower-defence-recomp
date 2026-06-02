@@ -32,8 +32,18 @@ target_compile_options(sp_td_varianta PRIVATE -O0 -w -fno-strict-aliasing
 # These come from the XenonRecomp build tree; (re)build them with: cmake --build ${XR}/out/build.
 set(XR_BUILD "${XR}/out/build")
 find_package(Threads REQUIRED)   # std::thread (ExCreateThread / vblank pump)
+
+# Minimal from-scratch Vulkan renderer (vulkan_render.cpp): host window + present. Active only at
+# runtime under REX_RENDER=1, but always linked.
+find_package(Vulkan REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SDL2 REQUIRED sdl2)
+target_include_directories(sp_td_varianta PRIVATE ${SDL2_INCLUDE_DIRS})
+
 target_link_libraries(sp_td_varianta PRIVATE
     "${XR_BUILD}/XenonUtils/libXenonUtils.a"
     "${XR_BUILD}/thirdparty/disasm/libdisasm.a"
     "${XR_BUILD}/thirdparty/fmt/libfmt.a"
-    Threads::Threads)
+    Threads::Threads
+    Vulkan::Vulkan
+    ${SDL2_LIBRARIES})
