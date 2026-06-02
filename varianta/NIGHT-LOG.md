@@ -1258,3 +1258,27 @@ real problem is COMPLETE per-frame command-buffer COVERAGE/enumeration, not the 
     directly (visible intro, sidesteps buffer RE); (2) full cmd-buffer enumeration — crack the device-tracked
     pool / segment format so ALL per-frame draws reach the CP (the general renderer path, hard).
 Added [fencewait] instrumentation (gated).
+
+## 2026-06-02 (cont. 4) — decoded-frame shortcut: there IS no decoded frame — the VC-1 decoder is idle
+
+Pursued the user-chosen decoded-frame shortcut (find the VC-1 decoder output + present it directly):
+- Captured the decoder's frame-pool buffers (16 allocs from one site LR 0x8244DD2C, ~0x101440 each).
+  Full-buffer scan: ALL are uniform fills (Y=0x00 black luma / chroma=0x80 neutral), varied=0 everywhere —
+  i.e. cleared-to-black, NO real decoded image (real VC-1 output is never perfectly uniform).
+- WMV is fully loaded: one NtReadFile of 8479541 bytes (the 8.4MB sp_xbox_0_intro.wmv) into memory; demux
+  reads from RAM after (no further file reads).
+- BROAD heap scan (0x1000000..0x9000000, 0x10000 chunks, report high adjacent-byte variation) for ANY
+  image-like region: found only (a) Lua/script TEXT at 0x2E9-0x2F2xxxx (visible strings), and (b) a
+  FULL-ENTROPY region 0x496-0x4Axxxxx (varied=16384/16384) inside the 23MB alloc at 0x48D0000 = the
+  COMPRESSED WMV bitstream (full entropy = compressed, not decoded; decoded frames have spatial smoothness).
+  NO decoded video frame anywhere in the heap.
+=> CONCLUSION: there is NO decoded frame to present — the VC-1 decoder has its input (compressed WMV in RAM)
+but produces NO output (its frame buffers stay uniform black). The decoder is IDLE / gated. So the intro is
+not invisible because of the renderer — the MOVIE DECODE PIPELINE is not running. This unifies the session's
+findings: the title runs a healthy per-frame loop (not fence-gated), draws only clear rects, presents empty
+buffers, and the movie never decodes. Getting the intro visible needs the DECODER to run (a video/XMA-decode
+subsystem investigation: why are the decoder threads tid11-14 @0x82339428 idle — waiting on demux input, a
+GPU surface, or a play trigger?), OR skip the intro to exercise menu/gameplay rendering instead. All 3
+near-term options' premises now mapped: route A (title not gated), route B (only rects built during intro),
+shortcut (no decoded frame). Diagnostics added (gated): video-buffer capture (g_videoBufs, LR 0x8244DD2C) +
+broad heap image-scan in VdSwap.

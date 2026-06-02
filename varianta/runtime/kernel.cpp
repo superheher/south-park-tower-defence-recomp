@@ -27,6 +27,10 @@
 // Lightweight import trace (set REX_KTRACE=0 to silence).
 static const bool g_ktrace = []{ const char* e = getenv("REX_KTRACE"); return !e || e[0] != '0'; }();
 #define KTRACE(...) do { if (g_ktrace) { fprintf(stderr, "[kernel] " __VA_ARGS__); } } while (0)
+// Renderer (decoded-frame shortcut): the VC-1 video decoder allocates its frame-pool buffers from a single
+// site (LR 0x8244DD2C, ~0x101440 bytes each). Capture them so the render thread can present the decoded
+// frame directly (sidesteps the PM4 command-buffer enumeration).
+uint32_t g_videoBufs[16]; std::atomic<int> g_videoBufN{0};
 
 // Called (via rex_indirect.h's PPC_CALL_INDIRECT_FUNC override) when a guest indirect-call target has no
 // recompiled function — i.e. a jump-table case-label the recompiler emitted as a call (XenonAnalyse missed
@@ -140,6 +144,10 @@ PPC_FUNC(__imp__NtAllocateVirtualMemory)
     }
     PPC_STORE_U32(pBase, gbase);
     PPC_STORE_U32(pSize, size);
+    if (ctx.lr == 0x8244DD2Cull) {                 // VC-1 decoder frame-pool allocation site
+        int i = g_videoBufN.load();
+        if (i < 16) { g_videoBufs[i] = gbase; g_videoBufN.store(i + 1); }
+    }
     KTRACE("NtAllocateVirtualMemory(req=0x%X sz=0x%X type=0x%X prot=0x%X) -> base=0x%X size=0x%X lr=0x%llX\n",
         reqBase, reqSize, allocType, protect, gbase, size, (unsigned long long)ctx.lr);
     ctx.r3.u64 = kStatusSuccess;
@@ -1581,6 +1589,31 @@ PPC_FUNC(__imp__VdSwap) {
                 for (int k = 0; k < 8; k++) p += snprintf(line+p, sizeof line-p, " %08X", GLD32(dv + off + k*4));
                 fprintf(stderr, "%s\n", line);
             }
+        }
+    }
+    // Decoded-frame shortcut: sample the captured VC-1 frame-pool buffers to find the one holding the
+    // decoded movie frame (high non-zero ratio + varied content vs an empty/uniform buffer).
+    if (g_ktrace) {
+        static std::atomic<bool> vsamp{false}; bool ve = false;
+        if (n >= 40 && g_videoBufN.load() && vsamp.compare_exchange_strong(ve, true)) {
+            // BROAD scan: hunt the whole title heap for any region with real image texture (a decoded video
+            // frame has high adjacent-byte variation; uniform fills / PM4 / structs do not). Report the
+            // 0x10000 chunks with the most variation — that's where the decoded frame is, if it exists.
+            fprintf(stderr, "[video] broad heap scan for image-like (high-varied) regions:\n");
+            int reported = 0;
+            for (uint32_t base = 0x1000000; base < 0x9000000 && reported < 40; base += 0x10000) {
+                uint32_t varied = 0;
+                for (uint32_t o = 0; o < 0x10000; o += 4) {
+                    uint32_t w = GLD32(base + o);
+                    if ((w & 0xFF) != ((w >> 8) & 0xFF) || ((w >> 16) & 0xFF) != ((w >> 24) & 0xFF)) varied++;
+                }
+                if (varied > 6000) {   // >~37% of 16384 dwords vary => textured/image data
+                    fprintf(stderr, "[video]  chunk @0x%X varied=%u/16384 head=%08X %08X %08X\n",
+                            base, varied, GLD32(base), GLD32(base+4), GLD32(base+8));
+                    reported++;
+                }
+            }
+            fprintf(stderr, "[video] broad scan done (%d image-like chunks)\n", reported);
         }
     }
     if (rex_render::Enabled()) rex_render::Present(ctx.r4.u32);  // non-blocking: publish fetch ptr to render thread
