@@ -1322,13 +1322,36 @@ PPC_FUNC(__imp__RtlTimeToTimeFields)
 namespace { constexpr uint32_t kErrNotConnected = 0x0000048Fu; }   // ERROR_DEVICE_NOT_CONNECTED
 PPC_FUNC(__imp__XamInputGetState)
 {
-    uint32_t s = ctx.r5.u32; if (s) for (uint32_t i = 0; i < 16; i += 4) PPC_STORE_U32(s + i, 0);
+    // REX_SKIPINTRO: present a CONNECTED pad with START (0x0010) held + an incrementing packet number, so
+    // the title's intro/movie skip handler fires and advances to the menu/gameplay (where it builds real
+    // textured PM4 draws). The intro is renderer-dead (VC-1 decoder idle); this exercises the real renderer.
+    static const bool skip = getenv("REX_SKIPINTRO") != nullptr;
+    uint32_t s = ctx.r5.u32;
+    if (skip && s) {
+        static std::atomic<uint32_t> pkt{0};
+        uint32_t p = pkt.fetch_add(1);
+        PPC_STORE_U32(s + 0, p + 1);                  // dwPacketNumber (changes each poll => new input)
+        // PULSE A+START (down ~8 polls, up ~8) so an edge-detecting skip handler registers a press.
+        uint16_t btn = ((p >> 3) & 1) ? 0x1010 : 0x0000;   // 0x1000=A | 0x0010=START
+        PPC_STORE_U16(s + 4, btn);
+        for (uint32_t i = 6; i < 16; i++) PPC_STORE_U8(s + i, 0);
+        static std::atomic<bool> once{false}; bool e=false;
+        if (g_ktrace && once.compare_exchange_strong(e,true)) fprintf(stderr, "[skipintro] injecting START press via XamInputGetState\n");
+        ctx.r3.u64 = 0;                               // ERROR_SUCCESS (connected)
+        return;
+    }
+    if (s) for (uint32_t i = 0; i < 16; i += 4) PPC_STORE_U32(s + i, 0);
     ctx.r3.u64 = kErrNotConnected;
 }
 PPC_FUNC(__imp__XamInputGetCapabilities)
 {
     uint32_t c = ctx.r5.u32; if (!c) { ctx.r3.u64 = 0x80070057u; return; }
     for (uint32_t i = 0; i < 0x20; i += 4) PPC_STORE_U32(c + i, 0);
+    static const bool skip = getenv("REX_SKIPINTRO") != nullptr;
+    if (skip) {                                   // report a connected standard gamepad (see XamInputGetState)
+        PPC_STORE_U8(c + 0, 1); PPC_STORE_U8(c + 1, 1);   // Type=GAMEPAD, SubType=GAMEPAD
+        ctx.r3.u64 = 0; return;
+    }
     ctx.r3.u64 = kErrNotConnected;
 }
 PPC_FUNC(__imp__XamInputSetState) { ctx.r3.u64 = 0; }   // vibration: no-op success

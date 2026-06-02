@@ -1282,3 +1282,28 @@ GPU surface, or a play trigger?), OR skip the intro to exercise menu/gameplay re
 near-term options' premises now mapped: route A (title not gated), route B (only rects built during intro),
 shortcut (no decoded frame). Diagnostics added (gated): video-buffer capture (g_videoBufs, LR 0x8244DD2C) +
 broad heap image-scan in VdSwap.
+
+## 2026-06-02 (cont. 5) — intro is MOVIE-gated (not input-skippable); root points at the coop scheduler
+
+User chose "skip intro -> render menu". Findings:
+- The intro does NOT poll input: XamInputGetState is called EXACTLY ONCE in a 25s run (hot loop = 33654x
+  VdGetSystemCommandBuffer). Injecting a CONNECTED pad with START, then pulsed A+START (REX_SKIPINTRO, via
+  XamInputGetState + XamInputGetCapabilities) does NOT advance past the intro (identical asset set, no menu
+  load). => the intro transition is MOVIE-gated (plays until movie-EOF / first-frame ready), not a skip
+  button. (REX_SKIPINTRO kept, gated — may matter in the menu, which likely does poll input.)
+- gdb all-thread bt of the running boot (26 threads): only Thread 1 (main) executes guest code (holds the
+  single coop token) — busy in the per-frame intro builder (sub_821FACD0 <- ... <- sub_822170E8). 11 threads
+  parked in lll_lock_wait (waiting for the token), 6 in pthread_cond_wait. Threads 10/11 wait in
+  KeWaitForSingleObject from sub_821CC5D0 (the 0x821CCxxx GPU-sync region) = GPU-completion workers. The VC-1
+  decoder threads (entry sub_82339428) appear in NO guest frame at any depth and are NOT in KeWait — they're
+  parked in lll_lock_wait, i.e. waiting for the coop TOKEN (not an event/data gate).
+=> LEADING ROOT: the cooperative single-token scheduler keeps the CPU-heavy VC-1 decoder threads from
+running (they compete with the busy main thread + ~10 other workers for ONE token), so the movie never
+decodes (frame buffers stay uniform black) -> never plays/EOFs -> the intro never advances. This is exactly
+RENDERER-PHASE-PLAN Step 1 (fibers / a real scheduler), deferred earlier as "coop token sufficient for now" —
+it is NOT sufficient for movie decode. (Caveat: could also be a main<->decoder start/feed handshake; exact
+gate needs reading the decoder threads' saved guest PC. But the decoder is parked on the token, not an
+event.) STRATEGIC: visible content needs ONE of (a) a better scheduler/threading so the decoder runs -> movie
+plays -> intro auto-advances to menu/gameplay (then the renderer for the drawn content); (b) force the
+movie-player "done" state to skip the intro (movie-player RE); (c) the renderer's full command-buffer
+enumeration (needed regardless). All multi-session, title-specific. Added REX_SKIPINTRO (gated input inject).
