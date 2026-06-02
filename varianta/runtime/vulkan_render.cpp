@@ -17,6 +17,8 @@
 #include <thread>
 #include <atomic>
 
+extern uint8_t* g_base;   // guest memory base (4 GiB), defined in runtime.cpp — render thread reads it directly
+
 namespace rex_render {
 namespace {
 
@@ -51,6 +53,22 @@ const uint32_t   g_shotTarget = []{ const char* s = getenv("REX_RENDER_SHOT"); r
 VkBuffer         g_capBuf   = VK_NULL_HANDLE;
 VkDeviceMemory   g_capMem   = VK_NULL_HANDLE;
 VkDeviceSize     g_capSize  = 0;
+
+// --- Decoded-frame (intro movie) present (increment 3) -------------------------------------------------
+// VC-1 frame-pool buffers published from VdSwap. Geometry RE'd from the live decode dump: the Y (luma)
+// plane is LINEAR, pitch 1344 bytes, 1280x720 visible, at buffer offset 0; 8-bit. Chroma layout is
+// non-standard (see NIGHT-LOG) so we present luma as grayscale for now.
+constexpr uint32_t kVidPitch = 1344, kVidW = 1280, kVidH = 720, kVidYOff = 0;
+std::atomic<const uint32_t*> g_vbufs{nullptr};   // -> kernel.cpp's g_videoBufs[16] (addresses stable once captured)
+std::atomic<int>             g_vbufN{0};
+VkBuffer       g_vidBuf    = VK_NULL_HANDLE;      // host-visible BGRA staging (1280x720x4), persistently mapped
+VkDeviceMemory g_vidMem    = VK_NULL_HANDLE;
+void*          g_vidMapped = nullptr;
+uint32_t       g_vidSig[16] = {0};                // per-buffer luma signature for freshness (motion) tracking
+uint64_t       g_vidSettledAt[16] = {0};          // present index at which each buffer last STOPPED changing
+uint32_t       g_vidStable[16] = {0};             // consecutive presents a buffer has been unchanged
+int            g_vidLastSel = -1;
+uint64_t       g_vidFrame   = 0;                  // count of presents that showed a decoded frame
 
 #define VKCHECK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[render] %s = %d\n", #x, (int)_r); return false; } } while (0)
@@ -99,6 +117,72 @@ void WriteCapturePPM(const char* path) {
         fprintf(stderr, "[render] captured frame %llu -> %s\n", (unsigned long long)g_frame, path);
     }
     vkUnmapMemory(g_device, g_capMem);
+}
+
+// Create the persistently-mapped host-visible BGRA staging buffer the decoded frame is uploaded through.
+void EnsureVideoBuffer() {
+    if (g_vidBuf) return;
+    VkDeviceSize need = (VkDeviceSize)kVidW * kVidH * 4;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = need; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(g_device, &bci, nullptr, &g_vidBuf) != VK_SUCCESS) { g_vidBuf = VK_NULL_HANDLE; return; }
+    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(g_device, g_vidBuf, &mr);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = FindMemoryType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(g_device, &mai, nullptr, &g_vidMem) != VK_SUCCESS) {
+        vkDestroyBuffer(g_device, g_vidBuf, nullptr); g_vidBuf = VK_NULL_HANDLE; return;
+    }
+    vkBindBufferMemory(g_device, g_vidBuf, g_vidMem, 0);
+    vkMapMemory(g_device, g_vidMem, 0, need, 0, &g_vidMapped);
+}
+
+// Pick the freshest CLEAN frame-pool buffer and expand its luma plane into the BGRA staging buffer.
+// Returns true if a frame was written into g_vidMapped (ready to copy to the swapchain image).
+// The movie decodes a handful of fps while we present ~60 fps, and the decoder writes one pool slot at a
+// time, so a "current" display frame must be chosen carefully — see the in-body comment for the criteria.
+bool PickAndFillVideo() {
+    const uint32_t* bufs = g_vbufs.load(); int n = g_vbufN.load();
+    if (!bufs || n <= 0 || !g_base || !g_vidMapped) return false;
+    if (n > 16) n = 16;
+    // Selecting the buffer that is changing RIGHT NOW would read it mid-decode (tearing — top rows new,
+    // bottom rows stale). Instead present the most-recently-COMPLETED buffer: one that has been written
+    // but did NOT change this present (its decode has settled). The decoder writes one pool slot at a
+    // time, so at any moment ≤1 slot is mid-write and the rest are clean finished frames.
+    // The cooperative scheduler can stall the decoder mid-frame, leaving a buffer half-written (unwritten
+    // rows read back as black bands). So a clean display frame must be BOTH settled (not changing now) AND
+    // complete (no black-unwritten bands). Sample a grid: a row whose mean luma is ~0 is unwritten; a fully
+    // decoded frame has all rows written (sky is ~128, never a full black band). Pick the freshest such frame.
+    constexpr int kRows = 72, kCols = 32, kMaxBlank = 3;
+    int sel = -1; uint64_t bestAge = 0;
+    for (int i = 0; i < n; i++) {
+        const uint8_t* y = g_base + bufs[i] + kVidYOff;
+        uint32_t sig = 0; int written = 0;
+        for (int r = 0; r < kRows; r++) {
+            const uint8_t* rp = y + (size_t)((r * kVidH) / kRows) * kVidPitch;
+            uint32_t rs = 0;
+            for (int c = 0; c < kCols; c++) rs += rp[(c * kVidW) / kCols];
+            sig = sig * 131 + rs;
+            if (rs / kCols > 12) written++;                    // row mean > 12 ⇒ written (not a black band)
+        }
+        bool changed = (sig != g_vidSig[i]);
+        g_vidSig[i] = sig;
+        if (changed) { g_vidStable[i] = 0; }
+        else if (++g_vidStable[i] == 2) g_vidSettledAt[i] = g_frame + 1;  // just finished (stable ≥2 presents)
+        bool complete = (written >= kRows - kMaxBlank);        // no large unwritten band
+        if (g_vidStable[i] >= 2 && complete && g_vidSettledAt[i] > bestAge) { bestAge = g_vidSettledAt[i]; sel = i; }
+    }
+    if (sel < 0) sel = g_vidLastSel;        // nothing complete+settled yet — hold the last good frame
+    if (sel < 0) return false;              // no frame yet
+    g_vidLastSel = sel;
+    const uint8_t* yp = g_base + bufs[sel] + kVidYOff;
+    uint8_t* dst = (uint8_t*)g_vidMapped;
+    for (uint32_t row = 0; row < kVidH; row++) {
+        const uint8_t* s = yp + (size_t)row * kVidPitch;
+        uint8_t* d = dst + (size_t)row * kVidW * 4;
+        for (uint32_t x = 0; x < kVidW; x++) { uint8_t v = s[x]; d[0]=v; d[1]=v; d[2]=v; d[3]=255; d += 4; }
+    }
+    return true;
 }
 
 bool CreateSwapchain() {
@@ -267,18 +351,43 @@ bool PresentOnce() {
                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                  0, VK_ACCESS_TRANSFER_WRITE_BIT);
 
-    // Increment 1: cycling clear color so the window visibly updates (proves the present loop runs).
-    float t = (float)(g_frame % 180) / 180.0f;
-    VkClearColorValue clear{};
-    clear.float32[0] = 0.10f;
-    clear.float32[1] = 0.10f + 0.40f * t;
-    clear.float32[2] = 0.35f;
-    clear.float32[3] = 1.0f;
-    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+    // Fill the swapchain image: the decoded intro movie if the decoder has produced a frame, else a
+    // cycling clear color (increment 1 fallback — proves the present loop runs before any decode).
+    EnsureVideoBuffer();
+    bool haveVideo = g_vidBuf && PickAndFillVideo();   // builds BGRA from the freshest luma plane (CPU)
+    if (haveVideo) g_vidFrame++;
+    if (haveVideo) {
+        VkBufferImageCopy rgn{};
+        rgn.bufferRowLength = kVidW; rgn.bufferImageHeight = kVidH;
+        rgn.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        uint32_t cw = g_extent.width  < kVidW ? g_extent.width  : kVidW;
+        uint32_t ch = g_extent.height < kVidH ? g_extent.height : kVidH;
+        rgn.imageExtent = {cw, ch, 1};
+        vkCmdCopyBufferToImage(g_cmd, g_vidBuf, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rgn);
+    } else {
+        float t = (float)(g_frame % 180) / 180.0f;
+        VkClearColorValue clear{};
+        clear.float32[0] = 0.10f;
+        clear.float32[1] = 0.10f + 0.40f * t;
+        clear.float32[2] = 0.35f;
+        clear.float32[3] = 1.0f;
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+    }
 
-    bool capturing = (g_shotTarget && g_frame == g_shotTarget);
+    // Capture the shotTarget-th DECODED frame when video is available (decouples capture from the
+    // render/decode timing race), else the shotTarget-th present (increment-1 fallback / no decode).
+    bool capturing = g_shotTarget && (haveVideo ? (g_vidFrame == g_shotTarget)
+                                                 : (g_vbufN.load() == 0 && g_frame == g_shotTarget));
     if (capturing) {
+        // Diagnostic: also dump the exact guest buffer the render thread selected, so its layout can be
+        // analyzed offline (distinguish a clean frame from a mid-overwrite/stride artifact).
+        const uint32_t* bufs = g_vbufs.load();
+        if (getenv("REX_RENDER_DUMPSEL") && bufs && g_vidLastSel >= 0 && g_base) {
+            FILE* f = fopen("/tmp/selbuf.raw", "wb");
+            if (f) { fwrite(g_base + bufs[g_vidLastSel], 1, 0x101440, f); fclose(f);
+                     fprintf(stderr, "[render] dumped selected buf%d @0x%X -> /tmp/selbuf.raw\n", g_vidLastSel, bufs[g_vidLastSel]); }
+        }
         EnsureCaptureBuffer();
         if (g_capBuf) {
             ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -315,8 +424,8 @@ bool PresentOnce() {
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) { vkDeviceWaitIdle(g_device); CreateSwapchain(); }
 
     if ((g_frame % 300) == 0)
-        fprintf(stderr, "[render] presented frame %llu (guest swaps=%llu)\n",
-                (unsigned long long)g_frame, (unsigned long long)g_swaps.load());
+        fprintf(stderr, "[render] presented frame %llu (guest swaps=%llu, video buf=%d/%d)\n",
+                (unsigned long long)g_frame, (unsigned long long)g_swaps.load(), g_vidLastSel, g_vbufN.load());
     g_frame++;
     return true;
 }
@@ -345,6 +454,12 @@ void Present(uint32_t frontBufferGuestAddr) {
         g_thread = std::thread(RenderThreadMain);
         g_thread.detach();
     }
+}
+
+void PublishVideo(const uint32_t* guestBufAddrs, int count) {
+    if (!g_enabled) return;
+    g_vbufs.store(guestBufAddrs);   // points at kernel.cpp's g_videoBufs[16] (stable once captured)
+    g_vbufN.store(count);
 }
 
 } // namespace rex_render

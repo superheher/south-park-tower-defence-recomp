@@ -1537,3 +1537,59 @@ This overturns cont.6/cont.8's "stuck/gated, not merely starved" conclusion.
 - **(c)** make fair + forced-transition not stall (only if XFLAG is still wanted as a stopgap); lower priority
   than (a)/(b).
 - ⚠ Do NOT combine REX_FAIRSCHED with REX_XFLAG (stalls). Use REX_FAIRSCHED with REX_MOVIE_EOF for decode work.
+
+## 2026-06-02 (cont. 11) — ✅✅ THE DECODED INTRO MOVIE IS ON SCREEN (grayscale) — renderer increment 3: decoded-frame present
+Resumes cont.10 (the movie now decodes). Implemented + verified the prompt's option **(b)** "present the
+decoded frames": the host render thread now uploads the VC-1 luma plane and presents it via Vulkan, so the
+intro movie is **VISIBLE for the first time in variant A**. Committed, gated behind REX_RENDER, default boot
+unregressed. (User picked "both: present first, then RE" at the session fork.)
+
+### Frame geometry — RE'd from the live decode dump
+- Added **REX_VIDEODUMP**: the `[video]` LATE diag (swap#220) also fwrites each varied frame-pool buffer raw
+  to `/tmp/vbufN.raw`. Reproduced cont.10 decode (`REX_FAIRSCHED=1 REX_MOVIE_EOF=30`) → buf4–11 dumped.
+- `ffprobe`: the movie is **1280×720 wmv3** (VC-1/WMV9). A full 720p YUV420 frame = 1,382,400 B but each pool
+  buffer is only `0x101440` = 1,053,760 B (SMALLER → not full-res planar 420).
+- Visualized the dump at candidate strides (numpy/PIL). Row-diff autocorrelation found a SHARP minimum at
+  **stride 1344** (rowdiff 1.33 vs noise at 1280); rendering at 1344 → a perfectly clean, recognizable South
+  Park intro frame (snowy mountains, pines, the town w/ RHINOPLASTY storefront, Cartman from behind).
+  ⇒ **Y (luma) plane = LINEAR, pitch 1344 B, 1280×720 visible, offset 0, 8-bit.** (The earlier "dashes" at
+  stride 1280 were a wrong-stride shear of sparse detail over a smooth sky gradient — not tiling.)
+- Xenia 360 `GetTiledOffset2D` untiling made it WORSE (block-scramble) ⇒ the surface is NOT GPU-tiled, just
+  plain linear with a padded pitch.
+- **CHROMA still unresolved**: after Y (1344×720 = 967,680 B) only ~86 KB tail remains — too little for 420
+  chroma (needs ~460 KB). Tail shows row-striped chroma-ish content; NV12/planar guesses gave wrong colors
+  (magenta/green bands). Non-standard layout ⇒ deferred; presenting **grayscale (luma)** for now.
+
+### Implementation (vulkan_render.cpp + rex_render.h + kernel.cpp), gated REX_RENDER
+- `VdSwap` publishes `g_videoBufs[16]`+count to the render thread (`rex_render::PublishVideo`), INSIDE the
+  existing `if (rex_render::Enabled())` block ⇒ **zero cost in default boot**. The render thread reads guest
+  memory directly (`extern g_base`) and each present picks a CLEAN frame, expands its luma → a host-visible
+  BGRA staging buffer (gray = Y,Y,Y,255) → `vkCmdCopyBufferToImage` into the swapchain image (no shaders).
+- Frame SELECTION (the hard part — racing the decoder writing guest memory):
+  - v1 "freshest changed buffer" → TEARING (read mid-decode: top new, bottom stale).
+  - v2 "settled ≥2 presents" → still a black SEAM. The cooperative scheduler STALLS the decoder mid-frame, so
+    a half-written buffer (black unwritten bands) looks settled. Proven with **REX_RENDER_DUMPSEL** (dump the
+    exact selected guest buffer): rendered offline at 1344 it had black bands = partial decode.
+  - v3 (final) "settled ≥2 presents AND complete": sample a 72×32 grid; a row whose mean luma ≤12 is an
+    unwritten black band; require ≥69/72 rows written ⇒ display only fully-decoded frames → CLEAN full frame
+    (min luma 43, no black bands, mean 152 = the offline frame). ✅ Screenshot delivered to user.
+- Capture (`REX_RENDER_SHOT=N`) now triggers on the Nth DECODED frame (decouples from render/decode timing).
+
+### Tests (all `timeout -s KILL`, /dev/shm cleaned each run)
+1. `REX_RENDER=1 REX_FAIRSCHED=1`: window opens (RADV POLARIS11); decode kicks in (video buf selection valid,
+   alternates complete buffers buf6/buf9); **0** device-overwrite; no crash. Captured a clean grayscale intro
+   frame. Motion is present but SLOW — without REX_MOVIE_EOF the title advances slowly (guest swaps crawl to
+   ~191/55s); that's a cooperative-throttle/perf matter, NOT a present-path bug.
+2. **Default boot (no flags) UNREGRESSED**: **0** device-overwrite, no crash, **zero `[render]` lines**
+   (renderer gated off), reaches the intro loop. Added per-VdSwap code is behind the REX_RENDER gate.
+
+### NEXT
+- **(a) COLOR**: RE the non-standard chroma layout in the buffer tail (or find the decoder's surface
+  descriptor / a separate chroma plane) → YUV→RGB. The luma path + upload pipeline are already in place.
+- **(b) Smooth MOTION**: the title advances slowly without REX_MOVIE_EOF (decoder cooperatively throttled);
+  a faster scheduler / real blocking fence would speed playback (ties into Step 1).
+- **(c)** [prompt option (a)] RE `sub_8211B740` divergence → natural intro→menu transition (retire REX_XFLAG).
+
+Diagnostics added (all env-gated, default boot unregressed): REX_VIDEODUMP, REX_RENDER_DUMPSEL.
+Build: `ninja -C runtime/out sp_td_varianta`. Visible movie:
+`REX_RENDER=1 REX_FAIRSCHED=1 ./runtime/out/sp_td_varianta ../private/extracted/default.xex`.

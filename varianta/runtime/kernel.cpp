@@ -1784,10 +1784,23 @@ PPC_FUNC(__imp__VdSwap) {
                     if ((w & 0xFF) != ((w >> 8) & 0xFF) || ((w >> 16) & 0xFF) != ((w >> 24) & 0xFF)) varied++;
                 }
                 fprintf(stderr, "[video]  buf%d @0x%X nz=%u varied=%u\n", i, b, nz, varied);
+                // REX_VIDEODUMP: write the raw buffer to disk so the host can render it at candidate
+                // widths/formats and identify the decoded-frame geometry. Only the varied (decoded) ones.
+                if (getenv("REX_VIDEODUMP") && varied > 1000) {
+                    char path[64]; snprintf(path, sizeof path, "/tmp/vbuf%d.raw", i);
+                    FILE* f = fopen(path, "wb");
+                    if (f) { fwrite(g_base + b, 1, 0x101440, f); fclose(f);
+                             fprintf(stderr, "[video]  -> dumped buf%d to %s (0x101440 B)\n", i, path); }
+                }
             }
         }
     }
-    if (rex_render::Enabled()) rex_render::Present(ctx.r4.u32);  // non-blocking: publish fetch ptr to render thread
+    if (rex_render::Enabled()) {
+        // Publish the VC-1 frame-pool buffer addresses so the render thread can present the decoded intro
+        // movie (it picks the freshest buffer + uploads its luma plane). Cheap (two atomic stores).
+        rex_render::PublishVideo(g_videoBufs, g_videoBufN.load());
+        rex_render::Present(ctx.r4.u32);                         // non-blocking: publish fetch ptr to render thread
+    }
     ctx.r3.u64 = 0;
 }
 
