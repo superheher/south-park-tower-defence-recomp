@@ -41,6 +41,18 @@
   ./runtime/out/sp_td_varianta ../private/extracted/default.xex`. Диаг (env-gated): REX_VIDEODUMP (дамп
   буферов пула /tmp/vbufN.raw на swap#220), REX_RENDER_DUMPSEL (дамп выбранного рендером буфера /tmp/selbuf.raw),
   REX_RENDER_SHOT=N (скрин N-го декод-кадра → /tmp/varianta_shot.ppm). Хост-визуализатор кадра: stride 1344, 8bpp gray.
+- 🚧**РЕНДЕРЕР (USER выбрал FULL PM4→Vulkan)** — ОСНОВА заложена + НАЙДЕН гейт-блокер. ⛔КРИТИЧНО: НИ ОДНО
+  достижимое состояние НЕ строит реальные текстур-draw'ы — intro = только untextured rects (init=0x30088, 8/кадр,
+  0 текстур); forced-transition (REX_XFLAG) тоже только rects + INDIRECT-NULL (target=0x0@lr=0x82292D08,
+  0x82367BD8@0x8236859C, + sub_8215DE84). Movie quad = НЕ PM4 (scaler/overlay path, шейдер SpMovie 3-плоскости
+  YUV). ⇒ транслятор draw-state ЗАБЛОКИРОВАН пока тайтл не дойдёт до ЖИВОГО экрана (меню/геймплей) — это
+  ПРЕДУСЛОВИЕ (deep RE экранных INDIRECT-NULL / sub_8211B740). ✅ШЕЙДЕР-ТУЛЧЕЙН ГОТОВ (varianta/tools/shaderc/):
+  19 .updb = ОРИГИНАЛЬНЫЙ D3D9 HLSL (ps_3_0, все .psh; VS только .xbv → писать generic VS); libshaderc стоит →
+  compile.cpp (GLSL→SPIR-V) + build.sh; портировал 5 шейдеров (все паттерны, вкл. SpMovie YUV→RGB) → ВАЛИДНЫЙ
+  SPIR-V. NEXT рендерера (по зависимости): (1) разблокировать прогресс экранов (INDIRECT-NULL/sub_8211B740) →
+  реальные draw'ы; (2) draw-state транслятор (vfetch reg0x4800→верт.буферы; ALU reg0x4000→юниформы; текстуры
+  reg0x4800→VkImage; RT/viewport) + VkPipeline (портир.PS + generic VS) + vkCmdDraw в swapchain (рендер-тред уже
+  владеет); (3) портировать остальные 14 шейдеров. Полностью: NIGHT-LOG «cont.11, renderer».
 
 ———————————————————————————— (ниже — cont.10 статус) ————————————————————————————
 

@@ -1646,3 +1646,43 @@ ONE guest thread at a time, so the 4-thread VC-1 decoder can't use multiple core
 No safe quick lever (the recompiled code assumes one-at-a-time execution; running decoder threads truly
 concurrently would race/corrupt). ⇒ **smooth motion = the deep Step-1 real-concurrency scheduler**, multi-
 session. (This refines cont.7's "stuck movie" to "slow movie": with REX_FAIRSCHED it genuinely plays through.)
+
+## 2026-06-02 (cont.11, renderer) — user picked the FULL PM4→Vulkan renderer; foundation laid + critical blocker found
+After the color movie, the user chose the full renderer (menu/gameplay content, not just the movie). Scoped
+it and made the verifiable foundation; surfaced the gating blocker.
+
+### ⛔ CRITICAL FINDING — the translator has NO real draws to consume in any reachable state
+- With the movie now decoding (REX_FAIRSCHED), the intro STILL emits only `init=0x30088 numInd=3 prim=8`
+  draws (single untextured rects, 8/frame via REX_SEGCP), ZERO bound textures. The movie quad is NOT a PM4
+  draw in variant A — prod presents it via the scaler/overlay path (the SpMovie 3-plane YUV shader, see
+  below); our decoded-frame CPU present already replicates that.
+- The FORCED transition (REX_XFLAG=1 REX_MOVIE_EOF=30 REX_SKIPINTRO=1) toward attract/menu ALSO emits only
+  the same untextured rects (80/80) + ZERO textures, and hits INDIRECT-NULL blockers (target=0x0 @
+  lr=0x82292D08; target=0x82367BD8 @ lr=0x8236859C; plus the known sub_8215DE84). ⇒ the real textured PM4
+  draws are gated behind the screen-setup INDIRECT-NULL blockers — reaching a LIVE menu/gameplay screen
+  (deep, title-specific RE) is the PREREQUISITE for the renderer to have anything to translate.
+- ⇒ The renderer splits into (1) the shader/pipeline toolchain (verifiable in isolation — done below) and
+  (2) the draw-state translator (BLOCKED on real draws until the screen progression is unblocked).
+
+### ✅ Shader toolchain — DE-RISKED and built (varianta/tools/shaderc/)
+- Confirmed the 19 `.updb` carry ORIGINAL D3D9 HLSL (ps_3_0) + interpolator/constant/sampler metadata.
+  All 19 are PIXEL shaders (.psh); vertex shaders are only `.xbv` (compiled) → the renderer will use
+  handwritten generic VS per vertex layout.
+- libshaderc is installed (`libshaderc_shared.so.1`, no dev pkg). Wrote `compile.cpp` (GLSL→SPIR-V, declares
+  the shaderc C API inline) + `build.sh`. Ported 5 shaders to Vulkan GLSL covering every pattern and compiled
+  them to VALID SPIR-V (magic 0x07230203): Simple/SPTextured (tex*color, s0), SPUntextured (vertex color),
+  SimpleCol (color*matCol push-const), **SpMovie (3 samplers Y/U/V → YUV→RGB studio-range BT.601 — the
+  movie-quad shader)**. The remaining 14 are mechanical variants. Port map: `sampler2D`+`tex2D`→`texture()`,
+  `:COLOR`/`:TEXCOORD` interpolators→`layout(location=<.updb Register>)`, `sN`→`set=0,binding=N`,
+  `uniform floatN`→push constant.
+
+### NEXT (renderer, by dependency order)
+1. **Unblock the screen progression** (THE prerequisite for real draws): RE the INDIRECT-NULL screen-setup
+   blockers (sub_8215DE84 / 0x82292D08 / 0x8236859C) and/or the natural transition (sub_8211B740) so the
+   title reaches a live menu screen that emits textured PM4 draws.
+2. **Draw-state translator**: once real draws flow (REX_SEGCP already captures the segment IBs), decode per
+   draw: vertex fetch constants (reg 0x4800) → vertex buffers + layout; ALU constants (reg 0x4000) →
+   uniforms; bound textures (reg 0x4800) → VkImage (detile + format); render target / viewport regs. Build a
+   VkPipeline (ported PS + generic VS) and vkCmdDraw into the swapchain image (the render thread already owns
+   it). Verify against the menu.
+3. **Port the remaining 14 shaders**; add generic vertex shaders; texture upload/detile.
