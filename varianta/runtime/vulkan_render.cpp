@@ -55,18 +55,20 @@ VkDeviceMemory   g_capMem   = VK_NULL_HANDLE;
 VkDeviceSize     g_capSize  = 0;
 
 // --- Decoded-frame (intro movie) present (increment 3) -------------------------------------------------
-// VC-1 frame-pool buffers published from VdSwap. Geometry RE'd from the live decode dump: the Y (luma)
-// plane is LINEAR, pitch 1344 bytes, 1280x720 visible, at buffer offset 0; 8-bit. Chroma layout is
-// non-standard (see NIGHT-LOG) so we present luma as grayscale for now.
+// VC-1 frame-pool buffers published from VdSwap. Layout RE'd from the live decode dump: planar I420,
+// full-range BT.601, 3 consecutive allocations per frame — Y (size 0x101440, pitch 1344, 1280x720) then
+// U then V (size 0x40520 each, pitch 672, 640x360 — chroma sharp-stride confirmed at 672, mean ~128).
 constexpr uint32_t kVidPitch = 1344, kVidW = 1280, kVidH = 720, kVidYOff = 0;
-std::atomic<const uint32_t*> g_vbufs{nullptr};   // -> kernel.cpp's g_videoBufs[16] (addresses stable once captured)
+constexpr uint32_t kYSize = 0x101440, kCSize = 0x40520, kCPitch = 672, kCW = 640, kCH = 360;
+std::atomic<const uint32_t*> g_vbufs{nullptr};   // -> kernel.cpp's g_videoBufs[] (addresses stable once captured)
+std::atomic<const uint32_t*> g_vsizes{nullptr};  // -> kernel.cpp's g_videoBufSz[] (alloc sizes; Y=0x101440)
 std::atomic<int>             g_vbufN{0};
 VkBuffer       g_vidBuf    = VK_NULL_HANDLE;      // host-visible BGRA staging (1280x720x4), persistently mapped
 VkDeviceMemory g_vidMem    = VK_NULL_HANDLE;
 void*          g_vidMapped = nullptr;
-uint32_t       g_vidSig[16] = {0};                // per-buffer luma signature for freshness (motion) tracking
-uint64_t       g_vidSettledAt[16] = {0};          // present index at which each buffer last STOPPED changing
-uint32_t       g_vidStable[16] = {0};             // consecutive presents a buffer has been unchanged
+uint32_t       g_vidSig[24] = {0};                // per-buffer luma signature for freshness (motion) tracking
+uint64_t       g_vidSettledAt[24] = {0};          // present index at which each buffer last STOPPED changing
+uint32_t       g_vidStable[24] = {0};             // consecutive presents a buffer has been unchanged
 int            g_vidLastSel = -1;
 uint64_t       g_vidFrame   = 0;                  // count of presents that showed a decoded frame
 
@@ -142,20 +144,22 @@ void EnsureVideoBuffer() {
 // The movie decodes a handful of fps while we present ~60 fps, and the decoder writes one pool slot at a
 // time, so a "current" display frame must be chosen carefully — see the in-body comment for the criteria.
 bool PickAndFillVideo() {
-    const uint32_t* bufs = g_vbufs.load(); int n = g_vbufN.load();
+    const uint32_t* bufs = g_vbufs.load(); const uint32_t* sizes = g_vsizes.load(); int n = g_vbufN.load();
     if (!bufs || n <= 0 || !g_base || !g_vidMapped) return false;
-    if (n > 16) n = 16;
+    if (n > 24) n = 24;
     // Selecting the buffer that is changing RIGHT NOW would read it mid-decode (tearing — top rows new,
-    // bottom rows stale). Instead present the most-recently-COMPLETED buffer: one that has been written
-    // but did NOT change this present (its decode has settled). The decoder writes one pool slot at a
-    // time, so at any moment ≤1 slot is mid-write and the rest are clean finished frames.
+    // bottom rows stale). Instead present the most-recently-COMPLETED frame: a Y plane that has been written
+    // but did NOT change this present (its decode has settled). The decoder writes one pool slot at a time,
+    // so at any moment ≤1 slot is mid-write and the rest are clean finished frames.
     // The cooperative scheduler can stall the decoder mid-frame, leaving a buffer half-written (unwritten
     // rows read back as black bands). So a clean display frame must be BOTH settled (not changing now) AND
     // complete (no black-unwritten bands). Sample a grid: a row whose mean luma is ~0 is unwritten; a fully
     // decoded frame has all rows written (sky is ~128, never a full black band). Pick the freshest such frame.
+    // Only Y planes (alloc size 0x101440) are candidates; their U/V are the next two pool slots.
     constexpr int kRows = 72, kCols = 32, kMaxBlank = 3;
     int sel = -1; uint64_t bestAge = 0;
     for (int i = 0; i < n; i++) {
+        if (sizes && sizes[i] != kYSize) continue;             // skip U/V planes — only Y is a candidate
         const uint8_t* y = g_base + bufs[i] + kVidYOff;
         uint32_t sig = 0; int written = 0;
         for (int r = 0; r < kRows; r++) {
@@ -175,12 +179,28 @@ bool PickAndFillVideo() {
     if (sel < 0) sel = g_vidLastSel;        // nothing complete+settled yet — hold the last good frame
     if (sel < 0) return false;              // no frame yet
     g_vidLastSel = sel;
+    // YUV->RGB (planar I420, full-range BT.601). U/V are the next two pool slots (size 0x40520) when present.
     const uint8_t* yp = g_base + bufs[sel] + kVidYOff;
+    bool color = (sel + 2 < n) && (!sizes || (sizes[sel + 1] == kCSize && sizes[sel + 2] == kCSize));
+    const uint8_t* up = color ? g_base + bufs[sel + 1] : nullptr;
+    const uint8_t* vp = color ? g_base + bufs[sel + 2] : nullptr;
+    auto clamp8 = [](int v) -> uint8_t { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); };
     uint8_t* dst = (uint8_t*)g_vidMapped;
     for (uint32_t row = 0; row < kVidH; row++) {
         const uint8_t* s = yp + (size_t)row * kVidPitch;
+        const uint8_t* ur = up ? up + (size_t)(row >> 1) * kCPitch : nullptr;
+        const uint8_t* vr = vp ? vp + (size_t)(row >> 1) * kCPitch : nullptr;
         uint8_t* d = dst + (size_t)row * kVidW * 4;
-        for (uint32_t x = 0; x < kVidW; x++) { uint8_t v = s[x]; d[0]=v; d[1]=v; d[2]=v; d[3]=255; d += 4; }
+        for (uint32_t x = 0; x < kVidW; x++) {
+            int Y = s[x];
+            if (ur) {
+                int u = ur[x >> 1] - 128, v = vr[x >> 1] - 128;
+                d[0] = clamp8(Y + ((454 * u) >> 8));              // B = Y + 1.772*u
+                d[1] = clamp8(Y - ((88 * u + 183 * v) >> 8));     // G = Y - 0.344*u - 0.714*v
+                d[2] = clamp8(Y + ((359 * v) >> 8));              // R = Y + 1.402*v
+            } else { d[0] = d[1] = d[2] = (uint8_t)Y; }           // no chroma yet -> grayscale
+            d[3] = 255; d += 4;
+        }
     }
     return true;
 }
@@ -456,9 +476,10 @@ void Present(uint32_t frontBufferGuestAddr) {
     }
 }
 
-void PublishVideo(const uint32_t* guestBufAddrs, int count) {
+void PublishVideo(const uint32_t* guestBufAddrs, const uint32_t* guestBufSizes, int count) {
     if (!g_enabled) return;
-    g_vbufs.store(guestBufAddrs);   // points at kernel.cpp's g_videoBufs[16] (stable once captured)
+    g_vbufs.store(guestBufAddrs);    // points at kernel.cpp's g_videoBufs[] (stable once captured)
+    g_vsizes.store(guestBufSizes);   // and g_videoBufSz[]
     g_vbufN.store(count);
 }
 

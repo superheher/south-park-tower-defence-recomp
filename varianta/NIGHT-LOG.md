@@ -1615,3 +1615,23 @@ After the present milestone, pivoted to the prompt's option (a) per the user. Fi
   REX_FAIRSCHED, where tid=10 runs it) and diff against prod's path (gdb-step prod through sub_8211B740 to the
   sub_8210AF90 bctrl) → the first divergent branch + its state input is the fix target. Then RE that input
   (likely one of the sub_82248AF8 / sub_82108E20 / sub_82253540 / sub_8224FB68 lookups returning differently).
+
+### ✅✅ COLOR DONE (cont.11, same session) — the intro movie now renders in FULL COLOR
+After the grayscale present + the sub_8211B740 characterization, cracked the chroma and added color.
+- **The chroma is a SEPARATE allocation, not in the Y buffer's tail.** The decoder's NtAllocateVirtualMemory
+  log (LR 0x8244DD2C) shows a repeating TRIPLE per frame: **Y (req 0x101440)** then **U then V (req 0x40520
+  each)** — planar I420. (My earlier "86KB tail" confusion was from dumping a fixed 0x101440 for every pool
+  slot, which over-read the small chroma allocations. The 0x101440 buffer holds ONLY the Y plane + padding.)
+- Pool order in g_videoBufs: Y at indices 0,3,6,9,12,15,18 (size 0x101440); its U = idx+1, V = idx+2 (0x40520).
+- Chroma geometry from autocorrelation on the small buffers: **sharp stride minimum at 672 (= luma pitch/2),
+  mean ≈128** ⇒ U/V are pitch 672, 640×360. Verified by rendering frame 2 (Y=buf6,U=buf7,V=buf8) → a correct
+  vibrant frame (blue sky, green pines, Cartman's turquoise hat + red jacket). **Full-range BT.601**, U/V order
+  = first-small=U, second-small=V (601 with that order gave correct colors; VU or 709 were wrong/off).
+- Implementation: kernel.cpp captures base+size (g_videoBufSz[24]); PublishVideo passes both; the render thread
+  selects only Y planes (size 0x101440), reads U/V from the next two slots, and does integer fixed-point
+  YUV→RGB (full-range BT.601) on the CPU into the BGRA staging buffer (chroma upsampled 2× nearest). Same
+  vkCmdCopyBufferToImage path, no shaders.
+- Verified ON SCREEN: REX_RENDER=1 REX_FAIRSCHED=1 → captured frame has R≠G≠B (mean 134/160/158 = color),
+  matches the offline proof, 0 device-overwrite, no crash. Default boot UNREGRESSED (0 [render], 0 overwrite).
+  Screenshot delivered to user. ⇒ **Task (a) COLOR is DONE.** Remaining: (b) smooth motion (coop-throttle),
+  (c) sub_8211B740 RE for the natural transition.

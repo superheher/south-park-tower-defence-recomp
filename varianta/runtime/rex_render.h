@@ -10,10 +10,10 @@ bool Enabled();
 // clear color (proves window + swapchain + present); later increments read/translate the framebuffer.
 void Present(uint32_t frontBufferGuestAddr);
 
-// Increment 3 (decoded-frame present): publish the VC-1 decoder's frame-pool buffers (guest addresses) so
-// the render thread can present the decoded intro movie. The render thread reads guest memory directly
-// (g_base + addr), picks the freshest fully-decoded buffer, and uploads its luma plane.
-// Frame layout (RE'd from the dump): Y (luma) plane is LINEAR, pitch=1344 bytes, 1280x720 visible, at
-// offset 0; 8-bit. Chroma layout is non-standard (TODO: color) — presented as grayscale for now.
-void PublishVideo(const uint32_t* guestBufAddrs, int count);
+// Increment 3 (decoded-frame present): publish the VC-1 decoder's frame-pool buffers (guest base + alloc
+// size) so the render thread can present the decoded intro movie in COLOR. The render thread reads guest
+// memory directly (g_base + addr), picks the freshest fully-decoded frame, does YUV->RGB, and uploads it.
+// Frame layout (RE'd): planar I420, full-range BT.601, as 3 consecutive allocations per frame — Y plane
+// (size 0x101440, pitch 1344, 1280x720) then U then V (size 0x40520 each, pitch 672, 640x360).
+void PublishVideo(const uint32_t* guestBufAddrs, const uint32_t* guestBufSizes, int count);
 }

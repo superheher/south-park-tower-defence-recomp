@@ -28,9 +28,10 @@
 static const bool g_ktrace = []{ const char* e = getenv("REX_KTRACE"); return !e || e[0] != '0'; }();
 #define KTRACE(...) do { if (g_ktrace) { fprintf(stderr, "[kernel] " __VA_ARGS__); } } while (0)
 // Renderer (decoded-frame shortcut): the VC-1 video decoder allocates its frame-pool buffers from a single
-// site (LR 0x8244DD2C, ~0x101440 bytes each). Capture them so the render thread can present the decoded
-// frame directly (sidesteps the PM4 command-buffer enumeration).
-uint32_t g_videoBufs[16]; std::atomic<int> g_videoBufN{0};
+// site (LR 0x8244DD2C). Each FRAME is 3 separate allocations in order: Y plane (req 0x101440, pitch 1344,
+// 1280x720) then U then V (req 0x40520 each, pitch 672, 640x360) — planar I420. Capture base+size so the
+// render thread can present the decoded frame in color (sidesteps PM4 command-buffer enumeration).
+uint32_t g_videoBufs[24]; uint32_t g_videoBufSz[24]; std::atomic<int> g_videoBufN{0};
 
 // Called (via rex_indirect.h's PPC_CALL_INDIRECT_FUNC override) when a guest indirect-call target has no
 // recompiled function — i.e. a jump-table case-label the recompiler emitted as a call (XenonAnalyse missed
@@ -144,9 +145,9 @@ PPC_FUNC(__imp__NtAllocateVirtualMemory)
     }
     PPC_STORE_U32(pBase, gbase);
     PPC_STORE_U32(pSize, size);
-    if (ctx.lr == 0x8244DD2Cull) {                 // VC-1 decoder frame-pool allocation site
+    if (ctx.lr == 0x8244DD2Cull) {                 // VC-1 decoder frame-pool allocation site (Y/U/V triplets)
         int i = g_videoBufN.load();
-        if (i < 16) { g_videoBufs[i] = gbase; g_videoBufN.store(i + 1); }
+        if (i < 24) { g_videoBufs[i] = gbase; g_videoBufSz[i] = reqSize; g_videoBufN.store(i + 1); }
     }
     KTRACE("NtAllocateVirtualMemory(req=0x%X sz=0x%X type=0x%X prot=0x%X) -> base=0x%X size=0x%X lr=0x%llX\n",
         reqBase, reqSize, allocType, protect, gbase, size, (unsigned long long)ctx.lr);
@@ -1778,27 +1779,27 @@ PPC_FUNC(__imp__VdSwap) {
             int cnt = g_videoBufN.load();
             fprintf(stderr, "[video] LATE (swap#%u) %d frame-pool buffers (full 0x101440 scan):\n", n, cnt);
             for (int i = 0; i < cnt; i++) {
-                uint32_t b = g_videoBufs[i]; uint32_t nz = 0, varied = 0;
-                for (uint32_t o = 0; o + 4 <= 0x101440; o += 4) {
+                uint32_t b = g_videoBufs[i], sz = g_videoBufSz[i]; uint32_t nz = 0, varied = 0;
+                for (uint32_t o = 0; o + 4 <= sz; o += 4) {
                     uint32_t w = GLD32(b + o); if (w) nz++;
                     if ((w & 0xFF) != ((w >> 8) & 0xFF) || ((w >> 16) & 0xFF) != ((w >> 24) & 0xFF)) varied++;
                 }
-                fprintf(stderr, "[video]  buf%d @0x%X nz=%u varied=%u\n", i, b, nz, varied);
-                // REX_VIDEODUMP: write the raw buffer to disk so the host can render it at candidate
-                // widths/formats and identify the decoded-frame geometry. Only the varied (decoded) ones.
+                fprintf(stderr, "[video]  buf%d @0x%X sz=0x%X nz=%u varied=%u\n", i, b, sz, nz, varied);
+                // REX_VIDEODUMP: write the raw buffer (exact size) to disk for offline analysis of the
+                // decoded-frame geometry. Only the varied (decoded) ones.
                 if (getenv("REX_VIDEODUMP") && varied > 1000) {
                     char path[64]; snprintf(path, sizeof path, "/tmp/vbuf%d.raw", i);
                     FILE* f = fopen(path, "wb");
-                    if (f) { fwrite(g_base + b, 1, 0x101440, f); fclose(f);
-                             fprintf(stderr, "[video]  -> dumped buf%d to %s (0x101440 B)\n", i, path); }
+                    if (f) { fwrite(g_base + b, 1, sz, f); fclose(f);
+                             fprintf(stderr, "[video]  -> dumped buf%d to %s (0x%X B)\n", i, path, sz); }
                 }
             }
         }
     }
     if (rex_render::Enabled()) {
-        // Publish the VC-1 frame-pool buffer addresses so the render thread can present the decoded intro
-        // movie (it picks the freshest buffer + uploads its luma plane). Cheap (two atomic stores).
-        rex_render::PublishVideo(g_videoBufs, g_videoBufN.load());
+        // Publish the VC-1 frame-pool buffers (base+size) so the render thread can present the decoded intro
+        // movie in color (picks the freshest Y triplet + does YUV->RGB). Cheap (a few atomic stores).
+        rex_render::PublishVideo(g_videoBufs, g_videoBufSz, g_videoBufN.load());
         rex_render::Present(ctx.r4.u32);                         // non-blocking: publish fetch ptr to render thread
     }
     ctx.r3.u64 = 0;
