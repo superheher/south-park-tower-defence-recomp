@@ -1349,6 +1349,24 @@ PPC_FUNC(__imp__VdSwap) {
                 n, baseVirt, w, h, format, tiled, endian, pitch,
                 GLD32(baseVirt), GLD32(baseVirt + 4), GLD32(baseVirt + 8),
                 GLD32(basePhysMirror), GLD32(basePhysMirror + 4), GLD32(basePhysMirror + 8));
+    // One-time: dump the per-frame command-buffer region around r3 (the swap buffer ptr, "into the ring"
+    // per rexglue but outside our main ring 0xA0002000 — the deferred per-frame command buffer). Reveals
+    // where the frame's draws are so the CP can execute them (the prerequisite for rendering).
+    if (g_ktrace) {
+        static std::atomic<bool> dumped{false};
+        bool e = false;
+        if (n >= 3 && dumped.compare_exchange_strong(e, true)) {
+            uint32_t r3 = ctx.r3.u32;
+            fprintf(stderr, "[swapbuf] r3=0x%X r5=0x%X r6=0x%X r7=0x%X (ringBase=0x%X size=0x%X) — dwords [r3-0x80 .. r3+0x80):\n",
+                    r3, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, GLD32(0x7FC80714), 0);
+            for (uint32_t off = 0xFFFFFF80; off != 0x100; off += 0x20) {  // -0x80..+0x60 in 0x20 steps
+                uint32_t a = r3 + off;
+                char line[256]; int p = snprintf(line, sizeof line, "[swapbuf] %+5d:", (int)off);
+                for (int k = 0; k < 8; k++) p += snprintf(line+p, sizeof line-p, " %08X", GLD32(a + k*4));
+                fprintf(stderr, "%s\n", line);
+            }
+        }
+    }
     if (rex_render::Enabled()) rex_render::Present(ctx.r4.u32);  // non-blocking: publish fetch ptr to render thread
     ctx.r3.u64 = 0;
 }
