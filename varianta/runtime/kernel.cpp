@@ -1367,6 +1367,25 @@ PPC_FUNC(__imp__VdSwap) {
             }
         }
     }
+    // Renderer part 1 (deferred-CP, EXPERIMENTAL, REX_DEFERCP=1): the per-frame draws live in a deferred
+    // command buffer at 0xA01xxxxx (r3 = the swap write-point at its end), NOT the main ring — so our CP
+    // never sees them. Execute the range built since the previous swap so DRAW_INDX etc. reach ExecutePM4
+    // (verify via REX_CPTRACE: draw packets after the init ring). Bounded to a sane forward range.
+    if (getenv("REX_DEFERCP")) {
+        static uint32_t s_lastEnd = 0;
+        uint32_t cur = ctx.r3.u32;
+        // The per-frame command buffer is a single GROWING buffer; r3 advances ~0x88000/frame, so this
+        // frame's commands are exactly [prev_r3, cur_r3]. Execute that range so the draws reach the CP.
+        bool exec = (s_lastEnd && cur > s_lastEnd && (cur - s_lastEnd) < 0x200000u && cur >= 0xA0000000u);
+        if (exec) {
+            uint64_t before = g_drawCount.load();
+            ExecutePM4(s_lastEnd, (cur - s_lastEnd) / 4, 0);
+            if (g_ktrace && n <= 16) fprintf(stderr, "[defercp] swap#%u range=0x%X totaldraws=%llu (+%llu this frame)\n",
+                n, cur - s_lastEnd, (unsigned long long)g_drawCount.load(),
+                (unsigned long long)(g_drawCount.load() - before));
+        }
+        s_lastEnd = cur;
+    }
     if (rex_render::Enabled()) rex_render::Present(ctx.r4.u32);  // non-blocking: publish fetch ptr to render thread
     ctx.r3.u64 = 0;
 }
