@@ -45,8 +45,61 @@ VkSemaphore      g_presentSem = VK_NULL_HANDLE;
 VkFence          g_fence    = VK_NULL_HANDLE;
 uint64_t         g_frame    = 0;
 
+// In-engine screenshot (REX_RENDER_SHOT=<frame> -> capture that present to /tmp/varianta_shot.ppm).
+// Self-contained: external Wayland capture tools (spectacle/grim/import) don't work here.
+const uint32_t   g_shotTarget = []{ const char* s = getenv("REX_RENDER_SHOT"); return s ? (uint32_t)atoi(s) : 0u; }();
+VkBuffer         g_capBuf   = VK_NULL_HANDLE;
+VkDeviceMemory   g_capMem   = VK_NULL_HANDLE;
+VkDeviceSize     g_capSize  = 0;
+
 #define VKCHECK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[render] %s = %d\n", #x, (int)_r); return false; } } while (0)
+
+uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) {
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(g_phys, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props) return i;
+    return 0;
+}
+
+void EnsureCaptureBuffer() {
+    VkDeviceSize need = (VkDeviceSize)g_extent.width * g_extent.height * 4;
+    if (g_capBuf && g_capSize >= need) return;
+    if (g_capBuf) { vkDestroyBuffer(g_device, g_capBuf, nullptr); vkFreeMemory(g_device, g_capMem, nullptr); }
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = need; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(g_device, &bci, nullptr, &g_capBuf) != VK_SUCCESS) { g_capBuf = VK_NULL_HANDLE; return; }
+    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(g_device, g_capBuf, &mr);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = FindMemoryType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(g_device, &mai, nullptr, &g_capMem) != VK_SUCCESS) { vkDestroyBuffer(g_device, g_capBuf, nullptr); g_capBuf = VK_NULL_HANDLE; return; }
+    vkBindBufferMemory(g_device, g_capBuf, g_capMem, 0);
+    g_capSize = need;
+}
+
+// Write the mapped capture buffer (swapchain format B8G8R8A8) to a PPM (RGB).
+void WriteCapturePPM(const char* path) {
+    void* p = nullptr;
+    if (vkMapMemory(g_device, g_capMem, 0, g_capSize, 0, &p) != VK_SUCCESS) return;
+    const uint8_t* src = (const uint8_t*)p;
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%u %u\n255\n", g_extent.width, g_extent.height);
+        std::vector<uint8_t> row(g_extent.width * 3);
+        for (uint32_t y = 0; y < g_extent.height; y++) {
+            const uint8_t* s = src + (size_t)y * g_extent.width * 4;
+            for (uint32_t x = 0; x < g_extent.width; x++) {   // BGRA -> RGB
+                row[x*3+0] = s[x*4+2]; row[x*3+1] = s[x*4+1]; row[x*3+2] = s[x*4+0];
+            }
+            fwrite(row.data(), 1, row.size(), f);
+        }
+        fclose(f);
+        fprintf(stderr, "[render] captured frame %llu -> %s\n", (unsigned long long)g_frame, path);
+    }
+    vkUnmapMemory(g_device, g_capMem);
+}
 
 bool CreateSwapchain() {
     VkSurfaceCapabilitiesKHR caps{};
@@ -224,9 +277,27 @@ bool PresentOnce() {
     VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
 
-    ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                 VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+    bool capturing = (g_shotTarget && g_frame == g_shotTarget);
+    if (capturing) {
+        EnsureCaptureBuffer();
+        if (g_capBuf) {
+            ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            VkBufferImageCopy rgn{};
+            rgn.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            rgn.imageExtent = {g_extent.width, g_extent.height, 1};
+            vkCmdCopyImageToBuffer(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_capBuf, 1, &rgn);
+            ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         VK_ACCESS_TRANSFER_READ_BIT, 0);
+        } else capturing = false;
+    }
+    if (!capturing) {
+        ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+    }
     vkEndCommandBuffer(g_cmd);
 
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -235,6 +306,7 @@ bool PresentOnce() {
     si.commandBufferCount = 1; si.pCommandBuffers = &g_cmd;
     si.signalSemaphoreCount = 1; si.pSignalSemaphores = &g_presentSem;
     vkQueueSubmit(g_queue, 1, &si, g_fence);
+    if (capturing) { vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, UINT64_MAX); WriteCapturePPM("/tmp/varianta_shot.ppm"); }
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &g_presentSem;

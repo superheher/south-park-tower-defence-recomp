@@ -1333,8 +1333,23 @@ PPC_FUNC(__imp__VdInitializeScalerCommandBuffer)    { ctx.r3.u64 = 0; }
 // frame-pacing / is_counter fences see presents happen (real present = renderer phase).
 PPC_FUNC(__imp__VdSwap) {
     uint32_t n = g_gpuCounter.fetch_add(1) + 1;
-    if (g_ktrace && n <= 8) fprintf(stderr, "[VdSwap] #%u (r3=0x%X r4=0x%X)\n", n, ctx.r3.u32, ctx.r4.u32);
-    if (rex_render::Enabled()) rex_render::Present(ctx.r3.u32);  // non-blocking: publishes fb to render thread
+    // r4 = D3D9 texture fetch constant (6 dwords, BE) describing the front buffer. Parse it (xenos
+    // xe_gpu_texture_fetch_t): dword_0 bit31=tiled, bits22..30=pitch(>>5); dword_1 bits0..5=format,
+    // bits6..7=endian, bits12..31=base_address(>>12, VIRTUAL); dword_2 = (w-1)|((h-1)<<13).
+    uint32_t fetchPtr = ctx.r4.u32;
+    uint32_t d0 = GLD32(fetchPtr), d1 = GLD32(fetchPtr + 4), d2 = GLD32(fetchPtr + 8);
+    uint32_t tiled = (d0 >> 31) & 1, pitch = (d0 >> 22) & 0x1FF;
+    uint32_t format = d1 & 0x3F, endian = (d1 >> 6) & 3;
+    uint32_t baseVirt = ((d1 >> 12) & 0xFFFFF) << 12;
+    uint32_t basePhysMirror = 0xA0000000u | (baseVirt & 0x1FFFFFFFu);
+    uint32_t w = (d2 & 0x1FFF) + 1, h = ((d2 >> 13) & 0x1FFF) + 1;
+    if (g_ktrace && n <= 6)
+        fprintf(stderr, "[VdSwap] #%u fb_virt=0x%X %ux%u fmt=%u tiled=%u endian=%u pitch=%u | "
+                "@virt=%08X %08X %08X | @0xA=%08X %08X %08X\n",
+                n, baseVirt, w, h, format, tiled, endian, pitch,
+                GLD32(baseVirt), GLD32(baseVirt + 4), GLD32(baseVirt + 8),
+                GLD32(basePhysMirror), GLD32(basePhysMirror + 4), GLD32(basePhysMirror + 8));
+    if (rex_render::Enabled()) rex_render::Present(ctx.r4.u32);  // non-blocking: publish fetch ptr to render thread
     ctx.r3.u64 = 0;
 }
 
