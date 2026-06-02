@@ -1135,3 +1135,45 @@ rexglue's command_processor + Vulkan backend (Xenia-based) already do — so the
 or (c) the fake-skip-the-intro stopgap to exercise more title LOGIC (menu/gameplay) for recomp coverage
 (no display). This is a multi-week, deliberate phase — flagged for a human scope decision, not autonomous
 loop work.
+
+## 2026-06-02 (post-reboot) — RENDERER PART 1 REFRAMED: per-frame draws never reach the ring (REX_DEFERCP refuted)
+
+Resumed after a host crash/reboot at clean HEAD `d0e1a3e`. Baseline re-verified: boot reaches the intro,
+presents double-buffered framebuffers (0xA2016000/0xA23AE000, 1280x720 fmt=6), 0 device-overwrite, no crash.
+
+Traced a full frame (REX_DEFERCP=1 + configurable REX_CPDUMP=N + REX_DRAWLOG). Findings overturn the
+"linearly parse the staging/deferred buffer" approach (REX_DEFERCP):
+
+- The per-frame staging buffer at 0xA01xxxxx is NOT a clean PM4 stream. A linear PM4 walk stays aligned for
+  only ~2000 of ~139000 dwords/frame, then desyncs HARD: the op histogram becomes near-uniform across all
+  0x00-0x7F (garbage signature), and the walk runs into INLINE VERTEX FLOATS (0x441FE000=639.0f=1280/2,
+  0x44DD0000=1768.0f, …) and segment-address words masked as type3 (raw 0xC02B7784 == addr 0xA02B7784). It is
+  the title's custom linked command SEGMENTS — markers op 0x38(cnt2)/0x79(cnt10) carrying segment addrs (e.g.
+  data `8100008B 00013640 C009790C`) — interleaved with inline vertex data. Not walkable linearly.
+
+- rexglue/Xenia 1:1 ref (agent-mapped graphics/command_processor.cpp + include xenos.h): there is NO deferred /
+  system-command-buffer execution path. ALL GPU work reaches the CP via the MAIN RING. VdGetSystemCommandBuffer
+  is a stub (0xBEEF, same as ours). VdSwap writes its swap PM4 (TYPE0 fetch-const + PM4_XE_SWAP) INTO the ring.
+  Texture fetch constants come from SET_CONSTANT(0x2D, type=1)->reg 0x4800 (our CP does NOT handle 0x2D — a
+  gap) or type-0 writes. kImmediate inline indices unsupported; vertices come from bound buffers.
+
+- DIRECT ring dump (new one-time KTRACE diag in VdSwap): ring base=0xA0002000 size=0x1000 (1024 dwords). After
+  init it holds ME_INIT + exactly 6 setup IBs (->0xA0090040/0xA0010000/0xA00900E0/0xA0010100/0xA00975A0/
+  0xA00975E0) and CP_RB_WPTR == CP_RB_RPTR == 37 — fully consumed, NOTHING past WPTR. The guest writes NO
+  per-frame commands to the ring. r3 in VdSwap = 0xA0123B74 (r7=0xBEEF0001) lies in the staging region, far
+  outside the 0x1000 ring — r3 is the staging write-point, not a ring pointer.
+
+- prod oracle (renders the SAME guest: 54 pipelines incl. PS adf7088205c03df9) launched & confirmed rendering,
+  so on the correct path the title DOES feed the ring per-frame. sub_821C6600 ("the kick") hit only ~1x in 5s
+  under gdb on prod (likely init-only) -> the per-frame ring submission is some OTHER path.
+
+CONCLUSION: the per-frame draws are built in the staging buffer (0xA01xxxxx) but the title's FLUSH to the ring
+(sub_821C6D58: write IB packets to the ring + advance WPTR) never fires in variant A — gated on a GPU<->CPU
+WAIT_REG_MEM handshake that the fence-forward stopgap does not reproduce. The tiny ring is meant to carry IB
+packets pointing to staging segments; our existing ring-CP would render them IF they were kicked. So
+REX_DEFERCP (linear staging parse) is the WRONG target. Real part-1 work = get the segment draws to the CP:
+either (A) model the handshake so the title's own flush fires, or (B) decode the segment descriptors and
+execute each segment as an IB ourselves. (Also: add SET_CONSTANT 0x2D handling for fetch constants.)
+
+Diagnostics added this commit (gated/one-time, boot unregressed): configurable REX_CPDUMP=N cap + op
+0x38/0x79/draw data dump in ExecutePM4; one-time ring walk in VdSwap flagging IB targets + WPTR/RPTR.

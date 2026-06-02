@@ -1031,15 +1031,20 @@ void ExecutePM4(uint32_t addr, uint32_t dwords, int depth) {
     while (addr + 4 <= end) {
         uint32_t packet = GLD32(addr); addr += 4;
         if (packet == 0) continue;
-        // REX_CPDUMP: trace top-level packets of the deferred buffer to locate where the parse desyncs.
-        static const bool cpdump = getenv("REX_CPDUMP") != nullptr;
+        // REX_CPDUMP=N: trace the first N top-level packets of the deferred buffer to find the draws and
+        // where the parse desyncs. N=1 -> 400 (back-compat); larger N walks a whole frame (~tens of K pkts).
+        static const int cpcap = []{ const char* e = getenv("REX_CPDUMP"); int v = e ? atoi(e) : 0; return v > 1 ? v : (e ? 400 : 0); }();
         static std::atomic<int> pn{0};
-        if (cpdump && depth == 0 && pn.load() < 400) {
+        if (cpcap && depth == 0 && pn.load() < cpcap) {
             int k = ++pn; uint32_t t = packet >> 30, op = (packet >> 8) & 0x7F;
             // flag draws + the suspicious low-byte!=0 "headers" (likely chain/jump packets or misaligned data)
             const char* note = (t == 3 && (op == 0x36 || op == 0x22)) ? " <<DRAW" : ((packet & 0xFF) && t == 3 ? " <<lowbyte" : "");
             fprintf(stderr, "[pm4] #%d @0x%X type%u op=0x%X cnt=%u raw=%08X%s\n",
                     k, addr - 4, t, t == 3 ? op : 0, ((packet >> 16) & 0x3FFF) + 1, packet, note);
+            // decode the title's custom segment packets (0x38/0x79) + draws: dump their leading data dwords
+            if (t == 3 && (op == 0x38 || op == 0x79 || op == 0x36 || op == 0x22))
+                fprintf(stderr, "[pm4]   data: %08X %08X %08X %08X %08X %08X\n",
+                        GLD32(addr), GLD32(addr+4), GLD32(addr+8), GLD32(addr+12), GLD32(addr+16), GLD32(addr+20));
         }
         switch (packet >> 30) {
           case 0: {                              // type-0: write `count` regs starting at base_index
@@ -1394,6 +1399,40 @@ PPC_FUNC(__imp__VdSwap) {
                 char line[256]; int p = snprintf(line, sizeof line, "[swapbuf] %+5d:", (int)off);
                 for (int k = 0; k < 8; k++) p += snprintf(line+p, sizeof line-p, " %08X", GLD32(a + k*4));
                 fprintf(stderr, "%s\n", line);
+            }
+        }
+        // One-time: walk the MAIN ring (small, 0x1000) as PM4 and flag INDIRECT_BUFFER packets. Model test:
+        // the ring is far too small to hold a frame (~139K dwords), so per rexglue the per-frame draws must
+        // reach the CP as IB packets in the ring pointing to the big staging segments at 0xA01xxxxx. If the
+        // guest builds ring IBs past WPTR but never kicks (advances CP_RB_WPTR), they're the missing draws.
+        static std::atomic<bool> rdumped{false};
+        bool re = false;
+        if (n >= 3 && rdumped.compare_exchange_strong(re, true) && g_ringBufferBase) {
+            uint32_t wptr = GLD32(0x7FC80714), rptr = GLD32(0x7FC80710);  // CP_RB_WPTR(0x1C5)/RPTR(0x1C4)
+            uint32_t nd = g_ringBufferSize / 4;
+            fprintf(stderr, "[ringdump] base=0x%X dwords=%u CP_RB_WPTR=%u CP_RB_RPTR=%u — walking as PM4:\n",
+                    g_ringBufferBase, nd, wptr, rptr);
+            uint32_t a = g_ringBufferBase, end = g_ringBufferBase + nd * 4; int shown = 0;
+            while (a + 4 <= end && shown < 90) {
+                uint32_t pk = GLD32(a); uint32_t di = (a - g_ringBufferBase) / 4; a += 4;
+                if (pk == 0) continue;
+                uint32_t t = pk >> 30;
+                const char* mark = (di == wptr) ? " <==WPTR" : (di == rptr ? " <==RPTR" : "");
+                if (t == 3) {
+                    uint32_t op = (pk >> 8) & 0x7F, cnt = ((pk >> 16) & 0x3FFF) + 1;
+                    if (op == 0x3F || op == 0x37) {   // INDIRECT_BUFFER: print target + len
+                        uint32_t ib = GLD32(a), len = GLD32(a + 4) & 0xFFFFF;
+                        fprintf(stderr, "[ringdump] @+%u IB -> 0x%X (phys 0x%X) len=%u%s\n",
+                                di, ib, 0xA0000000u | (ib & 0x1FFFFFFFu), len, mark);
+                    } else {
+                        fprintf(stderr, "[ringdump] @+%u T3 op=0x%X cnt=%u raw=%08X%s\n", di, op, cnt, pk, mark);
+                    }
+                    a += cnt * 4;
+                } else {
+                    fprintf(stderr, "[ringdump] @+%u type%u raw=%08X%s\n", di, t, pk, mark);
+                    if (t == 1) a += 8; else if (t == 0) a += (((pk >> 16) & 0x3FFF) + 1) * 4;
+                }
+                shown++;
             }
         }
     }
