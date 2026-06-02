@@ -1177,3 +1177,30 @@ execute each segment as an IB ourselves. (Also: add SET_CONSTANT 0x2D handling f
 
 Diagnostics added this commit (gated/one-time, boot unregressed): configurable REX_CPDUMP=N cap + op
 0x38/0x79/draw data dump in ExecutePM4; one-time ring walk in VdSwap flagging IB targets + WPTR/RPTR.
+
+## 2026-06-02 (post-reboot, cont.) — RENDERER PART 1: route B (segment-CP) VALIDATED — clean aligned draws
+
+User chose route B (decode the title's segments, execute each as an IB). Implemented + validated:
+- Instrumented the ring-kick sub_821C6600: the 6 init kicks reveal the SEGMENT DESCRIPTOR format
+  definitively = a 2-dword {d0 = 0x81000000 | len_dwords, d1 = phys_addr}. e.g. d0=8100000B d1=00090040
+  -> IB->0xA0090040 len=11; d0=8100010A d1=00010100 -> IB->0xA0010100 len=266. The "op 0x38" payloads seen
+  earlier in the staging stream (8100008B 00013640, ...) ARE exactly these descriptors embedded inline.
+- REX_SEGCP=1: scan this frame's staging range [prev_r3,cur_r3] for the descriptor signature
+  ((d0&0xFFFF0000)==0x81000000 + sane len/addr) and execute each referenced segment as a bounded IB
+  ExecutePM4(0xA0000000|d1, len, depth=1). RESULT: ~8 segments/frame, ~9 draws/frame, and they are CLEAN +
+  ALIGNED (all init=0x30088 numInd=3 prim=8 = kRectangleList) — NOT the desync garbage the linear DEFERCP
+  produced (init=0xC0000000 numInd=49152). 0 device-overwrite, no crash, boot reaches intro. => route B's
+  segment-IB model WORKS; segments are clean PM4 and parse aligned.
+- Added SET_CONSTANT(0x2D) + SET_CONSTANT2(0x55) to ExecuteType3 (type1->reg0x4800 fetch/textures,
+  type4->+0x2000 regs, type0->+0x4000 ALU, 2->+0x4900, 3->+0x4908; per rexglue command_processor.cpp).
+  Made REX_DRAWLOG=N configurable.
+
+LIMITATION / NEXT: the embedded-descriptor scan finds only a UNIFORM subset — across 500 logged draws 100%
+are init=0x30088 (untextured rects), ZERO bound textures. So these are one layer (clears/fills); the
+textured bulk (movie quad, sprites, the ~808-draw dominant pshader adf7088205c03df9) is in segments NOT
+referenced by inline descriptors. The COMPLETE per-frame segment list lives in the flush sub_821C6D58's
+queue: flush -> sub_821C6810 (provides segment region+count r30) -> sub_821C6C80 (consumes; r8=device+13568
+array base, r6=count) -> kick. Device fields: +10896 completion-ctr ptr, +10908 head fence, +13408/+13568
+segment tracking, +10940/10941 gate bytes (flush skips the segment block if device+13408!=0). NEXT:
+empirically hook sub_821C6C80 / read the device+13568 array to enumerate ALL segments (incl. textured), then
+present the movie quad's bound texture (shortcut to visible content).

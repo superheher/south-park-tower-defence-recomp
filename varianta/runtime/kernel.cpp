@@ -949,7 +949,8 @@ inline uint32_t TranslatePhys(uint32_t p) { return 0xA0000000u | (p & 0x1FFFFFFF
 
 enum { PM4_ME_INIT=0x48, PM4_NOP=0x10, PM4_INDIRECT_BUFFER=0x3F, PM4_INDIRECT_BUFFER_PFD=0x37,
        PM4_WAIT_REG_MEM=0x3C, PM4_EVENT_WRITE=0x46, PM4_EVENT_WRITE_SHD=0x58, PM4_EVENT_WRITE_EXT=0x5A,
-       PM4_DRAW_INDX=0x22, PM4_DRAW_INDX_2=0x36, PM4_INTERRUPT=0x54, PM4_XE_SWAP=0x64 };
+       PM4_DRAW_INDX=0x22, PM4_DRAW_INDX_2=0x36, PM4_INTERRUPT=0x54, PM4_XE_SWAP=0x64,
+       PM4_SET_CONSTANT=0x2D, PM4_SET_CONSTANT2=0x55 };
 constexpr uint32_t XE_GPU_REG_VGT_EVENT_INITIATOR = 0x21F9;
 
 std::atomic<uint32_t> g_gpuCounter{0};   // GPU swap counter — EVENT_WRITE_SHD is_counter fences read it
@@ -993,14 +994,29 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
       case PM4_EVENT_WRITE_EXT:
         WriteGpuReg(XE_GPU_REG_VGT_EVENT_INITIATOR, GLD32(addr) & 0x3F);
         break;
+      case PM4_SET_CONSTANT: {                 // load constants/registers into the register file (rexglue
+        uint32_t ot = GLD32(addr), index = ot & 0x7FF, type = (ot >> 16) & 0xFF;   // command_processor.cpp)
+        uint32_t regBase;                       // type: 0=ALU(+0x4000) 1=FETCH(+0x4800, textures) 2=BOOL
+        switch (type) { case 0: regBase=0x4000; break; case 1: regBase=0x4800; break;  // (+0x4900) 3=LOOP
+                        case 2: regBase=0x4900; break; case 3: regBase=0x4908; break;  // (+0x4908) 4=REG
+                        case 4: regBase=0x2000; break; default: regBase=0xFFFFFFFF; }  // (+0x2000)
+        if (regBase != 0xFFFFFFFF)
+            for (uint32_t i = 1; i < count; i++) WriteGpuReg(regBase + index + (i-1), GLD32(addr + i*4));
+        break;
+      }
+      case PM4_SET_CONSTANT2: {                 // like SET_CONSTANT but 16-bit index, writes regs directly
+        uint32_t index = GLD32(addr) & 0xFFFF;
+        for (uint32_t i = 1; i < count; i++) WriteGpuReg(index + (i-1), GLD32(addr + i*4));
+        break;
+      }
       case PM4_DRAW_INDX: case PM4_DRAW_INDX_2: {
         uint32_t init = GLD32(addr), numInd = init >> 16, prim = init & 0x3F;
         g_drawCount.fetch_add(1);
         // REX_DRAWLOG: log non-degenerate draws + their bound texture fetch constants (reg 0x4800,
         // 6 dwords/slot) — to find the intro movie's full-screen quad and its decoded-frame texture.
-        static const bool drawlog = getenv("REX_DRAWLOG") != nullptr;
+        static const int drawlog = []{ const char* e = getenv("REX_DRAWLOG"); int v = e ? atoi(e) : 0; return v > 1 ? v : (e ? 24 : 0); }();
         static std::atomic<int> dn{0};
-        if (drawlog && numInd > 2 && dn.load() < 24) {
+        if (drawlog && numInd > 2 && dn.load() < drawlog) {
             int k = ++dn;
             fprintf(stderr, "[draw] #%d init=0x%X numInd=%u prim=%u\n", k, init, numInd, prim);
             for (uint32_t slot = 0; slot < 32; slot++) {
@@ -1145,6 +1161,24 @@ PPC_FUNC(sub_821B9270)
         kernel::LockGuestExecution();
     }
     __imp__sub_821B9270(ctx, base);
+}
+
+// ---- Ring-kick instrumentation (sub_821C6600): log the segment descriptor it consumes + the ring delta.
+// The kick reads a 2-dword descriptor at r4 ({d0: low-24 used, d1: segment addr}) and emits an IB packet to
+// the ring (advancing CP_RB_WPTR). Renderer route B needs the per-frame segment [addr,len] list; logging the
+// 6 init kicks reveals the descriptor->IB encoding (which we then read from the segment table per-frame).
+extern "C" PPC_FUNC(__imp__sub_821C6600);
+PPC_FUNC(sub_821C6600)
+{
+    uint32_t dev = ctx.r3.u32, desc = ctx.r4.u32;
+    uint32_t d0 = desc ? GLD32(desc + 0) : 0, d1 = desc ? GLD32(desc + 4) : 0;
+    uint32_t w0 = GLD32(0x7FC80714);
+    __imp__sub_821C6600(ctx, base);
+    if (g_ktrace) {
+        uint32_t w1 = GLD32(0x7FC80714);
+        fprintf(stderr, "[kick] dev=0x%X desc=0x%X d0=%08X d1=%08X | CP_RB_WPTR %u->%u (+%d dw)\n",
+                dev, desc, d0, d1, w0, w1, (int)(w1 - w0));
+    }
 }
 
 // ---- GPU fence-wait completion: forward the completion fence past deferred segments (sub_821C6E58) --
@@ -1454,6 +1488,38 @@ PPC_FUNC(__imp__VdSwap) {
                 (unsigned long long)(g_drawCount.load() - before));
         }
         s_lastEnd = cur;
+    }
+    // Renderer part 1 (segment-CP, route B, REX_SEGCP=1): the per-frame draws are PM4 IBs ("segments")
+    // referenced by 2-dword descriptors {d0 = 0x81000000 | len_dwords, d1 = phys_addr} that the title embeds
+    // in the staging stream (and the kick sub_821C6600 turns into ring IBs on the working path — verified
+    // from the 6 init kicks: d0=8100000B/d1=00090040 -> IB->0xA0090040 len=11, etc.). Rather than linearly
+    // execute the staging stream (which desyncs on inline vertex data + markers), SCAN this frame's range for
+    // descriptors and execute each referenced segment as a bounded IB, so the parse stays aligned (segments
+    // are clean PM4, like the init IBs).
+    if (getenv("REX_SEGCP")) {
+        static uint32_t s_segLast = 0;
+        uint32_t cur = ctx.r3.u32;
+        if (s_segLast && cur > s_segLast && (cur - s_segLast) < 0x200000u && cur >= 0xA0000000u) {
+            uint64_t before = g_drawCount.load();
+            int segs = 0;
+            for (uint32_t a = s_segLast; a + 8 <= cur && segs < 4000; a += 4) {
+                uint32_t d0 = GLD32(a);
+                if ((d0 & 0xFFFF0000u) != 0x81000000u) continue;     // descriptor tag 0x8100_00LL
+                uint32_t len = d0 & 0xFFFF, d1 = GLD32(a + 4);
+                if (len == 0 || len > 0x4000u) continue;             // sane length (dwords)
+                if (d1 < 0x10000u || d1 >= 0x20000000u) continue;    // sane physical addr (0xA-window)
+                uint32_t seg = 0xA0000000u | (d1 & 0x1FFFFFFFu);
+                uint32_t ht = GLD32(seg) >> 30;                      // first packet must look like PM4
+                if (ht == 0 || ht == 1 || ht == 3) {
+                    ExecutePM4(seg, len, 1);                         // depth 1 = an IB body (skips cpdump)
+                    segs++; a += 4;                                  // consume the descriptor's 2nd dword
+                }
+            }
+            if (g_ktrace && n <= 24) fprintf(stderr, "[segcp] swap#%u range=0x%X segs=%d totaldraws=%llu (+%llu)\n",
+                n, cur - s_segLast, segs, (unsigned long long)g_drawCount.load(),
+                (unsigned long long)(g_drawCount.load() - before));
+        }
+        s_segLast = cur;
     }
     if (rex_render::Enabled()) rex_render::Present(ctx.r4.u32);  // non-blocking: publish fetch ptr to render thread
     ctx.r3.u64 = 0;
