@@ -1358,14 +1358,19 @@ void VblankPump() {
             if (B && B != 0xFFFFFFFFu && chunk >= 0xA0000000u) {
                 uint32_t lo = chunk > 0x180000u ? chunk - 0x180000u : 0xA0000000u;
                 int fired = 0;
-                // Fire ONE record per vblank: the consumer's event is auto-reset + it drains one item per
-                // wake, so a tight batch of KeSetEvents collapses to a single wake (cont.18 ref 2). One per
-                // vblank => one signal => one wake => one drain, letting the consumer keep pace.
-                for (uint32_t a = lo; a + 12 <= chunk + 0x20000u && fired < 1; a += 4) {
+                // cont.20: call the producer DIRECTLY with arg = the record's ctx (so the enqueued work item
+                // IS ctx, whose +16 may be the real draw handler) but ON THE PUMP CONTEXT (g_pumpKpcr — its
+                // procType matches the consumer's, so the producer's KeSetEvent wakes it). This combines
+                // INVOKECB's arg=ctx with PUMPCB's pump context. The consumer drains the batch.
+                (void)B;
+                for (uint32_t a = lo; a + 12 <= chunk + 0x20000u && fired < 4; a += 4) {
                     if (GLD32(a) != 0x0001057Cu || GLD32(a + 4) != 0x821CC7A0u) continue;
-                    GST32(B + 0x10, 0x821CC7A0u);
-                    GST32(B + 0x14, GLD32(a + 8));
-                    FireGfxInterrupt(cb, 1, /*cpu=*/2);
+                    PPCContext c{};
+                    c.fpscr.csr = 0x1F80;
+                    c.r1.u64 = g_pumpStack - 0x400;   // pump's guest stack (interrupts already returned)
+                    c.r13.u64 = g_pumpKpcr;
+                    c.r3.u64 = GLD32(a + 8);          // producer arg = ctx (the real work item)
+                    CallGuest(0x821CC7A0u, c);
                     fired++;
                 }
                 if (g_ktrace && fired) fprintf(stderr, "[pumpcb] fired %d completion interrupts\n", fired);
