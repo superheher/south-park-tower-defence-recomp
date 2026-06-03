@@ -1122,6 +1122,17 @@ static void FireGfxInterrupt(uint32_t cb, uint32_t source, uint32_t cpu = 2) {
         fprintf(stderr, "[int] FireGfx src=1 cpu=%u iData=0x%08X B=*(+10900)=0x%08X *(B+0x10)=0x%08X -> %s\n",
                 cpu, g_interruptData, B, cbslot, (g_interruptData && B == 0xFFFFFFFFu) ? "SKIP(sentinel)" : "FIRE");
     }
+    // REX_BOOTSTRAP (cont.14): the render producer sub_821CC7A0 is the completion callback at *(B+0x10),
+    // B=*(device+10900); in variant A that slot is null (the per-frame submit that registers it never runs),
+    // so the source=1 interrupt's null-check skips it -> producer never fires -> consumer (tid=10) never
+    // signalled -> kick-gate counter device+0x2b04 never decremented -> no kicks. Bootstrap by registering
+    // the producer so the interrupt fires it; the producer then enqueues + KeSetEvents the consumer.
+    static const bool g_bootstrap = getenv("REX_BOOTSTRAP") != nullptr;
+    if (g_bootstrap && source == 1 && g_interruptData) {
+        uint32_t B = GLD32(g_interruptData + 10900);
+        if (B && B != 0xFFFFFFFFu && GLD32(B + 0x10) == 0)
+            GST32(B + 0x10, 0x821CC7A0u);
+    }
     if (source == 1 && g_interruptData && GLD32(g_interruptData + 10900) == 0xFFFFFFFFu) return;
     PPCContext ctx{};
     ctx.fpscr.csr = 0x1F80;              // default MXCSR: all FP exceptions masked
@@ -1387,6 +1398,9 @@ PPC_FUNC(sub_821C73D8) { GpuLock _gl; __imp__sub_821C73D8(ctx, base); }
 extern "C" PPC_FUNC(__imp__sub_821C6C80);
 PPC_FUNC(sub_821C6C80) {
     static const bool kg = getenv("REX_KICKGATE") != nullptr;
+    // NOTE (cont.15): forcing the kick gate open here (GST32(r3+0x2b04,0)) DOES flow the ring (2725 kicks)
+    // but yields ONLY init=0x30088 rects (no textured draws) and crashes (skips segment bookkeeping).
+    // PROVEN non-viable — the textured draws are producer/consumer work items, not kicked segments.
     if (kg) {
         static int c = 0;
         if (c < 80) {

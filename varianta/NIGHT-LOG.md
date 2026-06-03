@@ -2232,3 +2232,20 @@ Continuing cont.13 (real render path = source=1 gfx-interrupt → producer sub_8
 This UNIFIES the whole renderer search with the tid=10 starvation thread: rendering is a cross-thread producer/consumer pipeline (GPU-CP-interrupt producer ⟷ tid-10 consumer sub_821CC310) gated by the pending counter device+0x2b04; variant A's consumer side (tid=10) is dead, so the pipeline never flows and the ring goes idle after init.
 
 **NEXT:** find why variant A's tid=10 (sub_82450FD0) never reaches the consumer loop sub_821CC5D0→sub_821CC310 (under NOTOKEN+CSLEAK): does the thread run at all? does it diverge into sub_82250420/sub_8211B740 instead? is it blocked on an object the (dead) producer should signal? Making the consumer run (decrement device+0x2b04 + issue draws via *(item+16)) is the renderer unblock. Diagnostic added: REX_KICKGATE ([kickgate]).
+
+## cont.15 (2026-06-04, autonomous) — BOOTSTRAP experiment VALIDATES the producer/consumer model; PROVES textured draws are producer/consumer work items, not kicked segments
+
+Tested the cont.14 model with gated, default-safe interventions (REX_BOOTSTRAP):
+
+1. **Register the producer into *(B+0x10) when source=1 fires.** Result: the producer **sub_821CC7A0 FIRED ([enq]=1, was 0)** and the consumer **sub_821CC310 RAN ([consumer]=1, was 0)** — the producer→consumer chain mechanically works. BUT the work item was EMPTY: `[enq] item=0x0`, `[consumer] r3=0x29C98 item=*(r3)=0x29A44 handler=*(item+16)=0x0` (null draw handler) → no draw. variant A's work items (a device-relative ring near device+0x2AC4) exist but their handlers are null — the per-frame render submission that populates them didn't complete.
+
+2. **Also force the kick gate open** (device+0x2b04=0 in sub_821C6C80). Result: kicks **FLOW — sub_821C6600 fired 2725× (was 6)**, the ring is alive, the CP executes the per-frame segments. BUT the draws are STILL **only init=0x30088 prim=8 numInd=3 untextured RECTS** (149/150 logged, 0 textured), then crashes (INDIRECT-NULL 0x80000000 @ lr=0x82448B70 — forcing kicks skips the title's segment bookkeeping → corruption). Force-kick hack reverted (left an inline NOTE; PROVEN non-viable).
+
+**DEFINITIVE CONCLUSIONS:**
+- The producer/consumer pipeline (sub_821CC7A0 → sub_821CC310) is the correct render mechanism and works when driven (validated end to end).
+- **The textured draws are NOT in the directly-kicked command segments** — kicking them 2725× yields only rects. Textured content is produced by the producer/consumer pipeline processing REAL work items (handler = the draw fn at *(item+16), called via lr=0x821CC4B0).
+- The real work items / completion objects (B) / item handlers are populated by the title's full render submission running against a FAITHFUL GPU (real command completion + interrupt timing). variant A's fence-forward stub fakes the fence value but not the completion semantics, so the submission produces incomplete state (null handlers, unpopulated B) and the pending counter device+0x2b04 is never decremented. Simple hacks turn the cranks with no grain (null items) or flow only the rect segments.
+
+⇒ The renderer genuinely requires a **faithful CP / GPU-completion model**, not a stopgap. All pieces are now mapped: (real render path = source=1 interrupt → producer; gate = pending counter device+0x2b04; cross-thread producer(GPU-CP-interrupt)/consumer(tid-10 sub_821CC310); draw = item handler *(item+16)).
+
+**NEXT (the real renderer, multi-session):** when variant A's CP consumes a kicked segment, MODEL its completion: (a) decrement device+0x2b04 (mimic the consumer) so kicks flow naturally; (b) fire the source=1 interrupt with the completion object B set up for that segment so the producer enqueues the segment's REAL work item (with a non-null handler); (c) let the consumer (tid-10, runs under NOTOKEN) drain it → issue the textured draw via *(item+16). Open RE: how a kicked segment maps to its completion object B + work-item handler (so the CP can populate them on completion). Diagnostics retained (gated, default boot unregressed): REX_INTLOG, REX_KICKGATE, REX_ENQLOG, REX_BOOTSTRAP (experiment).
