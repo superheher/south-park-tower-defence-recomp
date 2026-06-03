@@ -1992,3 +1992,26 @@ source, bypassing the deferred cmd-buffer format). Step 1 = find that function.
   watchpoint on the cmd-buffer for an op-0x36 write (flaky here, as the 0x827FD56C watchpoints were). The
   translator's Vulkan side (state-extraction reg-file, ported shaders, render-thread swapchain) is READY; the
   whole remaining renderer work is this draw EXTRACTION + the per-draw-type Vulkan translation. Multi-session.
+
+### cont.12 (c7) — draw-record INTERCEPTION is a proven NO-GO (XDK D3D inlined); only the PM4 cmd-buffer extraction is viable
+Pursued the targeted draw-record-fn search. The cmd-buffer base/writeptr writers (device+13568/+13572) trace
+to sub_821CC830 — and that is D3D FRAME-BEGIN (resets device+13568/13572=0, allocs the ring segments via
+sub_821C5BA8), NOT a draw. ⚠ This re-confirms the prior HLE-spike (same branch, 2 days ago, [[sp_hle_phase0_progress]])
+DETERMINATION: the title's static XDK D3D **INLINES every draw/state emit as PM4 stores** — there is NO
+per-draw / per-sprite / per-material guest FUNCTION to hook (RE-confirmed at call-structure level); the draws
+are PM4 stores deep in the render subtrees (frame render sub_82150970 → 10 structural passes; kicks
+sub_821C6600 ~11/frame, NOT draw-proportional). And "texture binding only via PM4" — a non-PM4 override never
+gets the texture SET_CONSTANT, so it can't reconstruct sprites.
+- ⇒ The user-picked "intercept the draw-record function" is TECHNICALLY BLOCKED (no such function exists —
+  the D3D is inlined). This is exactly why the HLE variant-B native-render spike was a NO-GO.
+- ⇒ The ONLY viable draw input for the renderer is the **PM4 cmd-buffer** (option A): crack the title's
+  deferred cmd-buffer (device+13568) and execute its PM4 — which carries BOTH the DRAW_INDX_2 packets AND the
+  SET_CONSTANT(0x4800 fetch+tex / 0x4000 ALU) state the existing CP already applies. cont.11's REX_CHUNKCP
+  LINEAR parse desynced on the title's custom structure (PM4 interleaved with inline-vertex floats +
+  0x8100xxxx segment-link descriptors); the fix is a STRUCTURED parse — follow the segment chain (the 0x38/
+  0x79 ops / 0x8100xxxx links) and parse PM4 within each segment, skipping/handling the inline-vertex regions.
+  This is cont.11's "full cmd-buffer enumeration (hard)" — now established as the ONLY path (interception is
+  ruled out), scoped to the menu where the title builds real textured draws into device+13568 ~0x88680/frame.
+- The CP/Vulkan side is ready (SET_CONSTANT→reg-file extraction, ported shaders, render-thread swapchain). The
+  whole remaining renderer = this structured deferred-cmd-buffer parse → feed the real DRAW_INDX+state to the
+  existing CP draw path → translate to vkCmdDraw. Multi-session, but now the approach is unambiguous.
