@@ -2160,3 +2160,30 @@ User picked the executor-level trace ("why does draw-issuing emit only rects?").
   (INDIRECT-NULL at 0x821BF834/0x821BF860) vs *never reached* — hook 0x821BF860 + the consumer sub_821CC310 to
   see if the segment-execution path runs at all. That disambiguates path (A) (fix the failing invocation) from
   needing path (B) (drive it ourselves). Diagnostic added: REX_ENQLOG ([enq], gated; default boot unregressed).
+
+## cont.12(c12) — disambiguation: leans path A — the render path is REACHED but its callback queues are EMPTY
+
+Hooked the consumer sub_821CC310 too (REX_ENQLOG). Over a full menu run:
+
+- **The sub_821CC* work-queue is DORMANT: producer sub_821CC7A0 = 0 calls AND consumer sub_821CC310 = 0 calls.**
+  So the 0x821CC7A0 callbacks the device+13568 segments carry are **dead data** for the menu — that queue is
+  not the active render path. (So path B "execute the segments + invoke 0x821CC7A0" is weakly supported — it'd
+  drive a queue the title itself never uses.)
+- **The ACTIVE render attempt is `sub_821BF748`** (the function that owns the INDIRECT-NULL at 0x821BF834). It's
+  a **spinlock-protected DPC / callback-queue processor**: `KfAcquireSpinLock(r3+16920)`, increments a counter
+  at +16756, stamps `mftb` at +16760, compares head/tail at +16908/+16912, and calls the queued callback at
+  **`*(r31+16752)`** under a null-check. variant A: that callback is **null on a clean run (null-check skips it
+  → no draw) or garbage 0xFFFFFFFF when raced (→ INDIRECT-NULL)**. Either way the **render-callback queue is
+  EMPTY** — nothing valid was ever enqueued into it.
+- **⇒ Path A, but the real gap is UPSTREAM of the callback site:** the render path IS reached (sub_821BF748
+  runs every frame), it's just that **no producer enqueues textured render work** into its queue (+16752 stays
+  null/garbage). This is the same shape as the dormant sub_821CC7A0 producer. So the divergence is the **menu
+  render logic never enqueuing the textured-content render callbacks** — consistent with "emits only rects."
+  Fixing the INDIRECT-NULL race (making +16752 not *garbage*) would only turn a crash into a *null-skip*, still
+  no draw — so the race genuinely is NOT the gate (reconfirms c10/c11). The gate is **why nothing is enqueued**.
+- **Next session (deep, the actual root): find the render-work PRODUCER** — what code in prod enqueues a valid
+  callback into sub_821BF748's queue (+16752) / sets up the textured-draw render items, and why variant A's
+  menu never calls it. Prod-oracle: break in prod at sub_821BF748, read the live `*(r31+16752)` (the real
+  callback fn) + walk back to its enqueuer; then check whether that enqueuer runs in variant A. That enqueuer
+  (or the object/state it needs) is the missing piece. Diagnostic: REX_ENQLOG now also hooks sub_821CC310
+  ([consumer]); default boot unregressed.
