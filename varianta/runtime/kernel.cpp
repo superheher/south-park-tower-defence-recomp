@@ -1381,6 +1381,25 @@ std::atomic<uint32_t> g_device{0};   // captured from the first ring-kick (devic
 extern "C" PPC_FUNC(__imp__sub_821C73D8);
 PPC_FUNC(sub_821C73D8) { GpuLock _gl; __imp__sub_821C73D8(ctx, base); }
 
+// REX_KICKGATE (cont.13): the ring-kick gate. sub_821C6C80 kicks the ring (sub_821C6600) only when
+// *(device+0x2b04)==0; non-zero runs a "process-pending" block and DEFERS the kick. prod: *(dev+0x2b04)
+// is mostly 0 (kicks ~7062x/45s); variant A: kicks only 6x => this flag is stuck non-zero. Log it.
+extern "C" PPC_FUNC(__imp__sub_821C6C80);
+PPC_FUNC(sub_821C6C80) {
+    static const bool kg = getenv("REX_KICKGATE") != nullptr;
+    if (kg) {
+        static int c = 0;
+        if (c < 80) {
+            uint32_t obj = ctx.r3.u32, dev = g_device.load();
+            uint32_t fr3 = GLD32(obj + 0x2b04), fdev = dev ? GLD32(dev + 0x2b04) : 0;
+            fprintf(stderr, "[kickgate] #%d r3=0x%08X dev=0x%08X *(r3+0x2b04)=0x%08X *(dev+0x2b04)=0x%08X %s\n",
+                    c, obj, dev, fr3, fdev, fr3 ? "defer" : "KICK");
+            c++;
+        }
+    }
+    __imp__sub_821C6C80(ctx, base);
+}
+
 // REX_ENQLOG: characterize what the menu enqueues into its deferred render work-queue (cont.12 c11). sub_821CC7A0
 // is the PRODUCER — it stores work item r3 into a per-process ring buffer (base+procType*108+11328, count
 // +11412) and KeSetEvent's the consumer (sub_821CC310, which dequeues + calls *(item+16) to issue the draws).

@@ -2212,3 +2212,23 @@ Prod oracle (gdb on `out/build/linux-amd64-release/south_park_td`, base=0x100000
 **SUCCESS METRIC for the renderer:** `REX_ENQLOG [enq]` (sub_821CC7A0) > 0 ⇒ producer fires ⇒ consumer issues real draws.
 
 **NEXT:** (a) find who writes `*(B+0x10)=0x821CC7A0` in prod (the completion-callback registration; a prod HW watchpoint on B+0x10 armed at the first source=1 interrupt did NOT fire in 90s ⇒ it's written earlier, during graphics init — arm earlier / trace sub_821C73D8 which sets device+0x2A94=B, or follow the device+13568 `821CC7A0 <ctx>` segment records); (b) decide fix: drive variant A's CP to execute the per-frame IBs/segments so the INTERRUPT packets fire + B+0x10 gets registered (route B, now with the dispatch mechanism understood), vs. the title's own flush sub_821C6D58. Diagnostic added: **REX_INTLOG** ([int], default boot unregressed).
+
+## cont.14 (2026-06-04, autonomous) — RENDER DEADLOCK ROOT FOUND: kick gated by a pending-counter (device+0x2b04) the CONSUMER (sub_821CC310, tid=10) must decrement — it never runs. Unifies with tid=10 starvation.
+
+Continuing cont.13 (real render path = source=1 gfx-interrupt → producer sub_821CC7A0). Traced WHY variant A never executes the per-frame command stream, to the root.
+
+**Per-frame render-submit chain RUNS in variant A but the KICK is gated.** Prod kicks the ring (sub_821C6600) 7062×/45s; variant A only 6× (init). Chain: `sub_82249638→…→sub_821CC830(D3D frame)→sub_821C6D58(flush)→sub_821C6C80→sub_821C6600(kick)`. variant A reaches the flush (3322×) and sub_821C6C80 (1410×) per-frame, but kicks 6×.
+
+**The gate (decoded from prod disasm + verified both sides): `sub_821C6C80` kicks only when `*(device+0x2b04)==0`** (0x2b04=11012). Non-zero → runs a "process-pending" block (sub_821C5CD0) and DEFERS the kick.
+- prod: the field oscillates **0↔1** (mostly 0 → kicks).
+- variant A (REX_KICKGATE): the field climbs **MONOTONICALLY 0→1→2→…→0xA…→ and NEVER resets** → stuck non-zero → kick deferred forever after the 6 init kicks.
+
+**device+0x2b04 is a pending-segment counter (producer/consumer flow control), proven by a prod HW watchpoint on device+0x2b04 (0x140019a84):**
+- **Increment (→N+1):** render thread `sub_82249638→sub_82249678→sub_82249970→sub_82249AD0→sub_82150970→sub_821BF298→sub_821CCA28→sub_821C6C80` (queues a pending segment, defers the kick).
+- **Decrement (→0):** `sub_82450FD0(thread)→sub_821CC5D0→sub_821CC310(CONSUMER)→sub_821CC140` — the consumer, when it drains a work item, decrements the counter.
+
+**⇒ THE DEADLOCK / RENDER ROOT:** the consumer **sub_821CC310** runs on **tid=10 (thread entry sub_82450FD0)** — the long-starved/blocked thread (cont.8–12). In variant A the consumer NEVER runs (`[consumer]=0`), so device+0x2b04 is never decremented → climbs forever → the kick is permanently deferred → no per-frame IBs reach the ring → no INTERRUPT packets → the producer never fires → no draws. **The renderer root IS the tid=10/consumer-not-running problem.** (Parallel break from cont.13: even on the source=1 fires that do happen, `*(B+0x10)` is null — the producer isn't registered as the completion callback; that registration likely also lives on the consumer/tid-10 path.)
+
+This UNIFIES the whole renderer search with the tid=10 starvation thread: rendering is a cross-thread producer/consumer pipeline (GPU-CP-interrupt producer ⟷ tid-10 consumer sub_821CC310) gated by the pending counter device+0x2b04; variant A's consumer side (tid=10) is dead, so the pipeline never flows and the ring goes idle after init.
+
+**NEXT:** find why variant A's tid=10 (sub_82450FD0) never reaches the consumer loop sub_821CC5D0→sub_821CC310 (under NOTOKEN+CSLEAK): does the thread run at all? does it diverge into sub_82250420/sub_8211B740 instead? is it blocked on an object the (dead) producer should signal? Making the consumer run (decrement device+0x2b04 + issue draws via *(item+16)) is the renderer unblock. Diagnostic added: REX_KICKGATE ([kickgate]).
