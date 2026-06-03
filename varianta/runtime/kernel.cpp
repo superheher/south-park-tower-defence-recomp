@@ -1115,6 +1115,13 @@ static void FireGfxInterrupt(uint32_t cb, uint32_t source, uint32_t cpu = 2) {
     // Variant A's stub CP re-runs the ring from the VblankPump, so it can fire this completion interrupt when
     // no completion is pending -> a wild deref of 0xFFFFFFFF -> SIGSEGV. Skip the spurious interrupt then
     // (there is nothing to acknowledge). [stopgap — like the fence-forward; a real CP would track completions.]
+    static const bool g_intlog = getenv("REX_INTLOG") != nullptr;
+    if (source == 1 && g_intlog) {
+        uint32_t B = g_interruptData ? GLD32(g_interruptData + 10900) : 0;
+        uint32_t cbslot = (g_interruptData && B && B != 0xFFFFFFFFu) ? GLD32(B + 0x10) : 0;
+        fprintf(stderr, "[int] FireGfx src=1 cpu=%u iData=0x%08X B=*(+10900)=0x%08X *(B+0x10)=0x%08X -> %s\n",
+                cpu, g_interruptData, B, cbslot, (g_interruptData && B == 0xFFFFFFFFu) ? "SKIP(sentinel)" : "FIRE");
+    }
     if (source == 1 && g_interruptData && GLD32(g_interruptData + 10900) == 0xFFFFFFFFu) return;
     PPCContext ctx{};
     ctx.fpscr.csr = 0x1F80;              // default MXCSR: all FP exceptions masked
@@ -1170,7 +1177,8 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
       }
       case PM4_INTERRUPT: {
         uint32_t cpuMask = GLD32(addr);
-        if (g_cptrace) fprintf(stderr, "[cp] INTERRUPT mask=0x%X\n", cpuMask);
+        static const bool intlog2 = getenv("REX_INTLOG") != nullptr;
+        if (g_cptrace || intlog2) fprintf(stderr, "[int] PM4_INTERRUPT mask=0x%X cb=0x%08X\n", cpuMask, g_interruptCallback);
         if (g_interruptCallback)
             for (int n = 0; n < 6; n++) if (cpuMask & (1u << n)) FireGfxInterrupt(g_interruptCallback, 1, n);
         break;

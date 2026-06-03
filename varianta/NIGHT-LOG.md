@@ -2187,3 +2187,28 @@ Hooked the consumer sub_821CC310 too (REX_ENQLOG). Over a full menu run:
   callback fn) + walk back to its enqueuer; then check whether that enqueuer runs in variant A. That enqueuer
   (or the object/state it needs) is the missing piece. Diagnostic: REX_ENQLOG now also hooks sub_821CC310
   ([consumer]); default boot unregressed.
+
+## cont.13 (2026-06-03/04, autonomous) — RENDER PATH REFRAMED via prod oracle: the producer is the source=1 gfx-interrupt DPC; sub_821BF748/+16752 (c12's lead) is a DEAD END
+
+Prod oracle (gdb on `out/build/linux-amd64-release/south_park_td`, base=0x100000000, `handle SIGSEGV nostop pass`) overturns c12 and pins the real render dispatch + a concrete success metric.
+
+**c12's lead (sub_821BF748 +16752) is a DEAD END — proven in prod.** Object guest 0x40016f80, callback slot guest 0x4001b0f0 (+0x4170). A HARDWARE watchpoint on the slot over 160s at full vblank rate NEVER fired, and the dispatch `call *%rax` (sub_821BF748+387) executed **0 times**. So prod's +16752 callback is null too — sub_821BF748 is the **vblank (source=0)** DPC processor, NOT the render path. The +16752 chase was a red herring.
+
+**The REAL render producer path (verified, prod):** producer `sub_821CC7A0` is called **4192×/120s** (consumer `sub_821CC310` 4191×, `sub_821BF860` 2095×). Backtrace:
+`CommandProcessor::WorkerThreadMain -> ExecutePrimaryBuffer -> ExecuteIndirectBuffer -> ExecutePacketType3_INTERRUPT -> DispatchInterruptCallback -> ExecuteInterrupt -> sub_821C7170 -> sub_821CC7A0`.
+⇒ the title's per-frame command stream (IBs in the PRIMARY ring) carries **INTERRUPT (type-3 op 0x54) packets**; the CP fires the guest gfx-interrupt **source=1 (command-complete)** → handler `sub_821C7170` → producer → enqueues render work → consumer `sub_821CC310` dequeues + calls *(item+16) → draws.
+
+**sub_821C7170 decoded (prod disasm).** Two paths on the source arg:
+- source==0 (vblank): reads MMIO 0x7FC86544 bit0, calls sub_821BF748 (the dead +16752 queue).
+- source==1 (cmd-complete): `callback = *( *(g_interruptData + 0x2A94) + 0x10 )`, null-checked at +122 (skips the call if null), resolved + called at +204 (guest LR **0x821C71A4** = variant A's long-standing INDIRECT-NULL site). In prod this callback = sub_821CC7A0 (or sub_821BF860).
+**0x2A94 = 10900** — EXACTLY the field variant A's `FireGfxInterrupt` STOPGAP checks (`if(source==1 && *(g_interruptData+10900)==0xFFFFFFFF) return;`). So `B = *(device+0x2A94)` = the per-submission completion object; `*(B+0x10)` = the DPC callback to run. Prod values: device(=g_interruptData=r4)=0x40016f80, B=0xffc9a000, *(B+0x10)=0x821cc7a0.
+
+**variant A state (REX_INTLOG+REX_ENQLOG added this session; NOTOKEN+CSLEAK menu run, reaches SPTextured/SPBackdropTextured shader loads):**
+- producer sub_821CC7A0 = **0**, consumer = 0, PM4_INTERRUPT executed = **1** (vs prod's per-frame stream).
+- source=1 FireGfxInterrupt fired **3×**, all identical: `iData=0x00026F80 B=*(+10900)=0xA2011000 *(B+0x10)=0x00000000 -> FIRE`.
+  ⇒ B is VALID (not the 0xFFFFFFFF sentinel) so the STOPGAP is NOT the blocker; **`*(B+0x10)` is NULL** — the producer was never registered into the completion object, so sub_821C7170's null-check skips the call.
+⇒ Two divergences, one root: (D1) `*(B+0x10)` null (producer not registered) and (D2) source=1 barely fires (1 INTERRUPT packet vs prod's per-frame stream). Both because **variant A's CP never executes the title's per-frame render command stream** — the IBs with the INTERRUPT packets + the device+13568 segment records `0001057C 821CC7A0 <ctx>` that register the producer. This is the long-known "ring frozen WPTR=37 / flush sub_821C6D58 gated / deferred program never executed" root, now pinned to a concrete dispatch mechanism + success metric.
+
+**SUCCESS METRIC for the renderer:** `REX_ENQLOG [enq]` (sub_821CC7A0) > 0 ⇒ producer fires ⇒ consumer issues real draws.
+
+**NEXT:** (a) find who writes `*(B+0x10)=0x821CC7A0` in prod (the completion-callback registration; a prod HW watchpoint on B+0x10 armed at the first source=1 interrupt did NOT fire in 90s ⇒ it's written earlier, during graphics init — arm earlier / trace sub_821C73D8 which sets device+0x2A94=B, or follow the device+13568 `821CC7A0 <ctx>` segment records); (b) decide fix: drive variant A's CP to execute the per-frame IBs/segments so the INTERRUPT packets fire + B+0x10 gets registered (route B, now with the dispatch mechanism understood), vs. the title's own flush sub_821C6D58. Diagnostic added: **REX_INTLOG** ([int], default boot unregressed).
