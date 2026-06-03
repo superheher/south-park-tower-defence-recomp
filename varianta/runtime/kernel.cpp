@@ -294,6 +294,34 @@ std::recursive_mutex* CsLock(uint32_t cs) {
     if (!p) p = new std::recursive_mutex();
     return p;
 }
+// Orphaned-critical-section handling (preemptive mode). A guest thread that EXITS while still owning a
+// critical section orphans its host recursive_mutex (std::recursive_mutex is NOT released on thread exit)
+// -> a later RtlEnterCriticalSection on it dead-locks forever. Under the cooperative token this never
+// surfaces (one thread runs at a time, so a held CS is released before another can contend); under
+// REX_NOTOKEN it does — the natural-transition worker tid=10 hangs at sub_82435C48 on a CS that the GPU/
+// video-init thread sub_8242B4A8 acquired (0x82818628) and exited without releasing (its CS-release branch
+// is skipped because the fence-forward stopgap doesn't reproduce the real GPU sequence). Track the CSes
+// held by THIS host thread (thread-local, so no start-addr aliasing) and, on exit, release any still held
+// (the exiting thread owns those host mutexes, so unlock() is valid on it; it returned normally, so the
+// state they guard is consistent) — and/or report under REX_CSLEAK. Tracking runs only when needed
+// (preemptive or the diagnostic); the default cooperative path is untouched (zero cost). [STOPGAP — the
+// clean fix is a real CP so sub_8242B4A8 takes its normal CS-release path; see the fence-forward note.]
+const bool g_csleak = getenv("REX_CSLEAK") != nullptr;
+const bool g_csPreempt = getenv("REX_NOTOKEN") != nullptr;   // == g_preempt (defined later in the file); local copy for this earlier section
+const bool g_csTrack = g_csPreempt || g_csleak;     // track per-thread held CSes (preemptive or diagnostic)
+thread_local uint32_t tl_guestStart = 0;            // owning guest thread's start addr (set in GuestThreadRun)
+thread_local std::unordered_map<uint32_t,int>* tl_heldCS = nullptr;   // guest CS addr -> recursion depth held by THIS host thread
+void CsHeldEnter(uint32_t cs) { if (!g_csTrack) return;
+    if (!tl_heldCS) tl_heldCS = new std::unordered_map<uint32_t,int>(); (*tl_heldCS)[cs]++; }
+void CsHeldLeave(uint32_t cs) { if (!g_csTrack || !tl_heldCS) return;
+    auto it = tl_heldCS->find(cs); if (it != tl_heldCS->end() && --it->second <= 0) tl_heldCS->erase(it); }
+void CsExitCleanup(uint32_t start) {                // on guest-thread exit: release CSes it still holds
+    if (!tl_heldCS) return;
+    for (auto& kv : *tl_heldCS) { if (kv.second <= 0) continue;
+        if (g_csleak) fprintf(stderr, "[CS-LEAK] guest thread start=0x%X EXITED owning CS=0x%X (depth=%d)%s\n",
+                              start, kv.first, kv.second, g_csPreempt ? " — releasing (orphan fix)" : " — orphans it");
+        if (g_csPreempt) for (int i = 0; i < kv.second; i++) CsLock(kv.first)->unlock(); }   // unlock on the owning thread
+    delete tl_heldCS; tl_heldCS = nullptr; }
 } // namespace
 
 PPC_FUNC(__imp__RtlEnterCriticalSection)
@@ -304,13 +332,16 @@ PPC_FUNC(__imp__RtlEnterCriticalSection)
         m->lock();
         kernel::LockGuestExecution();
     }
+    CsHeldEnter(ctx.r3.u32);
 }
-PPC_FUNC(__imp__RtlLeaveCriticalSection) { CsLock(ctx.r3.u32)->unlock(); }
+PPC_FUNC(__imp__RtlLeaveCriticalSection) { CsHeldLeave(ctx.r3.u32); CsLock(ctx.r3.u32)->unlock(); }
 
 // BOOLEAN RtlTryEnterCriticalSection(cs)
 PPC_FUNC(__imp__RtlTryEnterCriticalSection)
 {
-    ctx.r3.u64 = CsLock(ctx.r3.u32)->try_lock() ? 1 : 0;
+    bool got = CsLock(ctx.r3.u32)->try_lock();
+    if (got) CsHeldEnter(ctx.r3.u32);
+    ctx.r3.u64 = got ? 1 : 0;
 }
 
 // ====================================================================================================
@@ -873,6 +904,7 @@ void GuestThreadRun(ThreadRec* rec) {
         rec->startAddr, (unsigned long long)g_tok.next_, (unsigned long long)g_tok.serving_, (int)g_tok.held_);
     if (g_fair) g_tok.lock(); else if (g_coop) g_waitMutex.lock();   // acquire the execution token (FIFO-fair if g_fair); no token under REX_NOTOKEN (preemptive)
     if (g_fair && getenv("REX_INITDIAG")) fprintf(stderr, "[initdiag] GuestThreadRun start=0x%X GOT token -> running\n", rec->startAddr);
+    tl_guestStart = rec->startAddr;          // for the REX_CSLEAK orphaned-critical-section diagnostic
     PPCContext ctx{};
     ctx.fpscr.csr = 0x1F80;                  // default MXCSR: all FP exceptions masked
     ctx.r1.u64 = rec->stackTop - 0x200;
@@ -885,6 +917,7 @@ void GuestThreadRun(ThreadRec* rec) {
         ctx.r3.u64 = rec->startContext;
         CallGuest(rec->startAddr, ctx);
     }
+    CsExitCleanup(rec->startAddr);           // preemptive: release CSes this thread still holds (orphan fix) / REX_CSLEAK warn
     SignalObject(rec->threadAddr, 1);        // wake anyone waiting on this thread object (header type 6)
     if (g_fair) g_tok.unlock(); else if (g_coop) g_waitMutex.unlock();
 }

@@ -1789,3 +1789,37 @@ This OVERTURNS cont.11's "starvation" diagnosis. Under true concurrency, with th
 - (c) Keep the renderer on the REX_XFLAG forced-transition path (reach a menu screen for real draws) and treat
   the scheduler/movie as a separate track.
 - Diag this session (all gated/reversible): per-thread CPU + gdb thread-state scripts; `[video]` swap#220 dump.
+
+### cont.12 (b) — natural-transition RE under true concurrency (user-picked direction b): tid=10 hangs on an ORPHANED critical section; releasing it advances intro→menu, converging with the INDIRECT-NULL renderer blockers
+With REX_NOTOKEN booting, pursued WHY tid=10 (sub_8211B740) still never reaches sub_8210AF90.
+- **gdb full stack of tid=10**: it is BLOCKED in `RtlEnterCriticalSection` (std::recursive_mutex) at
+  sub_8211B740→…→sub_82434860→**sub_82435C48** — waiting on a guest CRITICAL SECTION, NOT a CPU spin (~0% CPU).
+  Reading the host mutex (`__owner`): the owning LWP has ALREADY EXITED ⇒ an **ORPHANED critical section**
+  (std::recursive_mutex is not auto-released on thread exit, so a later RtlEnterCriticalSection deadlocks).
+- **REX_CSLEAK diagnostic** (track per-host-thread held CSes; on GuestThreadRun exit warn/release) named the
+  culprit, exactly one event: `[CS-LEAK] guest thread start=0x8242B4A8 EXITED owning CS=0x82818628`.
+  sub_8242B4A8 = the GPU/video-init thread (sub_8242B4A8→sub_8214F730→fence-wait sub_821C6E58); it acquires
+  CS 0x82818628, does GPU init, and EXITS without releasing it — its RtlLeaveCriticalSection branch is skipped
+  because the fence-forward stopgap doesn't reproduce the real GPU sequence, so it diverges. Under the
+  cooperative token this never surfaces (one thread at a time); under NOTOKEN tid=10 contends and deadlocks.
+- **Fix (NOTOKEN-gated, default-safe)**: when a guest thread exits, release any CS it still holds (it owns
+  those host mutexes, and it returned normally so the guarded state is consistent). Result: tid=10 UNBLOCKS
+  and the title **ADVANCES OUT OF THE INTRO into MENU/FRONTEND setup** — loads `Global/Textures/Global.bin`
+  (28165 B) + allocs menu buffers (NEW activity: NtQueryDirectoryFile, KeQueryBasePriorityThread, a flood of
+  RtlInitializeCriticalSection from sub_82427xxx). **Concrete progress toward the renderer.** Then a CASCADE
+  of `[INDIRECT-NULL]` (null vtable/jump-table slots: 0x82292D08, 0x8236859C, **0x821BF834, 0x821C71A4**) →
+  **SIGSEGV at ~34s**.
+- ⭐ **CONVERGENCE (directions b + c):** the natural path reaches the SAME menu-setup INDIRECT-NULL blockers
+  as the forced REX_XFLAG path (cont.11: 0x82292D08 / 0x8236859C / sub_8215DE84). The NEW INDIRECT-NULLs are
+  in the **0x821Bxxxx / 0x821Cxxxx CP/render code** ⇒ the menu tries to RENDER through GPU vtables variant A
+  has not populated (no real CP/renderer) → the **renderer is THE blocker for a live menu**. (Note: sub_8210AF90
+  STILL never fires — the advance happens via a different path under NOTOKEN, so the cont.7/8 "0x828E82A6 via
+  sub_8210AF90" model is not the only route to leave the intro.)
+- ⇒ Both ways of reaching the menu converge on **INDIRECT-NULL screen/GPU-vtable recovery (= the renderer
+  work)**. NOTOKEN + the orphan-CS release get the title there NATURALLY (no REX_XFLAG).
+- **Committed (NOTOKEN-gated, default-safe):** REX_CSLEAK diagnostic + orphaned-CS release-on-exit. Default
+  cooperative boot unregressed (VdSwap, 0 device-overwrite). The ~34s SIGSEGV (render-vtable INDIRECT-NULL
+  cascade) is the next frontier — the renderer.
+- NEXT: recover the INDIRECT-NULL screen/GPU vtables (sub_8215DE84 / 0x82292D08 / 0x8236859C / 0x821BF834 /
+  0x821C71A4) so the menu builds real textured PM4 draws → the draw-state translator has content. This is the
+  renderer (RENDERER-PHASE-PLAN), now reachable via the natural NOTOKEN path.
