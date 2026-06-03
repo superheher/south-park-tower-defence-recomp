@@ -1358,7 +1358,10 @@ void VblankPump() {
             if (B && B != 0xFFFFFFFFu && chunk >= 0xA0000000u) {
                 uint32_t lo = chunk > 0x180000u ? chunk - 0x180000u : 0xA0000000u;
                 int fired = 0;
-                for (uint32_t a = lo; a + 12 <= chunk + 0x20000u && fired < 16; a += 4) {
+                // Fire ONE record per vblank: the consumer's event is auto-reset + it drains one item per
+                // wake, so a tight batch of KeSetEvents collapses to a single wake (cont.18 ref 2). One per
+                // vblank => one signal => one wake => one drain, letting the consumer keep pace.
+                for (uint32_t a = lo; a + 12 <= chunk + 0x20000u && fired < 1; a += 4) {
                     if (GLD32(a) != 0x0001057Cu || GLD32(a + 4) != 0x821CC7A0u) continue;
                     GST32(B + 0x10, 0x821CC7A0u);
                     GST32(B + 0x14, GLD32(a + 8));
