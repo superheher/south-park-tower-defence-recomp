@@ -2125,3 +2125,38 @@ menu boots. **Answer: NO — a race-free run does not build textured draws; the 
   count + CLEAN/RACED (g_nonBenignInd) + a one-time segment-FOLLOW of the first settled menu directory (resolves
   each {0x81LLLLLL,addr}, parses the segment, tallies realDraws/rectDraws/setConst/texFetch). g_nonBenignInd =
   count of non-benign (lr!=0x82292D08) INDIRECT-NULLs = the race indicator.
+
+## cont.12(c11) — the unifying conclusion: the title BUILDS a deferred render program it never EXECUTES
+
+User picked the executor-level trace ("why does draw-issuing emit only rects?"). Traced the executor callback
+**0x821CC7A0** that the device+13568 segments carry (records `0001057C 821CC7A0 <ctx>`).
+
+- **0x821CC7A0 = sub_821CC7A0 is a work-queue PRODUCER**, not a draw function: it stores its arg into a
+  per-process ring buffer (base = *(0x8200098C/0x82000990) + procType·108 + 11328; count at +11412) and
+  KeSetEvent's the consumer (sub_821CC310, which dequeues and calls *(item+16) to actually issue the draws).
+- **Hooked it (REX_ENQLOG): over a full menu run sub_821CC7A0 is called ZERO times**, even though the menu is
+  reached (36 shader loads) and the segments reference 0x821CC7A0 as a callback. So the segment render
+  callbacks are **queued but never invoked** — the title's deferred render PROGRAM (the device+13568 segments:
+  state + draw callbacks) is BUILT but never successfully EXECUTED. Meanwhile the fence-forward stopgap keeps
+  satisfying the deferred-segment waits ([fencefwd] fence climbing 93717→93729…), so the title PROCEEDS as if
+  the GPU ran the program — without the program actually running. The render-path INDIRECT-NULLs (e.g.
+  `lr=0x821BF834 target=0xFFFFFFFF`, the same family the memory calls "WAIT_REG_MEM callbacks to 0x821BF860/
+  0x821CC7A0") are plausibly the FAILED callback invocations of that program.
+- **⇒ This UNIFIES the whole multi-session renderer search.** Every layer agreed the title emits only
+  init=0x30088 rects with 0 textures (ring, staging/SEGCP, device+13568). The reason: variant A builds the
+  textured render program (prod runs the same guest → 54 pipelines) but **never executes it** — only the
+  directly-kicked degenerate rects reach the CP. Not a parse problem (device+13568 parses), not a coverage
+  problem (the draws are found — they're rects), not purely the NOTOKEN race (clean runs also lack textured
+  draws), not the draw-issuing logic per se — it's that the **deferred render program is never run**, exactly
+  the stopgap hazard cont.11 flagged ("fence-forward lets the title proceed; deferred draws skipped").
+- **Two concrete renderer paths (multi-session, pick next session):** (A) make the title execute its own
+  program — drive the real GPU↔CPU handshake / fix the render-path callback invocations (the INDIRECT-NULL
+  race + whatever gates sub_821CC7A0/the consumer) so the segments run; or (B) execute the device+13568
+  segments OURSELVES — the directory format is cracked ({0x81LLLLLL,addr}, resolve 0xA0000000|(addr&0x1FFFFFFF)),
+  so a real CP can walk it, run each segment's PM4, and invoke its callbacks (0x821CC7A0 → producer → consumer
+  → draws), replacing the fence-forward so the fence advances as a REAL result. (B) is the "full cmd-buffer
+  enumeration" route, now unblocked by the cracked format; (A) needs the deferred-execution trigger RE'd.
+- Caveat to resolve first next session: confirm whether the segment callbacks are *attempted-and-fail*
+  (INDIRECT-NULL at 0x821BF834/0x821BF860) vs *never reached* — hook 0x821BF860 + the consumer sub_821CC310 to
+  see if the segment-execution path runs at all. That disambiguates path (A) (fix the failing invocation) from
+  needing path (B) (drive it ourselves). Diagnostic added: REX_ENQLOG ([enq], gated; default boot unregressed).
