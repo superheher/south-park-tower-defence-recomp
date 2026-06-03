@@ -1395,6 +1395,24 @@ PPC_FUNC(sub_821CC7A0) {
     __imp__sub_821CC7A0(ctx, base);
 }
 
+// REX_ENQLOG also hooks the CONSUMER sub_821CC310 (dequeues a work item r31=*(r3), calls *(r31+16) at
+// lr=0x821CC4B0 to issue the draw). Disambiguates renderer path A vs B: if it RUNS, the segment-execution path
+// is reached (path A — the handlers are just null/garbage = uninit objects, fix their init); if it's NEVER
+// called, the deferred program is never reached at all (path B — drive it ourselves). Also logs the handler
+// *(item+16) so we see whether the work items carry valid draw handlers or garbage.
+extern "C" PPC_FUNC(__imp__sub_821CC310);
+PPC_FUNC(sub_821CC310) {
+    static const bool enqlog = getenv("REX_ENQLOG") != nullptr;
+    if (enqlog) {
+        static std::atomic<uint64_t> c310{0}; uint64_t c = ++c310;
+        uint32_t item = ctx.r3.u32 ? GLD32(ctx.r3.u32) : 0, handler = item ? GLD32(item + 16) : 0;
+        if (c <= 6 || (c % 4000) == 0)
+            fprintf(stderr, "[consumer] #%llu sub_821CC310 r3=0x%X item=*(r3)=0x%X handler=*(item+16)=0x%X\n",
+                    (unsigned long long)c, ctx.r3.u32, item, handler);
+    }
+    __imp__sub_821CC310(ctx, base);
+}
+
 extern "C" PPC_FUNC(__imp__sub_821C6600);
 PPC_FUNC(sub_821C6600)
 {
