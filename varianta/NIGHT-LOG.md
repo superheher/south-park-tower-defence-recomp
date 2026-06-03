@@ -1953,3 +1953,26 @@ guest thread.
   remaining work — now reachable through the NATURAL menu (pool + CS-fix + NOTOKEN + CP-sync), not the forced
   REX_XFLAG path. Committed correct stopgaps this session: pool allocator (724c104), gfx-interrupt guard +
   g_gpuMutex CP-sync. Run: REX_NOTOKEN=1 REX_CSLEAK=1 -> menu (shaders) -> render-code SIGSEGV ~33s.
+
+### cont.12 (c5) — draw-state translator START blocked on INPUT: only init rects reach the CP (the cont.11 coverage problem, confirmed in the menu)
+USER picked the renderer (draw-state translator). PREREQ check — what DRAW_INDX/state actually reaches the CP
+during the menu? REX_DRAWLOG (main ring) and REX_SEGCP (route B) both during the NOTOKEN+CS-fix menu:
+- 60 draws via the main ring, 120 via route B — ALL `init=0x30088 numInd=3 prim=8` (the same degenerate
+  RECT_LIST as the intro), ZERO bound textures. The menu's REAL textured draws do NOT reach the CP.
+- ⇒ same COVERAGE PROBLEM as cont.11 (b22fe28): the title builds its real draws in its CUSTOM deferred
+  command-buffer pool (device+13568, growing ~0x88680/frame: PM4 interleaved with INLINE VERTEX floats +
+  0x8100xxxx segment-link descriptors; cont.11 REX_CHUNKCP linear-parse DESYNCED on it). They never reach the
+  main ring (only the 6 init kicks) or the route-B segment scan. The CP's existing SET_CONSTANT(0x4000 ALU /
+  0x4800 fetch+tex) + DRAW_INDX plumbing is ready, but it has no real draw to translate.
+- So the draw-state translator cannot START until the real draws reach the CP. PREREQUISITE options:
+  (A) crack the title's deferred cmd-buffer format (device+13568) and execute its chunks correctly (follow the
+      segment links / the 0x38/0x79 ops, skip the inline-vertex regions) — the direct path to the real draws,
+      cont.11's "full cmd-buffer enumeration (hard)";
+  (B) intercept the title's draw-RECORD function (where it emits a DRAW_INDX into its cmd-buffer with the GPU
+      regs live) and translate at the source — bypasses the cmd-buffer format but needs to find that fn;
+  (C) drive the title's own flush sub_821C6D58 to push the built IBs to the ring (route A — but cont.11 showed
+      the title is NOT fence-gated, so this premise is weak).
+  (Separately, the menu still SIGSEGVs ~33s — a stability blocker, but device+13568 grows regardless, so the
+  draws ARE being built; the blocker is extraction, not the crash.)
+- ⇒ The renderer's true first step is the deferred-cmd-buffer extraction (A or B), not the Vulkan translation
+  (which is plumbed + the shaders are ported). This is the cont.11-unresolved hard RE, now scoped to the menu.
