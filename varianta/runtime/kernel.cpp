@@ -1081,6 +1081,13 @@ static void InitGpuRegisters() {
 // cpu = the logical processor to deliver on (prod's DispatchInterruptCallback sets the active CPU before
 // invoking; vblank is delivered on cpu 2). The callback reads it from KPCR+0x10C (+268).
 static void FireGfxInterrupt(uint32_t cb, uint32_t source, uint32_t cpu = 2) {
+    // STOPGAP: the source=1 (command-buffer-complete) handler sub_821C7170 dereferences the device's active
+    // completion object at *(interruptData+10900) and clears the firing CPU's ack bit in *(obj+0). The title
+    // sets that field per submission (sub_821C73D8) and leaves it the sentinel 0xFFFFFFFF between submissions.
+    // Variant A's stub CP re-runs the ring from the VblankPump, so it can fire this completion interrupt when
+    // no completion is pending -> a wild deref of 0xFFFFFFFF -> SIGSEGV. Skip the spurious interrupt then
+    // (there is nothing to acknowledge). [stopgap — like the fence-forward; a real CP would track completions.]
+    if (source == 1 && g_interruptData && GLD32(g_interruptData + 10900) == 0xFFFFFFFFu) return;
     PPCContext ctx{};
     ctx.fpscr.csr = 0x1F80;              // default MXCSR: all FP exceptions masked
     ctx.r1.u64 = g_pumpStack - 0x200;

@@ -1905,3 +1905,26 @@ r4=tag 0x4E574D20; li r5,0; b ExAllocatePoolTypeWithTag` ⇒ ABI r3=NumberOfByte
 - ⇒ ExAllocatePoolTypeWithTag was a FUNDAMENTAL missing primitive — implementing it unblocks ALL menu pool
   allocations at once (cluster item 1 RESOLVED). NEXT = the new crash at sub_82368028 (cluster items 2/3: the
   missing jump table sub_82367B88 and/or the gfx-interrupt null-vtable sub_821C7170).
+
+### cont.12 (c3) — past the pool fix the menu hits a NOTOKEN+stub-CP concurrency swamp (gfx-interrupt + string-as-code corruption)
+With the pool allocator unblocking the menu, the next crashes are RACE-DEPENDENT under NOTOKEN (the host
+VblankPump CP thread fires GPU interrupts / re-runs the ring concurrently with the menu's GPU-setup thread):
+- **gfx-interrupt crash (sub_821C7170, recurs on the VblankPump thread):** our CP, on a menu PM4_INTERRUPT
+  (op 0x54), calls FireGfxInterrupt(source=1). The source=1 (command-buffer-complete) handler sub_821C7170
+  derefs the device's active completion object at *(device+10900) and clears the firing CPU's ack bit. The
+  title sets that field per submission (sub_821C73D8) and leaves it the sentinel 0xFFFFFFFF between
+  submissions; variant A's CP fires the interrupt when none is pending → deref of 0xFFFFFFFF (last byte of
+  the 4 GiB map) → SIGSEGV. STOPGAP guard added in FireGfxInterrupt: skip source=1 when *(device+10900)==
+  0xFFFFFFFF (nothing to acknowledge). Default boot unregressed; the gfx-interrupt crash is gone.
+- BUT the title still dies ~32s at a DIFFERENT spot: an INDIRECT-NULL cascade at lr=0x82204D08 whose targets
+  are ASCII PATH FRAGMENTS (0x67616D65="game", 0x41737365="Asse", 0x74735C47="ts\G") — sub_82204xxx is
+  executing a path STRING as a function/vtable table = downstream corruption (same class as the earlier
+  sub_825AB garbage). The menu's state is inconsistent: a buffer that should hold pointers holds a path string.
+- ⇒ Past the (clean) pool-allocator win, the menu bring-up is a CLUSTER of variant-A-specific concurrency +
+  uninitialised-object issues: (a) NOTOKEN guest-thread races; (b) the VblankPump host CP firing GPU
+  interrupts / re-running the ring asynchronously vs the guest's GPU submission; (c) string-as-code
+  corruption from incomplete menu state; (d) the still-missing jump table sub_82367B88. This is the
+  renderer / CP-concurrency boundary — fixing crashes one-by-one under NOTOKEN races is whack-a-mole; the
+  structural fix is a properly-synchronised CP (the renderer work). The pool allocator + gfx-interrupt guard
+  are committed correct stopgaps that advanced the menu to loading its shaders; the rest needs the CP/render
+  architecture. Diag REX_INDDUMP; run REX_NOTOKEN=1 REX_CSLEAK=1.
