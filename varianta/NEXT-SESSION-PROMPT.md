@@ -16,10 +16,26 @@
 - ЗАКОММИЧЕНО (default-safe, НЕ пушено): 2 NOTOKEN-фикса + удаление BlockFenceYield. ЗАПУСК конкурентности:
   `REX_NOTOKEN=1 ./runtime/out/sp_td_varianta ../private/extracted/default.xex` (⚠ NOTOKEN ≠ FAIRSCHED:
   взаимоисключающие; под NOTOKEN sub_821B9270-спины жгут ядро вместо token-yield, безвредно но расточительно).
-- СЛЕДУЮЩЕЕ (глубокий title-RE — выбор за USER): (a) почему декодер-потоки висят на object-wait под NOTOKEN
-  (какой вход/сигнал demux-feed/buffer-ready/4-thread-handshake ждут, что variant A не постит); (b) что ждёт
-  новый блокер tid=10 sub_82435C48 (глубокий гейт перехода); (c) держать рендерер на REX_XFLAG-форс-переходе
-  (дойти до меню для реальных draw'ов), а планировщик/фильм — отдельным треком.
+- ✅**НАПРАВЛЕНИЕ (b) ПРОЙДЕНО (USER выбрал, commit 8b82515):** tid=10-блокер sub_82435C48 РАСШИФРОВАН — это
+  ДЕДЛОК на ОСИРОТЕВШЕЙ критической секции 0x82818628. gdb: tid=10 висит в RtlEnterCriticalSection (guest-CS, не
+  spin); host recursive_mutex.__owner = УЖЕ ВЫШЕДШИЙ LWP. REX_CSLEAK-диаг назвал виновника: GPU/video-init поток
+  **sub_8242B4A8** выходит, держа CS 0x82818628 (его RtlLeaveCriticalSection-ветка пропущена — fence-forward
+  стопгап не воспроизводит настоящую GPU-последовательность). Под кооп-токеном не всплывает (сериализация); под
+  NOTOKEN — дедлок. ФИКС (NOTOKEN-gated, default-safe): при выходе guest-потока освобождать удерживаемые CS.
+  РЕЗУЛЬТАТ: tid=10 разблокирован → тайтл **ВЫХОДИТ ИЗ ИНТРО в menu/frontend-setup** (грузит
+  Global/Textures/Global.bin, аллоцирует menu-буферы) — РЕАЛЬНЫЙ ПРОГРЕСС — затем КАСКАД [INDIRECT-NULL]
+  (нулевые vtable/jump-table слоты, вкл. CP/render-диапазон 0x821BF834/0x821C71A4) → SIGSEGV ~34с. ⭐СХОДИТСЯ с
+  форс-путём REX_XFLAG: ОБА упираются в одни menu-setup INDIRECT-NULL блокеры (0x82292D08/0x8236859C/sub_8215DE84);
+  новые GPU-range INDIRECT-NULL ⇒ меню ПЫТАЕТСЯ РЕНДЕРИТЬ через GPU-vtable'ы, которых нет (нет настоящего CP) ⇒
+  **РЕНДЕРЕР = блокер живого меню**. (sub_8210AF90 всё ещё НЕ срабатывает — выход из интро идёт другим путём.)
+  Диаг REX_CSLEAK (gated). ⚠ NOTOKEN ≠ FAIRSCHED.
+- **СЛЕДУЮЩЕЕ (b+c СОШЛИСЬ → РЕНДЕРЕР):** расшить INDIRECT-NULL screen/GPU-vtable'ы (sub_8215DE84 / 0x82292D08 /
+  0x8236859C / 0x821BF834 / 0x821C71A4) чтобы меню строило реальные текстур-PM4-draw'ы → транслятор draw-state
+  получит контент. Это рендерер (RENDERER-PHASE-PLAN), теперь ДОСТИЖИМЫЙ ЕСТЕСТВЕННО через NOTOKEN+CS-фикс (без
+  REX_XFLAG). Запуск: `REX_NOTOKEN=1 ./runtime/out/sp_td_varianta ../private/extracted/default.xex` → доходит до
+  menu-load+SIGSEGV ~34с. Прод-оракул (символы есть) для сравнения GPU-vtable-инициализации. Прочие хвосты: (a)
+  декодеры висят на object-wait под NOTOKEN (фильм); тупик sub_8242B4A8 (почему пропускает CS-release =
+  fence-forward стопгап) — оба упираются в настоящий CP.
 
 ———————————————————————————— (ниже — cont.11 статус) ————————————————————————————
 
