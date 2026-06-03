@@ -2257,3 +2257,14 @@ gdb dump of the per-submission completion object B = *(device+0x2A94), the descr
 - **variant A (B=0xA2011000), REX_INTLOG:** `B[0]=0 *(B+0x10)=0 *(B+0x14)=0` — **ENTIRELY ZERO**. B is allocated (device+10900 points to it) but NEVER populated.
 
 ⇒ variant A's completion object is a bare zero allocation; the title's render submission never writes {count, producer callback, render context} into it, because variant A's fence-forward stub GPU doesn't drive the faithful command-completion that triggers the population. This is exactly why cont.15's force-B+0x10 gave an empty work item — B+0x14 (the context) is also null. **The faithful-completion fix must populate B[0]/B+0x10/B+0x14 per completed segment** (callback=producer sub_821CC7A0, context=the segment's render work; format TBD — 0xddd10180 is an unusual handle / write-combined address, not a plain guest pointer). This is the precise remaining RE for the renderer. REX_INTLOG extended to dump B[0]/B+0x10/B+0x14.
+
+## cont.17 (2026-06-04, autonomous) — route-B DIRECT-INVOKE: producer fires with real ctx (6886×) but the consumer doesn't drain (process-context/event obstacle)
+
+REX_FINDCB located the deferred render program's producer-callback records {0001057C, 0x821CC7A0, ctx} (c11) — staging range = 2/frame, device+13568 chunk = 4 — with REAL per-record contexts **ctx=0xC0090180 / 0xC0117B00** (GPU-physical 0xC-window, analogous to prod's B+0x14=0xddd10180). So the records carry valid contexts; variant A queues but never invokes them.
+
+REX_INVOKECB (route-B direct-invoke): call `sub_821CC7A0(ctx)` for each staging record (bypassing the unpopulated/aliased completion object B). Result:
+- **The producer FIRED 6886× (22 distinct item-types) — up from 0.** Invoking the records with their real ctx DOES drive the producer to enqueue.
+- **BUT the consumer sub_821CC310 STILL didn't run ([consumer]=0)** — the producer's KeSetEvent didn't wake it. Likely a **process-context mismatch**: the producer enqueues into the per-process ring (base=*(0x8200098C)+procType·108+11328) for the CURRENT thread's procType (VdSwap's), while the consumer (tid=10) drains a DIFFERENT procType's ring — so the work + the event signal miss the consumer.
+- Crashes on the render-path INDIRECT-NULL 0xFFFFFFFF @ lr=0x821BF834.
+
+⇒ The producer can be driven directly with the records' real ctx, but the producer→consumer handoff fails on a process-context/event mismatch (+ a render-path null). **Next obstacle:** invoke the producer on the procType the consumer (tid=10) drains — read the *(0x8200098C)+procType·108 ring layout, match contexts — OR signal the consumer's wait directly. Diagnostics REX_FINDCB / REX_INVOKECB added (gated, default boot unregressed; INVOKECB crashes when used — a scaffold for the next session).

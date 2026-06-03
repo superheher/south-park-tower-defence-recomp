@@ -1954,6 +1954,56 @@ PPC_FUNC(__imp__VdSwap) {
         }
         s_segLast = cur;
     }
+    // cont.16 (REX_FINDCB): locate the deferred render program's producer-callback records {0001057C, 0x821CC7A0,
+    // ctx} (c11) — in the staging range vs the device+13568 chunk — so route-B direct-invoke knows where to scan.
+    if (getenv("REX_FINDCB")) {
+        static uint32_t s_fcbLast = 0;
+        uint32_t cur = ctx.r3.u32;
+        if (s_fcbLast && cur > s_fcbLast && (cur - s_fcbLast) < 0x200000u && cur >= 0xA0000000u) {
+            static std::atomic<bool> done{false}; bool e = false;
+            if (done.compare_exchange_strong(e, true)) {
+                int fStg = 0, fChk = 0;
+                for (uint32_t a = s_fcbLast; a + 12 <= cur; a += 4)
+                    if (GLD32(a) == 0x0001057Cu && GLD32(a + 4) == 0x821CC7A0u) {
+                        if (fStg < 8) fprintf(stderr, "[findcb] STAGING @0x%X ctx=0x%08X\n", a, GLD32(a + 8));
+                        fStg++;
+                    }
+                uint32_t dev = g_device.load(), cb = dev ? GLD32(dev + 13568) : 0;
+                if (cb >= 0xA0000000u) {
+                    uint32_t lo = cb > 0x180000u ? cb - 0x180000u : 0xA0000000u;
+                    for (uint32_t a = lo; a + 12 <= cb + 0x20000u; a += 4)
+                        if (GLD32(a) == 0x0001057Cu && GLD32(a + 4) == 0x821CC7A0u) {
+                            if (fChk < 8) fprintf(stderr, "[findcb] CHUNK @0x%X ctx=0x%08X\n", a, GLD32(a + 8));
+                            fChk++;
+                        }
+                }
+                fprintf(stderr, "[findcb] records: staging=%d chunk=%d (chunkbase=0x%08X)\n", fStg, fChk, cb);
+            }
+        }
+        s_fcbLast = cur;
+    }
+    // cont.16 (REX_INVOKECB): route-B direct-invoke — call the producer sub_821CC7A0(ctx) for each callback
+    // record {0001057C,821CC7A0,ctx} in this frame's staging range, bypassing the unpopulated/aliased completion
+    // object B. The producer enqueues ctx -> KeSetEvents the consumer sub_821CC310 (tid=10) -> issues the draw.
+    if (getenv("REX_INVOKECB")) {
+        static uint32_t s_icbLast = 0;
+        uint32_t cur = ctx.r3.u32;
+        if (s_icbLast && cur > s_icbLast && (cur - s_icbLast) < 0x200000u && cur >= 0xA0000000u) {
+            int inv = 0;
+            for (uint32_t a = s_icbLast; a + 12 <= cur && inv < 64; a += 4) {
+                if (GLD32(a) != 0x0001057Cu || GLD32(a + 4) != 0x821CC7A0u) continue;
+                PPCContext c{};
+                c.fpscr.csr = 0x1F80;
+                c.r1.u64 = ctx.r1.u64 - 0x800;   // borrow current guest stack below the VdSwap frame
+                c.r13.u64 = ctx.r13.u64;
+                c.r3.u64 = GLD32(a + 8);          // ctx = the record's per-callback context
+                CallGuest(0x821CC7A0u, c);
+                inv++;
+            }
+            if (g_ktrace && inv) fprintf(stderr, "[invokecb] invoked %d producer callbacks (range 0x%X)\n", inv, cur - s_icbLast);
+        }
+        s_icbLast = cur;
+    }
     // Renderer part 1 (chunk-CP, route B v2, REX_CHUNKCP=1): the REAL command stream is NOT the r3 staging
     // buffer (0xA01xxxxx) but a pool of command-buffer chunks at 0xA04D-0xA056xxxx tracked in the device
     // struct (records {base, writeptr, 0x1080, base+4, 0, device}). device+13568=current-chunk base,
