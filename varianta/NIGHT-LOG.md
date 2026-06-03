@@ -1928,3 +1928,28 @@ VblankPump CP thread fires GPU interrupts / re-runs the ring concurrently with t
   structural fix is a properly-synchronised CP (the renderer work). The pool allocator + gfx-interrupt guard
   are committed correct stopgaps that advanced the menu to loading its shaders; the rest needs the CP/render
   architecture. Diag REX_INDDUMP; run REX_NOTOKEN=1 REX_CSLEAK=1.
+
+### cont.12 (c4) — CP synchronization (g_gpuMutex) fixes the pump-races-guest crash; the menu now reaches its RENDER code = the renderer boundary
+USER picked the structural fix (synchronize the CP). ROOT of the race class: the VblankPump is a HOST thread
+that runs ExecuteRing + the gfx-interrupt CALLBACK (guest code); under the cooperative token it is serialized
+with the guest, but under NOTOKEN the pump's `if(g_fair)…else if(g_coop)…` acquires NOTHING -> it races every
+guest thread.
+- FIX (g_gpuMutex, NOTOKEN-only, default path untouched): the pump holds g_gpuMutex over its ExecuteRing +
+  FireGfxInterrupt batch; the guest's GPU-boundary functions hold it too — the ring kick sub_821C6600 and the
+  completion-object setup sub_821C73D8 (which writes the device+10900 the source=1 handler derefs). This
+  serializes the host pump with the guest GPU submission WITHOUT a global run-token (decoders/menu logic stay
+  concurrent; recursive mutex for callback re-entry). No deadlock; default boot UNREGRESSED.
+- RESULT: the gfx-interrupt crash (sub_821C7170, pump-races-guest) is GONE from the cascade. The title
+  progresses INTO its render code and now SIGSEGVs ~33s on INDIRECT-NULLs in the 0x821Bxxxx/0x821Cxxxx GPU/CP
+  region whose targets are FLOAT values (0x43A04000=320.5f, 0x421A0000=38.5f, 0x3E340000=0.176f) — i.e. the
+  title's render code is reading VERTEX / render-state data as function pointers, because variant A's stub CP
+  maintains no real GPU draw-state.
+- ⇒ ⭐ THE MENU HAS REACHED THE RENDERER BOUNDARY. The chain of this session's fixes drove it there naturally
+  (no REX_XFLAG): pool allocator -> the singleton constructs -> the menu loads its shaders/textures; CP-sync
+  -> the pump no longer races the guest -> the menu reaches its actual RENDERING; and rendering needs the real
+  GPU draw-state that only a PM4->Vulkan renderer maintains. This UNIFIES with cont.11: the renderer
+  (draw-state translator: vfetch reg0x4800 -> vertex buffers + layout, ALU reg0x4000 -> uniforms, textures,
+  RT/viewport; + the 19 .updb shaders -> SPIR-V; vkCmdDraw into the swapchain the render thread owns) is THE
+  remaining work — now reachable through the NATURAL menu (pool + CS-fix + NOTOKEN + CP-sync), not the forced
+  REX_XFLAG path. Committed correct stopgaps this session: pool allocator (724c104), gfx-interrupt guard +
+  g_gpuMutex CP-sync. Run: REX_NOTOKEN=1 REX_CSLEAK=1 -> menu (shaders) -> render-code SIGSEGV ~33s.

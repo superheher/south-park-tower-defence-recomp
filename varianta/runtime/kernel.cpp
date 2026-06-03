@@ -1053,6 +1053,16 @@ std::atomic<bool> g_vblankRunning{false};
 uint32_t g_pumpKpcr = 0, g_pumpStack = 0;
 std::atomic<uint32_t> g_vblankCount{0};
 
+// CP synchronization (REX_NOTOKEN). The VblankPump is a HOST thread that runs ExecuteRing + the graphics-
+// interrupt callback as GUEST code. Under the cooperative token that is serialized with the guest; under
+// NOTOKEN the pump holds NO lock and races the guest's GPU submission/state — the source of the menu's
+// gfx-interrupt + completion-object crashes (sub_821C7170 deref of a half-set device field, etc.). g_gpuMutex
+// serializes the pump's CP+interrupt work with the guest's GPU-boundary functions (the ring kick sub_821C6600
+// and the completion-object setup sub_821C73D8, which writes device+10900) WITHOUT a global run-token, so the
+// decoders / menu logic stay concurrent. Recursive: the pump's callback may re-enter a hooked GPU fn.
+std::recursive_mutex g_gpuMutex;
+struct GpuLock { bool on; GpuLock() : on(g_preempt) { if (on) g_gpuMutex.lock(); } ~GpuLock() { if (on) g_gpuMutex.unlock(); } };
+
 // Xbox 360 GPU register window is at guest 0x7FC80000 (reg index r -> 0x7FC80000 + r*4). The guest
 // kicks the ring buffer by writing the write index to CP_RB_WPTR (0x1C5); the GPU reports progress in
 // CP_RB_RPTR (0x1C4) and the title's RPtr write-back location. Ref: rexglue-sdk graphics_system.cpp.
@@ -1281,6 +1291,7 @@ void VblankPump() {
             fprintf(stderr, "[initdiag] g_tok next=%llu serving=%llu held=%d (churn=serving)\n",
                     (unsigned long long)g_tok.next_, (unsigned long long)g_tok.serving_, (int)g_tok.held_); }
         if (g_fair) g_tok.lock(); else if (g_coop) g_waitMutex.lock();
+        GpuLock _gl;   // NOTOKEN: serialize this CP+interrupt batch with the guest's GPU-boundary functions
         // Real command processor: the guest kicks by writing the ring write index to CP_RB_WPTR. Execute
         // the newly-submitted PM4 (lastWptr..wptr) — which recurses into the indirect buffers and applies
         // the EVENT_WRITE_SHD fences / INTERRUPT callbacks the render loop waits on — then advance RPtr to
@@ -1338,9 +1349,16 @@ PPC_FUNC(sub_821B9270)
 // the ring (advancing CP_RB_WPTR). Renderer route B needs the per-frame segment [addr,len] list; logging the
 // 6 init kicks reveals the descriptor->IB encoding (which we then read from the segment table per-frame).
 std::atomic<uint32_t> g_device{0};   // captured from the first ring-kick (device base, ~0x26F80)
+// sub_821C73D8 sets up the per-submission GPU-completion object at *(device+10900) — the field the pump's
+// source=1 gfx-interrupt handler (sub_821C7170) derefs. Serialize it with the pump under NOTOKEN so the pump
+// never reads device+10900 while the guest is writing it (the other half of the gfx-interrupt race fix).
+extern "C" PPC_FUNC(__imp__sub_821C73D8);
+PPC_FUNC(sub_821C73D8) { GpuLock _gl; __imp__sub_821C73D8(ctx, base); }
+
 extern "C" PPC_FUNC(__imp__sub_821C6600);
 PPC_FUNC(sub_821C6600)
 {
+    GpuLock _gl;   // NOTOKEN: serialize the ring kick with the pump's CP+interrupt batch
     uint32_t dev = ctx.r3.u32, desc = ctx.r4.u32;
     if (!g_device.load()) g_device.store(dev);
     uint32_t d0 = desc ? GLD32(desc + 0) : 0, d1 = desc ? GLD32(desc + 4) : 0;
