@@ -2046,3 +2046,46 @@ The conclusion is decisive and overturns Option A's premise.**
   INDIRECT-NULL-vtable recovery via the prod oracle the user endorsed earlier — now localized to the render path.
 - Diagnostics added (gated, default boot unregressed): `REX_CHUNKDUMP` = per-swap brute draw-scan of the active
   device+13568 chunk + one-time structured PM4 dump of the first draw-bearing chunk ([chunkscan]/[chunkdump]).
+
+## cont.12(c9) — render-path INDIRECT-NULL cluster mapped: it's a NOTOKEN RACE, plus one recompiler gap fixed
+
+Drilled into the render-path INDIRECT-NULL cluster (user picked "fix the render-path cluster"). REX_INDDUMP
+(dumps GPRs + vtable chain per distinct site) over several NOTOKEN menu runs. The cluster is **heterogeneous**,
+and crucially **the set varies run-to-run** — the smoking gun for a race.
+
+- **Site structures (recomp source):**
+  - `sub_821CC310` (owns lr=0x821CC4B0): a work-queue executor. `r31 = *(r3)` is a command/sync object —
+    spinlock at +0 (lwarx/stwcx CAS loop), ready-mask at +56, count at +60, **callback fn-ptr at +16**. It
+    fills fields (+0/+24/+28/+32/+36) then `bctrl *(r31+16)` with r3=r30. In variant A `*(r31+16)=0x43A04000`
+    = **320.0f** (a screen coord, not a code pointer).
+  - `sub_821B9270` (owns lr=0x821B925C): `bctrl r9` with a float arg (f1 = f13·f12·f0); r9 was loaded earlier
+    and in variant A = `0x421A0000` = **38.5f**.
+  - `sub_821BF834`: target `0x3E340000` = **0.176f**.
+  - `sub_82249C58`/`sub_82448B70`: target = garbage with `r31=0xFFFFFFFF` and `*(r31+4)=0xC0012D01` (a real
+    PM4 packet: type3 op0x2D SET_CONSTANT) — i.e. a command-buffer walk reading PM4 *data* as a fn-ptr.
+- **It's a RACE, not a deterministic missing-init.** Run A: float-vtable sites + crash ~33s. Run B: jump-table
+  + garbage sites. Run C (after the fix below): **only the benign 0x82292D08, segv=0, NO crash, ran the full
+  32s.** Same binary, same env — the set and the crash are non-deterministic. The specific float values
+  (320f/38.5f) are not random garbage: the render-command objects are **pooled/reused**, and under the
+  preemptive NOTOKEN scheduler the executor (sub_821CC310) sometimes runs **before the enqueuer finishes
+  constructing the object**, reading the previous occupant's **stale float data** at the +16 callback offset.
+  Classic use-before-init on a recycled pool slot. This unifies the scheduler tension: the cooperative single
+  token serializes (no race) but starves the VC-1 decoder; NOTOKEN feeds the decoder but races the render-
+  command construction. ⇒ the renderer needs a scheduler that does **both** (Step-1, real synchronization).
+- **One DETERMINISTIC site fixed (a genuine recompiler gap, not a race): `sub_82367BD8`.** `sub_82367B88` is a
+  12-way switch: `r12 = 0x82360000+31656 = 0x82367BA8 (table base); bctr *(table + r3*4)`. XenonAnalyse
+  mis-identified the table at 0x82367BA8 as CODE and decoded its 12 address-dwords as 12 `lwz r17,X(r22)`
+  instructions (the bogus "sub_82367BA8"), absorbing case-0's handler — which sits right after the table at
+  **0x82367BD8 = `li r3,0 ; blr`** — so it was never emitted as a callable function. Cases 1-11 (sub_82367BE0
+  /BE8/BF0/BFC/C08/C14/C20/C2C/C38/C44) WERE emitted; only case-0 was lost. Re-supplied it in PPCInvokeGuest
+  (small always-on switch, transcribed from the recomp's own decode): `case 0x82367BD8: ctx.r3.s64=0; return;`.
+  Verified: the 0x82367BD8 INDIRECT-NULL (4 call sites in the sub_82368xxx float-format chain) is gone; default
+  boot unregressed (VdSwap=6, segv=0, devOver=0). This is the reusable pattern for other recompiler jump-table
+  gaps (in-range, decodable, consistent target).
+- **Pivotal open question for next session:** does a verified RACE-FREE run actually build textured content
+  draws (textures bound) into device+13568? If yes → the render gate is purely the race → fix enqueuer/executor
+  synchronization (Step-1) and the structured device+13568 parse THEN has real content. If a clean run still
+  builds only rects → the divergence is deeper than the race. Answering it needs the structured device+13568
+  parse run on a confirmed-clean boot (the brute-scan can't see texture binds; CHUNKCP desyncs). So Option A
+  (the parse) is not dead — it is **gated on first getting a clean run**, which reframes the whole renderer:
+  step 1 = race-free scheduling, step 2 = parse device+13568 on a clean run to confirm/extract textured draws.

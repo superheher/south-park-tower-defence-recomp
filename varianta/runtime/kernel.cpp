@@ -77,6 +77,18 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
             return;
         }
     }
+    // Recompiler jump-table-gap recovery: XenonAnalyse misidentified some switch jump-tables as code and
+    // decoded the table dwords as instructions, absorbing the FIRST case handler (which sits immediately
+    // after the table) into that mis-decoded "function" so it was never emitted as its own callable entry.
+    // The dispatcher's `bctr jumptable[r3]` then lands on an unregistered in-range address -> INDIRECT-NULL.
+    // Re-supply those tiny handlers here, transcribed from the recomp's own decode of the absorbed bytes, so
+    // the dispatch resolves correctly. (Always-on: each target is otherwise a guaranteed INDIRECT-NULL; none
+    // is hit on the default cooperative boot, which never reaches these paths — so the default boot is
+    // unaffected.) sub_82367BD8 = `li r3,0 ; blr` — case 0 of sub_82367B88's 12-way switch (table at
+    // 0x82367BA8 was mis-decoded as sub_82367BA8); reached from 4 sites in the sub_82368xxx format chain.
+    switch (target) {
+        case 0x82367BD8u: ctx.r3.s64 = 0; return;   // li r3,0 ; blr
+    }
     if (trace) fprintf(stderr, "[b740] bctrl lr=0x%08X -> 0x%08X (NULL/unmapped, SKIPPED)\n", lr, target);
     if (g_inddump) {   // dump GPRs + the C++ vtable chain once per distinct null/unmapped call site
         static std::mutex dm; static std::unordered_set<uint32_t> dseen;
