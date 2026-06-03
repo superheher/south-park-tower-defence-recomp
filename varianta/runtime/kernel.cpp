@@ -43,8 +43,14 @@ uint32_t g_videoBufs[24]; uint32_t g_videoBufSz[24]; std::atomic<int> g_videoBuf
 // recompiled function — i.e. a jump-table case-label the recompiler emitted as a call (XenonAnalyse missed
 // the table). Log each distinct target once and continue (skip the call) so one run maps every missing
 // table target for batch recovery.
+// Race indicator for the pivotal "does a clean run build textured content?" experiment: every INDIRECT-NULL
+// except the one known-benign site (lr=0x82292D08, an always-null optional callback) is a render-path miss —
+// under preemptive NOTOKEN these are the use-before-init races on pooled render-command objects. A run with
+// g_nonBenignInd==0 is RACE-FREE; correlate that with whether device+13568 then carries textured draws.
+std::atomic<int> g_nonBenignInd{0};
 void PPCIndirectNull(uint32_t target, uint32_t lr)
 {
+    if (lr != 0x82292D08u) g_nonBenignInd.fetch_add(1, std::memory_order_relaxed);
     static std::mutex m;
     static std::unordered_set<uint32_t> seen;
     std::lock_guard<std::mutex> lk(m);
@@ -1885,43 +1891,55 @@ PPC_FUNC(__imp__VdSwap) {
             }
         }
     }
-    // Renderer (option A): STRUCTURED dump of the deferred cmd-buffer chunk to design the real parse — walk
-    // it as PM4 and print each packet (offset, raw, type/op/count), flagging draws / SET_CONSTANT / the
-    // title's custom seg-link ops, and STOP at the first non-PM4 dword (the desync point cont.11's linear
-    // ExecutePM4 hit). REX_CHUNKDUMP=N -> dump the active chunk at swap#N (default first menu swap >=80).
+    // PIVOTAL EXPERIMENT (REX_CHUNKDUMP): does a RACE-FREE run build TEXTURED draws? The device+13568 chunk is
+    // NOT inline PM4 — it's the title's SEGMENT DIRECTORY: records + segment descriptors {0x81LLLLLL, phys_addr}
+    // (LLLLLL = segment length in dwords) that point at the actual PM4 segments scattered across the cmd-buffer
+    // pool. (Brute-scanning the directory for op-0x22 headers gives FALSE POSITIVES — the 0xC134xxxx record
+    // words decode as op 0x22.) So FOLLOW the descriptors: resolve guest = 0xA0000000 | (addr & 0x1FFFFFFF),
+    // parse each segment as PM4, and count REAL draws (init != 0x30088 degenerate rect), rect draws,
+    // SET_CONSTANT, and texture-fetch constants (type-1 FETCH payload with a 0xA-range base). Report
+    // g_nonBenignInd (0 = race-free). Run several times: clean+realDraws/tex => the race is the whole gate;
+    // clean+rects-only across all segments => the divergence is deeper than the race.
     if (getenv("REX_CHUNKDUMP") && g_device.load()) {
         uint32_t dv = g_device.load(), base = GLD32(dv+13568), wptr = GLD32(dv+13572);
         bool valid = base >= 0xA0000000u && wptr > base && (wptr - base) < 0x100000u;
-        // Per-swap brute-scan: how many op-0x22/0x36 DRAW headers are in the active chunk (finds the menu).
-        int bruteDraws = 0;
-        if (valid) for (uint32_t a = base; a + 4 <= wptr; a += 4) {
-            uint32_t p = GLD32(a); if ((p>>30)==3) { uint32_t op=(p>>8)&0x7F; if (op==0x22||op==0x36) bruteDraws++; } }
+        struct Desc { uint32_t off, len, addr; }; Desc descs[128]; int nDesc = 0;
+        if (valid) for (uint32_t a = base; a + 8 <= wptr; a += 4) {
+            uint32_t d = GLD32(a);
+            if ((d >> 24) == 0x81u) { uint32_t len = d & 0xFFFFFF, addr = GLD32(a+4);
+                if (len > 0 && len < 0x8000 && (addr & 3) == 0 && nDesc < 128) descs[nDesc++] = { a-base, len, addr }; }
+        }
         static std::atomic<int> lastN{-1};
-        if (valid && bruteDraws > 0 && lastN.exchange(n) != (int)n)
-            fprintf(stderr, "[chunkscan] swap#%u base=0x%X len=0x%X brute-draws=%d\n", n, base, wptr-base, bruteDraws);
-        // Structured dump of the FIRST chunk that actually contains draws (the menu's real cmd-buffer).
+        if (valid && nDesc > 0 && lastN.exchange(n) != (int)n)
+            fprintf(stderr, "[chunkscan] swap#%u segDescs=%d nonBenignInd=%d %s\n",
+                    n, nDesc, g_nonBenignInd.load(), g_nonBenignInd.load()==0?"CLEAN":"RACED");
         static std::atomic<bool> cd{false}; bool ce=false;
-        if (valid && bruteDraws >= 1 && cd.compare_exchange_strong(ce, true)) {
-            fprintf(stderr, "[chunkdump] swap#%u base=0x%X wptr=0x%X len=0x%X brute-draws=%d\n", n, base, wptr, wptr-base, bruteDraws);
-            uint32_t a = base, end = wptr;
-            for (int i = 0; i < 1200 && a + 4 <= end; i++) {
-                uint32_t pkt = GLD32(a), type = pkt >> 30;
-                if (type == 3) {
-                    uint32_t op = (pkt>>8)&0x7F, cnt = ((pkt>>16)&0x3FFF)+1;
-                    const char* tag = (op==0x22||op==0x36)?" <==DRAW_INDX" : (op==0x2D||op==0x55)?" SET_CONSTANT"
-                                    : (op==0x38)?" <seg0x38?" : (op==0x79)?" <seg0x79?" : (op==0x3F||op==0x37)?" IB" : "";
-                    fprintf(stderr, "  +0x%05X %08X T3 op=0x%02X cnt=%u%s\n", a-base, pkt, op, cnt, tag);
-                    a += 4 + cnt*4;
-                } else if (type == 0) {
-                    uint32_t cnt = ((pkt>>16)&0x3FFF)+1, idx = pkt & 0x7FFF;
-                    fprintf(stderr, "  +0x%05X %08X T0 reg0x%X cnt=%u\n", a-base, pkt, idx, cnt);
-                    a += 4 + cnt*4;
-                } else if (type == 2) { a += 4; }   // T2 = NOP filler
-                else {   // type == 1: 2 reg writes — rare in real cmd-buffers, usually a misread inline float => desync
-                    fprintf(stderr, "  +0x%05X %08X T1 (2-reg-write / likely misread inline data => DESYNC)\n", a-base, pkt);
-                    a += 12;
+        if (valid && nDesc >= 10 && n >= 4000 && cd.compare_exchange_strong(ce, true)) {   // >=10 descs @ settled = a MENU frame
+            int totReal=0, totTex=0, totRect=0;
+            fprintf(stderr, "[chunkdump] swap#%u base=0x%X len=0x%X %s(ind=%d) segDescs=%d — FOLLOWING:\n",
+                    n, base, wptr-base, g_nonBenignInd.load()==0?"CLEAN":"RACED", g_nonBenignInd.load(), nDesc);
+            for (int di = 0; di < nDesc && di < 24; di++) {
+                uint32_t len = descs[di].len, addr = descs[di].addr, guest = 0xA0000000u | (addr & 0x1FFFFFFFu);
+                int dReal=0, dRect=0, setc=0, tex=0; uint32_t a = guest, end = guest + (len < 1024 ? len : 1024)*4;
+                bool mapped = guest >= 0xA0000000u;
+                for (int i = 0; mapped && i < 1024 && a + 4 <= end; ) {
+                    uint32_t pkt = GLD32(a);
+                    if ((pkt>>30) == 3) {
+                        uint32_t op=(pkt>>8)&0x7F, cnt=((pkt>>16)&0x3FFF)+1;
+                        if (op==0x22||op==0x36) { uint32_t init=GLD32(a+4); (init==0x30088u)?dRect++:dReal++; }
+                        else if (op==0x2D||op==0x55) { setc++; uint32_t ot=GLD32(a+4);
+                            if (((ot>>16)&0xFF)==1) for (uint32_t j=2;j<cnt&&a+j*4+4<=end;j++)
+                                if (((GLD32(a+j*4)>>12)&0xFFFFF)<<12 >= 0xA0000000u) { tex++; break; } }
+                        a += 4+cnt*4; i += 1+cnt;
+                    } else { a += 4; i += 1; }
                 }
+                totReal+=dReal; totRect+=dRect; totTex+=tex;
+                fprintf(stderr, "  desc#%d @+0x%05X {len=0x%X addr=0x%08X->0x%08X}: realDraws=%d rect=%d setConst=%d texFetch=%d  raw0=%08X %08X %08X\n",
+                        di, descs[di].off, len, addr, guest, dReal, dRect, setc, tex, GLD32(guest), GLD32(guest+4), GLD32(guest+8));
             }
+            fprintf(stderr, "[chunkdump] TOTALS over %d segments: realDraws=%d rectDraws=%d texFetch=%d  => %s\n",
+                    nDesc<24?nDesc:24, totReal, totRect, totTex,
+                    (totReal>0||totTex>0) ? "*** TEXTURED/REAL CONTENT PRESENT ***" : "only rects / no textures");
         }
     }
     // One-time (settled frame): dump the device struct's segment-tracking region to find the flush queue /
