@@ -1823,3 +1823,35 @@ With REX_NOTOKEN booting, pursued WHY tid=10 (sub_8211B740) still never reaches 
 - NEXT: recover the INDIRECT-NULL screen/GPU vtables (sub_8215DE84 / 0x82292D08 / 0x8236859C / 0x821BF834 /
   0x821C71A4) so the menu builds real textured PM4 draws → the draw-state translator has content. This is the
   renderer (RENDERER-PHASE-PLAN), now reachable via the natural NOTOKEN path.
+
+### cont.12 (c) — INDIRECT-NULL menu/renderer recovery STARTED via the prod oracle (user-picked)
+With NOTOKEN+CS-fix reaching menu setup, classified the INDIRECT-NULL cascade with REX_INDDUMP (per distinct
+null call-site: dump GPRs + the C++ vtable chain), then read the CORRECT values from the prod oracle.
+
+INDIRECT-NULL site classification (REX_INDDUMP):
+- ROOT — lr=0x82292D08 in sub_82292CE0: a C++ VIRTUAL CALL on a NULL global singleton. The recomp does
+  `obj=*(r31+4); obj->vtable->method[1]()` with r31=0x827FD568 (a fixed image global). Dump: *(r31+4)=
+  *(0x827FD56C)=0 — the singleton is NEVER CONSTRUCTED in variant A → the virtual call targets null.
+- 4 sites (lr 0x8236859C / 0x823685D0 / 0x82368070 / 0x82368160) all target 0x82367BD8 = a MISSING JUMP
+  TABLE in sub_82367B88 (switch on r3=0..11; table base 0x82367BA8 [lis 0x8209<<16 + 0x7BA8], default
+  0x82367C50, case code starts 0x82367BD8). XenonAnalyse missed it and emitted the switch `bctr` as an
+  indirect call. It is one of the BOUNDARY-LIMITED cases — the 0x82367BA8 table DATA was mis-split into a
+  function sub_82367BA8 — so recovering it needs the function-boundary fix, not just a toml add.
+- 3 sites (sub_825ABxxx, target 0x0): registers hold ASCII path fragments + *(r3)=0xB4B4B4B4 (uninit fill)
+  = DOWNSTREAM corruption (a symptom of the incomplete menu state), not a root.
+
+PROD ORACLE (gdb prod; guest base FIXED at 0x100000000; at a recomp fn entry rsi=base [SysV ABI 2nd arg],
+r31=0x827FD568 const; symbols present, not stripped):
+- At sub_82292CE0: global 0x827FD56C = obj 0x45FE78B0 (a heap object), *obj = vtable 0x820948B0 (static, in
+  the image), vt[0]=0x8248E768, vt[1]=0x824927B8 (the method variant A wants). Prod caller path:
+  main → sub_82249970 → sub_82150770 → sub_82292CE0 (the frontend/menu setup). ⇒ variant A reaches the same
+  virtual call but with the singleton 0x827FD56C UNCONSTRUCTED — root confirmed via the oracle.
+- Constructor of the singleton: a hardware-watchpoint on host 0x182FD56C (= prod base + 0x827FD56C) is the
+  method (find the code that allocs obj 0x45FE78B0-class + sets vtable 0x820948B0 + stores it at 0x827FD56C);
+  first try via a stop()-callback failed (software fallback / arming-in-callback), retried top-level.
+Committed: REX_INDDUMP (7f901e9). Tooling: prod base=0x100000000, $rsi=base, r31 const; /tmp/prod_oracle.gdb
+(read object/vtable) + /tmp/prod_ctor2.gdb (watchpoint the constructor).
+NEXT: identify the singleton's constructor + why variant A skips it (an upstream menu-init divergence,
+likely the same fence-forward/GPU-init lineage), then recover so sub_82292CE0's virtual call succeeds and the
+menu builds real textured PM4 draws → the draw-state translator (the renderer). The jump table sub_82367B88
+is a separate boundary-limited recovery.
