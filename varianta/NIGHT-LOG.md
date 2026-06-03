@@ -1976,3 +1976,19 @@ during the menu? REX_DRAWLOG (main ring) and REX_SEGCP (route B) both during the
   draws ARE being built; the blocker is extraction, not the crash.)
 - ⇒ The renderer's true first step is the deferred-cmd-buffer extraction (A or B), not the Vulkan translation
   (which is plumbed + the shaders are ported). This is the cont.11-unresolved hard RE, now scoped to the menu.
+
+### cont.12 (c6) — draw-record interception (user-picked): finding the draw fn — random prod sampling too noisy
+USER picked: intercept the title's draw-record function (hook where it emits a DRAW_INDX, translate at the
+source, bypassing the deferred cmd-buffer format). Step 1 = find that function.
+- Tried RANDOM prod-thread sampling (gdb `thread apply all bt` ×3 during the menu): too noisy — the histogram
+  is dominated by BLOCKED threads in waits (workers sub_8230FA80/sub_8230E898, GPU-sync sub_821CC5D0/
+  sub_821BFF48, decoders sub_82339xxx, the trampoline sub_82450FD0) + the screen-loop (sub_82249678/970/AD0,
+  sub_82150970). A draw call is fast and was not caught; prod at the static menu draws infrequently.
+- NEXT (targeted, reliable): find the draw-record fn by INSTRUMENTING variant A's own cmd-buffer writes — the
+  title records DRAW_INDX_2 (op 0x36) packets into device+13568's current chunk; hook the cmd-buffer reserve/
+  write (the fn that advances *(device+13568+4) writeptr, cont.11-mapped) and log the guest LR when an op-0x36
+  header is written ⇒ the LR is inside the draw-record fn. Then read its accessible D3D state (vertex streams,
+  shader, textures, RT from the device object) and translate to vkCmdDraw. Alternative: a prod hardware
+  watchpoint on the cmd-buffer for an op-0x36 write (flaky here, as the 0x827FD56C watchpoints were). The
+  translator's Vulkan side (state-extraction reg-file, ported shaders, render-thread swapchain) is READY; the
+  whole remaining renderer work is this draw EXTRACTION + the per-draw-type Vulkan translation. Multi-session.
