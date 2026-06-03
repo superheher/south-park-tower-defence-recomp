@@ -28,6 +28,10 @@
 static const bool g_ktrace = []{ const char* e = getenv("REX_KTRACE"); return !e || e[0] != '0'; }();
 // REX_TRACEB740: trace sub_8211B740's indirect calls (transitions-init divergence RE).
 static const bool g_traceB740 = getenv("REX_TRACEB740") != nullptr;
+// REX_INDDUMP: at each DISTINCT null/unmapped indirect-call site, dump the GPRs + the C++ vtable chain
+// (object *(r31+4) / *(r3) / *(*(r3)+N)) once, to RE which slot is null (object vs vtable vs method) for
+// the menu/frontend INDIRECT-NULL recovery (cont.12(b)). Prod oracle gives the correct values.
+static const bool g_inddump = getenv("REX_INDDUMP") != nullptr;
 #define KTRACE(...) do { if (g_ktrace) { fprintf(stderr, "[kernel] " __VA_ARGS__); } } while (0)
 // Renderer (decoded-frame shortcut): the VC-1 video decoder allocates its frame-pool buffers from a single
 // site (LR 0x8244DD2C). Each FRAME is 3 separate allocations in order: Y plane (req 0x101440, pitch 1344,
@@ -74,6 +78,18 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
         }
     }
     if (trace) fprintf(stderr, "[b740] bctrl lr=0x%08X -> 0x%08X (NULL/unmapped, SKIPPED)\n", lr, target);
+    if (g_inddump) {   // dump GPRs + the C++ vtable chain once per distinct null/unmapped call site
+        static std::mutex dm; static std::unordered_set<uint32_t> dseen;
+        std::lock_guard<std::mutex> dlk(dm);
+        if (dseen.insert(lr).second) {
+            auto rd = [&](uint32_t a){ uint32_t b; memcpy(&b, base + a, 4); return __builtin_bswap32(b); };
+            uint32_t r3 = ctx.r3.u32, r31 = ctx.r31.u32, obj = rd(r31 + 4);
+            fprintf(stderr, "[inddump] lr=0x%08X tgt=0x%08X | r3=0x%08X r10=0x%08X r11=0x%08X r30=0x%08X r31=0x%08X | "
+                    "*(r31+4)=0x%08X *(r3)=0x%08X *(*r3+0)=0x%08X *(*r3+4)=0x%08X *(obj)=0x%08X *(obj+0)=0x%08X\n",
+                    lr, target, r3, ctx.r10.u32, ctx.r11.u32, ctx.r30.u32, r31,
+                    obj, rd(r3), rd(rd(r3) + 0), rd(rd(r3) + 4), (obj ? rd(obj) : 0), (obj ? rd(rd(obj)) : 0));
+        }
+    }
     PPCIndirectNull(target, lr);
 }
 
