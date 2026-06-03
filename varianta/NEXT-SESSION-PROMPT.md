@@ -36,8 +36,16 @@
   (downstream-симптом). **Prod-оракул** (база ФИКС 0x100000000, $rsi=base на входе fn, r31=const): sub_82292CE0 →
   obj=0x45FE78B0, vtable=0x820948B0, vt[1]=0x824927B8; prod-путь main→sub_82249970→sub_82150770→sub_82292CE0.
   Конструктор класса (статически): vtable 0x820948B0 ставит ТОЛЬКО sub_824883E0 ← sub_824898C0 ← getter
-  sub_8248F4C8 (кэш 0x82819358) ← sub_8248F988. ⭐varianta hit-check: getter ВЫЗВАН (1×), но конструктор
-  sub_824883E0 + sub_824898C0 — НИ РАЗУ (0×) ⇒ объект не строится (lazy-ветка getter'а пропускает конструкцию).
+  sub_8248F4C8 (кэш 0x82819358) ← sub_8248F988. ✅**КОРЕНЬ НАЙДЕН+ИСПРАВЛЕН (commit 724c104):** конструкция
+  валилась E_OUTOFMEMORY (0x8007000E) — цепочка getter→sub_82497720→sub_82497678→sub_824A5E50→sub_824A5DD0→
+  **ExAllocatePoolTypeWithTag**, а это (+ExAllocatePoolWithTag/ExFreePool) был СТАБ, возвращавший NULL → ВСЕ
+  пул-аллокации меню падали. РЕАЛИЗОВАЛ их (kernel.cpp, НЕ gated — реальный примитив: 16-байт bump над ≥8MiB
+  аренами из g_virtNext; ABI r3=size r4=tag r5=type). РЕЗУЛЬТАТ: синглтон СТРОИТСЯ (sub_824883E0 0→1), меню идёт
+  НАМНОГО ДАЛЬШЕ — грузит СВОИ РЕНДЕР-АССЕТЫ (шейдеры SPTextured/SPBackdropTextured.xbv/.xbp, текстуры
+  Global.bin/LipSyncTextures). Дефолт-бут НЕ регрессит ([stub] ExAllocatePoolType исчез). **Cluster item 1 РЕШЁН.**
+- ⚡**SIGSEGV СДВИНУЛСЯ ВПЕРЁД** (был sub_821C7170 gfx-interrupt): теперь **sub_82368028 ← sub_8233DFD0 ←
+  sub_8233E198** (ppc_recomp.52:24506, menu/UI регион у пропущенной jump-table sub_82367B88). = НОВЫЙ блокер
+  (cluster items 2/3). RE его следующим. Запуск: `REX_NOTOKEN=1 REX_CSLEAK=1 ...default.xex`.
 - ⭐⭐**МЕНЮ КИКАЕТ РЕАЛЬНУЮ GPU-РАБОТУ — РИНГ ОЖИЛ** (был WPTR=37 весь intro): SIGSEGV ~34с в стеке VblankPump→
   ExecuteRing(rptr=37)→ExecutePM4→ExecuteType3(op=0x54 EVENT_WRITE)→FireGfxInterrupt→**sub_821C7170**→
   PPC_STORE(r31+0) r31=garbage. Меню грузит Global/Meshes/Textures + эмитит PM4 EVENT_WRITE → fires gfx-interrupt
