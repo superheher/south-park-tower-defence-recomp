@@ -1373,6 +1373,28 @@ std::atomic<uint32_t> g_device{0};   // captured from the first ring-kick (devic
 extern "C" PPC_FUNC(__imp__sub_821C73D8);
 PPC_FUNC(sub_821C73D8) { GpuLock _gl; __imp__sub_821C73D8(ctx, base); }
 
+// REX_ENQLOG: characterize what the menu enqueues into its deferred render work-queue (cont.12 c11). sub_821CC7A0
+// is the PRODUCER — it stores work item r3 into a per-process ring buffer (base+procType*108+11328, count
+// +11412) and KeSetEvent's the consumer (sub_821CC310, which dequeues + calls *(item+16) to issue the draws).
+// Log each DISTINCT work-item vtable (= render-command TYPE) + the running total. If the menu enqueues only a
+// couple of rect types, the divergence is UPSTREAM — the menu render logic builds no textured-content items.
+extern "C" PPC_FUNC(__imp__sub_821CC7A0);
+PPC_FUNC(sub_821CC7A0) {
+    static const bool enqlog = getenv("REX_ENQLOG") != nullptr;
+    if (enqlog) {
+        static std::atomic<uint64_t> cnt{0}; uint64_t c = ++cnt;
+        uint32_t item = ctx.r3.u32, vt = item ? GLD32(item) : 0;
+        static std::mutex em; static std::unordered_set<uint32_t> vts;
+        std::lock_guard<std::mutex> lk(em);
+        if (vts.insert(vt).second)
+            fprintf(stderr, "[enq] #%llu NEW item-type: item=0x%X vtable=0x%X *(item+16)=0x%X (distinct=%zu)\n",
+                    (unsigned long long)c, item, vt, item ? GLD32(item+16) : 0, vts.size());
+        else if ((c % 4000) == 0)
+            fprintf(stderr, "[enq] count=%llu distinct-types=%zu\n", (unsigned long long)c, vts.size());
+    }
+    __imp__sub_821CC7A0(ctx, base);
+}
+
 extern "C" PPC_FUNC(__imp__sub_821C6600);
 PPC_FUNC(sub_821C6600)
 {
