@@ -1855,3 +1855,30 @@ NEXT: identify the singleton's constructor + why variant A skips it (an upstream
 likely the same fence-forward/GPU-init lineage), then recover so sub_82292CE0's virtual call succeeds and the
 menu builds real textured PM4 draws → the draw-state translator (the renderer). The jump table sub_82367B88
 is a separate boundary-limited recovery.
+
+### cont.12 (c, cont.) — singleton constructor chain found; the menu KICKS REAL GPU WORK (ring alive); SIGSEGV is a gfx-interrupt null-vtable
+Traced the 0x820948B0-class constructor STATICALLY (no flaky watchpoint): the vtable 0x820948B0 is set ONLY
+by sub_824883E0 (`lis 0x8209 + addi 0x48B0; stw r11,0(this)`), called only by the construct-wrapper
+sub_824898C0, called only by the lazy getter sub_8248F4C8 (allocs, constructs, caches the object at a DIFFERENT
+global 0x82819358 via `stw r31,-27816(r25)` r25=0x82820000; returns it), called only by sub_8248F988. So the
+0x827FD56C the virtual call reads is a SEPARATE reference (a manager at 0x827FD568 holding the object at +4),
+populated by a caller of the getter, not the getter's own cache.
+- ⭐ varianta hit-check (gdb, NOTOKEN+CS-fix, breakpoints on the chain): the getter sub_8248F4C8 IS reached
+  (1 hit) but the constructor sub_824883E0 AND the construct-wrapper sub_824898C0 are NEVER called (0 hits).
+  ⇒ in variant A the getter runs but its lazy-init branch SKIPS construction (or a different construct path
+  is never reached), so the 0x820948B0-class object is never built and 0x827FD56C stays null → the
+  sub_82292CE0 virtual call hits null. The recovery target = why the construction branch is skipped.
+- ⭐⭐ The ~34s SIGSEGV is NOT the null singleton directly — and it reveals a BIG step: under NOTOKEN+CS-fix the
+  menu loads real assets (Global/Textures + Global/Meshes/Global.bin) and **KICKS REAL GPU WORK — the main
+  ring is ALIVE** (was frozen at WPTR=37 the whole intro). The crash stack: VblankPump → ExecuteRing(rptr=37
+  wptr=...) → ExecutePM4 → ExecuteType3(op=0x54 EVENT_WRITE) → FireGfxInterrupt(cb,source=1) →
+  sub_821C7170 → `PPC_STORE_U32(r31+0,...)` with r31 GARBAGE → SIGSEGV. sub_821C7170 is itself an INDIRECT-NULL
+  site (0x821C71A4, target=0x003F8000 = a garbage method pointer in r10): the skipped indirect call leaves r31
+  garbage, so the next store faults. ⇒ a downstream null/garbage vtable in the graphics-interrupt callback path
+  the CP now exercises (because the menu emits PM4 EVENT_WRITE that fires the gfx interrupt).
+- NET: directions (b)+(c) have driven variant A from a frozen intro to a MENU that loads assets and emits real
+  GPU work — the renderer now has live PM4 to process. The remaining blockers are a cluster of uninitialised
+  menu/GPU objects (null singleton 0x827FD56C via skipped construction; the gfx-interrupt callback's garbage
+  vtable in sub_821C7170; the missing jump table sub_82367B88), all surfacing because variant A's menu/GPU
+  subsystem init diverges (the same lineage as the fence-forward stopgap / no real CP). Each is a concrete,
+  separately-recoverable target. Diag REX_INDDUMP + prod-oracle method (base 0x100000000, rsi=base, r31 const).

@@ -29,13 +29,31 @@
   новые GPU-range INDIRECT-NULL ⇒ меню ПЫТАЕТСЯ РЕНДЕРИТЬ через GPU-vtable'ы, которых нет (нет настоящего CP) ⇒
   **РЕНДЕРЕР = блокер живого меню**. (sub_8210AF90 всё ещё НЕ срабатывает — выход из интро идёт другим путём.)
   Диаг REX_CSLEAK (gated). ⚠ NOTOKEN ≠ FAIRSCHED.
-- **СЛЕДУЮЩЕЕ (b+c СОШЛИСЬ → РЕНДЕРЕР):** расшить INDIRECT-NULL screen/GPU-vtable'ы (sub_8215DE84 / 0x82292D08 /
-  0x8236859C / 0x821BF834 / 0x821C71A4) чтобы меню строило реальные текстур-PM4-draw'ы → транслятор draw-state
-  получит контент. Это рендерер (RENDERER-PHASE-PLAN), теперь ДОСТИЖИМЫЙ ЕСТЕСТВЕННО через NOTOKEN+CS-фикс (без
-  REX_XFLAG). Запуск: `REX_NOTOKEN=1 ./runtime/out/sp_td_varianta ../private/extracted/default.xex` → доходит до
-  menu-load+SIGSEGV ~34с. Прод-оракул (символы есть) для сравнения GPU-vtable-инициализации. Прочие хвосты: (a)
-  декодеры висят на object-wait под NOTOKEN (фильм); тупик sub_8242B4A8 (почему пропускает CS-release =
-  fence-forward стопгап) — оба упираются в настоящий CP.
+- ✅**INDIRECT-NULL recovery НАЧАТА через prod-оракул (USER выбрал, commits 7f901e9/65ec22a):** REX_INDDUMP
+  (дамп GPR+vtable-цепочки на null-сайтах) классифицировал каскад: (1)⭐КОРЕНЬ lr=0x82292D08 в sub_82292CE0 —
+  виртуальный вызов на **null-синглтоне** *(0x827FD56C)=0 (не сконструирован); (2) 4 сайта→0x82367BD8 =
+  пропущенная **boundary-limited** jump-table sub_82367B88 (таблица 0x82367BA8); (3) 3 сайта sub_825AB = мусор
+  (downstream-симптом). **Prod-оракул** (база ФИКС 0x100000000, $rsi=base на входе fn, r31=const): sub_82292CE0 →
+  obj=0x45FE78B0, vtable=0x820948B0, vt[1]=0x824927B8; prod-путь main→sub_82249970→sub_82150770→sub_82292CE0.
+  Конструктор класса (статически): vtable 0x820948B0 ставит ТОЛЬКО sub_824883E0 ← sub_824898C0 ← getter
+  sub_8248F4C8 (кэш 0x82819358) ← sub_8248F988. ⭐varianta hit-check: getter ВЫЗВАН (1×), но конструктор
+  sub_824883E0 + sub_824898C0 — НИ РАЗУ (0×) ⇒ объект не строится (lazy-ветка getter'а пропускает конструкцию).
+- ⭐⭐**МЕНЮ КИКАЕТ РЕАЛЬНУЮ GPU-РАБОТУ — РИНГ ОЖИЛ** (был WPTR=37 весь intro): SIGSEGV ~34с в стеке VblankPump→
+  ExecuteRing(rptr=37)→ExecutePM4→ExecuteType3(op=0x54 EVENT_WRITE)→FireGfxInterrupt→**sub_821C7170**→
+  PPC_STORE(r31+0) r31=garbage. Меню грузит Global/Meshes/Textures + эмитит PM4 EVENT_WRITE → fires gfx-interrupt
+  → колбэк sub_821C7170 (его же INDIRECT-NULL 0x821C71A4 target=0x003F8000 garbage пропущен → r31 garbage →
+  store крашит). ⇒ рендерер ТЕПЕРЬ имеет живой PM4; краш = downstream null-vtable в gfx-interrupt пути.
+- **СЛЕДУЮЩЕЕ (РЕНДЕРЕР, по приоритету):** кластер неинициализированных menu/GPU-объектов, каждый отдельно
+  восстановим: (1) почему getter sub_8248F4C8 пропускает конструкцию синглтона (lazy-ветка — сравнить с prod
+  hardware-watchpoint'ом на 0x182FD56C: gdb `watch` через stop()-колбэк падал на software, делать top-level;
+  ИЛИ найти кто пишет 0x827FD56C); (2) gfx-interrupt краш sub_821C7170 (garbage r10/r31 — INDIRECT-NULL
+  0x821C71A4 = ещё null-vtable; чинить FireGfxInterrupt контекст ИЛИ восстановить vtable); (3) jump-table
+  sub_82367B88 (boundary-limited, function-split фикс). Запуск: `REX_NOTOKEN=1 REX_CSLEAK=1 REX_INDDUMP=1
+  ./runtime/out/sp_td_varianta ../private/extracted/default.xex` → menu-load+SIGSEGV ~34с. Прод-оракул:
+  `cd out/build/linux-amd64-release; SDL_VIDEODRIVER=x11 LD_LIBRARY_PATH=. ./south_park_td
+  --game_data_root=.../private/extracted --user_data_root=.../private/userdata` (символы, base=0x100000000;
+  под gdb `handle SIGSEGV nostop noprint pass`). Tooling: /tmp/prod_oracle.gdb (read obj/vtable). Прочие
+  хвосты: (a) декодеры висят на object-wait под NOTOKEN (фильм); sub_8242B4A8 CS-skip — упираются в настоящий CP.
 
 ———————————————————————————— (ниже — cont.11 статус) ————————————————————————————
 
