@@ -2268,3 +2268,13 @@ REX_INVOKECB (route-B direct-invoke): call `sub_821CC7A0(ctx)` for each staging 
 - Crashes on the render-path INDIRECT-NULL 0xFFFFFFFF @ lr=0x821BF834.
 
 ⇒ The producer can be driven directly with the records' real ctx, but the producer→consumer handoff fails on a process-context/event mismatch (+ a render-path null). **Next obstacle:** invoke the producer on the procType the consumer (tid=10) drains — read the *(0x8200098C)+procType·108 ring layout, match contexts — OR signal the consumer's wait directly. Diagnostics REX_FINDCB / REX_INVOKECB added (gated, default boot unregressed; INVOKECB crashes when used — a scaffold for the next session).
+
+## cont.18 (2026-06-04, autonomous) — FIX PROGRESS: pump-context completion (REX_PUMPCB) WAKES the consumer (no crash); drain not yet sustained + no draws
+
+Building on cont.17 (route-B direct-invoke fired the producer 6886× from VdSwap's context but the consumer never drained + crashed at INDIRECT-NULL). REX_PUMPCB drives the same producer/consumer from the **PUMP context** (its procType matches the consumer's — cont.15 showed a pump-fired interrupt wakes the consumer): each vblank, scan the device+13568 chunk for callback records {0001057C,821CC7A0,ctx}, populate B{+0x10=0x821CC7A0,+0x14=ctx}, fire source=1.
+
+Result (NOTOKEN+CSLEAK menu run): [pumpcb] fired 764, **producer [enq]=17** (was 0), **consumer [consumer]=1** (was 0), **NO CRASH** (vs INVOKECB's crash — ran the full 40s). ⇒ firing on the pump context DID wake the consumer — confirms the cont.17 procType hypothesis (VdSwap's context was wrong, the pump's is right). BUT:
+- The consumer drained only **1×** (not sustained) despite 764 fires / 17 producer enqueues — the producer's repeated KeSetEvents don't re-wake it (event auto-reset semantics, the consumer doesn't re-loop, or tid=10 stalls after the first drain).
+- No textured draws (only the 1 init=0x30088 rect). (The [consumer] hook logs the queue-head sentinel handler=0, so it's unclear if the real dequeued item had a handler — but no draw was issued regardless.)
+
+⇒ Genuine incremental fix progress: the producer/consumer render pipeline now PARTIALLY flows from the pump context (producer fires, consumer wakes once, stable). **Remaining obstacles:** (a) sustain the consumer drain — RE the consumer's KeWait/event re-arming and why it drains 1 of N (read sub_821CC5D0's wait object + sub_821CC310's dequeue loop); (b) get a real draw — verify the ctx's render data / work-item handler is complete (it may itself depend on more of the title's submission running). Diagnostics REX_PUMPCB / REX_FINDCB / REX_INVOKECB (gated, default boot unregressed).

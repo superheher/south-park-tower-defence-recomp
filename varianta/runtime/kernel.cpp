@@ -1345,6 +1345,29 @@ void VblankPump() {
         GST32(GpuRegAddr(0x1951), 1);             // re-assert interrupt-status=vblank (prod ReadRegister)
         FireGfxInterrupt(cb, 0, /*cpu=*/2);       // vblank (prod delivers on cpu 2)
         if (consumed) FireGfxInterrupt(cb, 1, /*cpu=*/2);    // command-buffer complete
+        // REX_PUMPCB (cont.17 fix attempt): drive the render producer/consumer from the PUMP context (its
+        // procType matches the consumer's — cont.15 showed a pump-fired interrupt DOES wake the consumer).
+        // Scan the device cmd-buffer chunk for the callback records {0001057C,821CC7A0,ctx}; for each, populate
+        // the completion object B{+0x10=producer,+0x14=ctx} + fire source=1 -> sub_821C7170 -> producer(ctx)
+        // -> KeSetEvent -> consumer sub_821CC310 (tid=10) drains -> draw via *(item+16).
+        static const bool s_pumpcb = getenv("REX_PUMPCB") != nullptr;
+        if (s_pumpcb && cb && g_interruptData) {
+            uint32_t dev = g_interruptData;   // == device (g_device); declared earlier than g_device
+            uint32_t B = GLD32(g_interruptData + 10900);
+            uint32_t chunk = GLD32(dev + 13568);
+            if (B && B != 0xFFFFFFFFu && chunk >= 0xA0000000u) {
+                uint32_t lo = chunk > 0x180000u ? chunk - 0x180000u : 0xA0000000u;
+                int fired = 0;
+                for (uint32_t a = lo; a + 12 <= chunk + 0x20000u && fired < 16; a += 4) {
+                    if (GLD32(a) != 0x0001057Cu || GLD32(a + 4) != 0x821CC7A0u) continue;
+                    GST32(B + 0x10, 0x821CC7A0u);
+                    GST32(B + 0x14, GLD32(a + 8));
+                    FireGfxInterrupt(cb, 1, /*cpu=*/2);
+                    fired++;
+                }
+                if (g_ktrace && fired) fprintf(stderr, "[pumpcb] fired %d completion interrupts\n", fired);
+            }
+        }
         if (g_fair) g_tok.unlock(); else if (g_coop) g_waitMutex.unlock();
     }
 }
