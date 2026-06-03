@@ -66,6 +66,19 @@
   ALU reg0x4000→юниформы, текстуры, RT/viewport) + 19 .updb шейдеров→SPIR-V → vkCmdDraw в swapchain (рендер-тред владеет).
   Прочее (не на пути к рендереру): jump-table sub_82367B88 (boundary-limited), декодеры/фильм под NOTOKEN.
   Запуск: `REX_NOTOKEN=1 REX_CSLEAK=1 ...default.xex` → меню(шейдеры) → render-SIGSEGV ~33с. Диаг REX_INDDUMP.
+- ⚠**cont.12(c5): транслятор ЗАБЛОКИРОВАН на ВХОДЕ.** Проверка (REX_DRAWLOG главный ринг + REX_SEGCP route B во
+  время меню): до CP долетают ТОЛЬКО `init=0x30088 numInd=3 prim=8` rect'ы (60+120), 0 текстур — реальные draw'ы
+  меню НЕ доходят (та же coverage-проблема cont.11: они в custom deferred cmd-buffer пуле тайтла device+13568:
+  PM4+inline-вершины+0x8100xxxx сегмент-линки, растёт ~0x88680/кадр; REX_CHUNKCP linear-parse десинкается). Vulkan-
+  сторона ГОТОВА (CP извлекает state SET_CONSTANT→reg 0x4000 ALU/0x4800 fetch+tex; шейдеры портированы; рендер-тред
+  владеет swapchain) — нет ВХОДА. ⇒ настоящая работа рендерера = EXTRACTION draw'ов из deferred cmd-buffer'а.
+- ✅**USER выбрал: ИНТЕРЦЕПТ draw-record функции** (хукнуть fn тайтла, пишущую DRAW_INDX, транслировать в источнике,
+  обходя binary-формат). cont.12(c6): случайный prod-сэмплинг ШУМНЫЙ (поймал blocked-потоки+main-loop, не быструю
+  draw-fn). **NEXT (таргетированно): найти draw-record fn** инструментировав cmd-buffer записи variant A — тайтл
+  пишет DRAW_INDX_2 (op 0x36) в чанк device+13568; хукнуть cmd-buffer reserve/write (advance *(device+13568+4)
+  writeptr, cont.11-map) + лог guest-LR при записи op-0x36 header ⇒ LR внутри draw-fn. Затем прочитать её D3D-state
+  (верт.стримы/шейдер/текстуры/RT из device-объекта) → vkCmdDraw. Альт: hardware-watchpoint на cmd-buffer (flaky).
+  Остаток рендерера = эта draw-extraction + per-draw-type Vulkan-трансляция (multi-session).
 - ⭐⭐**МЕНЮ КИКАЕТ РЕАЛЬНУЮ GPU-РАБОТУ — РИНГ ОЖИЛ** (был WPTR=37 весь intro): SIGSEGV ~34с в стеке VblankPump→
   ExecuteRing(rptr=37)→ExecutePM4→ExecuteType3(op=0x54 EVENT_WRITE)→FireGfxInterrupt→**sub_821C7170**→
   PPC_STORE(r31+0) r31=garbage. Меню грузит Global/Meshes/Textures + эмитит PM4 EVENT_WRITE → fires gfx-interrupt
