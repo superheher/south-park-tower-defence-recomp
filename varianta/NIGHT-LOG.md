@@ -1882,3 +1882,26 @@ populated by a caller of the getter, not the getter's own cache.
   vtable in sub_821C7170; the missing jump table sub_82367B88), all surfacing because variant A's menu/GPU
   subsystem init diverges (the same lineage as the fence-forward stopgap / no real CP). Each is a concrete,
   separately-recoverable target. Diag REX_INDDUMP + prod-oracle method (base 0x100000000, rsi=base, r31 const).
+
+### cont.12 (c2) — ROOT of the menu null-singleton: ExAllocatePoolTypeWithTag was a NULL stub; implemented the kernel pool allocator
+Traced the singleton-construction failure all the way down (gdb FinishBreakpoints on the chain return values):
+getter sub_8248F4C8 (cache *(0x82819358)=0 ⇒ it DOES take the construct path, not the already-cached error
+path) → sub_82497720 (CS+refcount) → sub_82497678 → sub_824A5E50 (calls a static allocator object's vtable[0]
+sub_824A5DD0) → sub_824A5DD0 → **ExAllocatePoolTypeWithTag** → returned **0x8007000E (E_OUTOFMEMORY)**. Because
+ExAllocatePoolTypeWithTag / ExAllocatePoolWithTag / ExFreePool were weak stubs returning NULL, EVERY guest
+kernel-pool allocation failed → the singleton manager object was never built → 0x827FD56C stayed null → the
+menu virtual-called through it = the whole INDIRECT-NULL cascade + SIGSEGV. (sub_824A5DD0: `mr r3,r4; lis/ori
+r4=tag 0x4E574D20; li r5,0; b ExAllocatePoolTypeWithTag` ⇒ ABI r3=NumberOfBytes, r4=Tag, r5=PoolType.)
+- **FIX (kernel.cpp, NOT gated — a real kernel primitive):** implemented ExAllocatePoolTypeWithTag(size r3,
+  tag r4, type r5) + ExAllocatePoolWithTag (Xbox 360 2-arg, size-first) + ExFreePool (no-op leak) as a
+  fine-grained 16-byte-aligned bump allocator over >=8 MiB arenas carved from the guest VM cursor g_virtNext
+  (tracked in g_regions; every block is fresh demand-zero guest memory).
+- **RESULT:** the singleton constructor NOW RUNS (sub_824883E0 / sub_824898C0: 0→1 hits). The menu progresses
+  much further: it now loads its RENDERING ASSETS — **shaders SPBackdropTextured.xbp / SpTextured.xbv+.xbp,
+  textures LipSyncTextures.bin / Global.bin** (the frontend setting up its draw pipeline). The SIGSEGV MOVED
+  FORWARD: was sub_821C7170 (gfx-interrupt) → now sub_82368028 ← sub_8233DFD0 ← sub_8233E198 (the menu/UI
+  region near the still-missing jump table sub_82367B88). Default cooperative boot UNREGRESSED (ALIVE, VdSwap,
+  0 device-overwrite, 0 segv; the [stub] ExAllocatePoolType line is gone — the override is live).
+- ⇒ ExAllocatePoolTypeWithTag was a FUNDAMENTAL missing primitive — implementing it unblocks ALL menu pool
+  allocations at once (cluster item 1 RESOLVED). NEXT = the new crash at sub_82368028 (cluster items 2/3: the
+  missing jump table sub_82367B88 and/or the gfx-interrupt null-vtable sub_821C7170).

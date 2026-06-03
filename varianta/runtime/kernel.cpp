@@ -184,6 +184,38 @@ PPC_FUNC(__imp__NtAllocateVirtualMemory)
     ctx.r3.u64 = kStatusSuccess;
 }
 
+// ---- Kernel pool allocator: ExAllocatePoolTypeWithTag / ExAllocatePoolWithTag / ExFreePool -----------
+// The default weak stubs return NULL, so EVERY guest pool allocation fails with E_OUTOFMEMORY. That is
+// fatal for the menu/frontend: e.g. its singleton-manager construction (getter sub_8248F4C8 -> sub_82497720
+// -> sub_82497678 -> sub_824A5E50 -> sub_824A5DD0 -> ExAllocatePoolTypeWithTag) returned 0x8007000E, so the
+// manager object was never built; the menu then virtual-calls through its null pointer (sub_82292CE0) =>
+// the INDIRECT-NULL cascade + SIGSEGV (cont.12(c)). Implement a real pool: a fine-grained bump allocator
+// over arenas carved from the guest VM bump cursor. The title rarely frees pool during a session, so
+// ExFreePool is a no-op leak (acceptable for bring-up); every block is fresh demand-zero guest memory.
+namespace {
+std::mutex g_poolMutex;
+uint32_t g_poolCur = 0, g_poolEnd = 0;
+uint32_t PoolAlloc(uint32_t size) {
+    if (!size) return 0;
+    std::lock_guard<std::mutex> lk(g_poolMutex);
+    size = RoundUp(size, 16);
+    if (g_poolCur == 0 || g_poolCur + size > g_poolEnd) {        // carve a new arena from the guest VM
+        uint32_t arena = RoundUp(size > 0x800000u ? size : 0x800000u, 0x10000);   // >= 8 MiB
+        std::lock_guard<std::mutex> mk(g_memMutex);
+        g_virtNext = RoundUp(g_virtNext, 0x10000);
+        g_poolCur = g_virtNext; g_poolEnd = g_virtNext + arena; g_virtNext += arena;
+        g_regions[g_poolCur] = VRegion{arena, true, true, kPageReadWrite};
+    }
+    uint32_t p = g_poolCur; g_poolCur += size; return p;
+}
+} // namespace
+// PVOID ExAllocatePoolTypeWithTag(SIZE_T NumberOfBytes r3, ULONG Tag r4, ULONG PoolType r5)
+PPC_FUNC(__imp__ExAllocatePoolTypeWithTag) { ctx.r3.u64 = PoolAlloc(ctx.r3.u32); }
+// PVOID ExAllocatePoolWithTag(SIZE_T NumberOfBytes r3, ULONG Tag r4)  — Xbox 360 2-arg form (size first)
+PPC_FUNC(__imp__ExAllocatePoolWithTag)     { ctx.r3.u64 = PoolAlloc(ctx.r3.u32); }
+// void ExFreePool(PVOID Block r3) — bump allocator leaks; nothing to do
+PPC_FUNC(__imp__ExFreePool)                { ctx.r3.u64 = 0; }
+
 // NTSTATUS NtQueryVirtualMemory(BaseAddress r3, *MEMORY_BASIC_INFORMATION r4, RegionType r5)
 PPC_FUNC(__imp__NtQueryVirtualMemory)
 {
