@@ -2015,3 +2015,34 @@ gets the texture SET_CONSTANT, so it can't reconstruct sprites.
 - The CP/Vulkan side is ready (SET_CONSTANT→reg-file extraction, ported shaders, render-thread swapchain). The
   whole remaining renderer = this structured deferred-cmd-buffer parse → feed the real DRAW_INDX+state to the
   existing CP draw path → translate to vkCmdDraw. Multi-session, but now the approach is unambiguous.
+
+## cont.12(c8) — Option A is MOOT: the title builds NO real draws; render-path INDIRECT-NULL is the real gate
+
+**Ran the structured device+13568 chunk dump (REX_CHUNKDUMP) + a per-swap brute draw-scan over a full menu run.
+The conclusion is decisive and overturns Option A's premise.**
+
+- **device+13568 chunks hold only 1–3 draws each (max 16), and they are ALL degenerate rects.** Per-swap brute
+  histogram over 14,460 swaps: 2943 chunks×1 draw, 2008×2, 1143×3, 165×4, 142×6, 164×7, 164×16 — never the
+  dozens/hundreds a real menu needs. The structured dump of a draw-bearing chunk = a few init packets (op 0x02
+  cnt10, T0 reg0x168/0x2D0 writes) then ZEROS to the end. The chunk is barely filled.
+- **Three independent draw-scans converge:** route-B SEGCP = 120 [draw], ALL `init=0x30088 numInd=3 prim=8`,
+  **0 textures bound**; ring/CP path = 60 [draw], ALL `init=0x30088` rect, **0 textures**; chunk brute-scan =
+  rects only. variant A builds ONLY untextured degenerate rects, in BOTH intro AND menu. **There is nothing to
+  extract** — Option A (crack device+13568) cannot produce textured draws that the title never builds.
+- **Root cause = render-path INDIRECT-NULL on uninitialized objects.** The last non-spam lines before the ~33s
+  segv are indirect calls whose targets are FLOATS read out of an object's vtable slot:
+  `target=0x3E340000 (0.176f) @ lr=0x821BF834`, `target=0x43A04000 (320.0f) @ lr=0x821CC4B0`,
+  `target=0x421A0000 (38.5f) @ lr=0x821B925C`, plus `target=0x82367BD8 @ lr=0x8236859C` (a real code addr —
+  near-miss / unregistered). The caller sites **`sub_821BFF48` and `sub_821CC5D0` are in the prod oracle's
+  recurring render-function set** (sub_82450FD0×30, sub_8230FA80/E898/E7D8×9, sub_82150970, sub_821CC5D0,
+  sub_821BFF48, sub_821B9270…). So these ARE the draw path; in variant A their state objects are uninitialized
+  (vtable field = float data) → the indirect dispatch fails → the title SKIPS the textured content draws
+  (emitting only the clear/background rects) and then crashes ~33s. SAME class as the singleton-ctor bug fixed
+  earlier this session (uninit object → null/garbage vtable → INDIRECT-NULL).
+- **⇒ The renderer's real prerequisite is NOT cmd-buffer extraction but fixing the render-path uninitialized-
+  object cluster** (`sub_821BFF48` / `sub_821CC5D0` / `sub_821B9270` / `sub_8236859C` callers) so the indirect
+  calls dispatch, the title runs its content-draw code, and real textured DRAW_INDX_2 + SET_CONSTANT(0x4800)
+  state finally appears in the cmd-buffer. THEN extraction has something to render. This is exactly the
+  INDIRECT-NULL-vtable recovery via the prod oracle the user endorsed earlier — now localized to the render path.
+- Diagnostics added (gated, default boot unregressed): `REX_CHUNKDUMP` = per-swap brute draw-scan of the active
+  device+13568 chunk + one-time structured PM4 dump of the first draw-bearing chunk ([chunkscan]/[chunkdump]).

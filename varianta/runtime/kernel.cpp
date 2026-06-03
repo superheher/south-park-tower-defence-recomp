@@ -1873,6 +1873,45 @@ PPC_FUNC(__imp__VdSwap) {
             }
         }
     }
+    // Renderer (option A): STRUCTURED dump of the deferred cmd-buffer chunk to design the real parse — walk
+    // it as PM4 and print each packet (offset, raw, type/op/count), flagging draws / SET_CONSTANT / the
+    // title's custom seg-link ops, and STOP at the first non-PM4 dword (the desync point cont.11's linear
+    // ExecutePM4 hit). REX_CHUNKDUMP=N -> dump the active chunk at swap#N (default first menu swap >=80).
+    if (getenv("REX_CHUNKDUMP") && g_device.load()) {
+        uint32_t dv = g_device.load(), base = GLD32(dv+13568), wptr = GLD32(dv+13572);
+        bool valid = base >= 0xA0000000u && wptr > base && (wptr - base) < 0x100000u;
+        // Per-swap brute-scan: how many op-0x22/0x36 DRAW headers are in the active chunk (finds the menu).
+        int bruteDraws = 0;
+        if (valid) for (uint32_t a = base; a + 4 <= wptr; a += 4) {
+            uint32_t p = GLD32(a); if ((p>>30)==3) { uint32_t op=(p>>8)&0x7F; if (op==0x22||op==0x36) bruteDraws++; } }
+        static std::atomic<int> lastN{-1};
+        if (valid && bruteDraws > 0 && lastN.exchange(n) != (int)n)
+            fprintf(stderr, "[chunkscan] swap#%u base=0x%X len=0x%X brute-draws=%d\n", n, base, wptr-base, bruteDraws);
+        // Structured dump of the FIRST chunk that actually contains draws (the menu's real cmd-buffer).
+        static std::atomic<bool> cd{false}; bool ce=false;
+        if (valid && bruteDraws >= 1 && cd.compare_exchange_strong(ce, true)) {
+            fprintf(stderr, "[chunkdump] swap#%u base=0x%X wptr=0x%X len=0x%X brute-draws=%d\n", n, base, wptr, wptr-base, bruteDraws);
+            uint32_t a = base, end = wptr;
+            for (int i = 0; i < 1200 && a + 4 <= end; i++) {
+                uint32_t pkt = GLD32(a), type = pkt >> 30;
+                if (type == 3) {
+                    uint32_t op = (pkt>>8)&0x7F, cnt = ((pkt>>16)&0x3FFF)+1;
+                    const char* tag = (op==0x22||op==0x36)?" <==DRAW_INDX" : (op==0x2D||op==0x55)?" SET_CONSTANT"
+                                    : (op==0x38)?" <seg0x38?" : (op==0x79)?" <seg0x79?" : (op==0x3F||op==0x37)?" IB" : "";
+                    fprintf(stderr, "  +0x%05X %08X T3 op=0x%02X cnt=%u%s\n", a-base, pkt, op, cnt, tag);
+                    a += 4 + cnt*4;
+                } else if (type == 0) {
+                    uint32_t cnt = ((pkt>>16)&0x3FFF)+1, idx = pkt & 0x7FFF;
+                    fprintf(stderr, "  +0x%05X %08X T0 reg0x%X cnt=%u\n", a-base, pkt, idx, cnt);
+                    a += 4 + cnt*4;
+                } else if (type == 2) { a += 4; }   // T2 = NOP filler
+                else {   // type == 1: 2 reg writes — rare in real cmd-buffers, usually a misread inline float => desync
+                    fprintf(stderr, "  +0x%05X %08X T1 (2-reg-write / likely misread inline data => DESYNC)\n", a-base, pkt);
+                    a += 12;
+                }
+            }
+        }
+    }
     // One-time (settled frame): dump the device struct's segment-tracking region to find the flush queue /
     // descriptor array (sub_821C6C80 uses r8=device+13568; flush gate is device+13408). Look for content-
     // segment descriptors {0x8100_00LL, addr} that the inline-descriptor scan misses (textured draws).
