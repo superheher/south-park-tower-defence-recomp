@@ -2089,3 +2089,39 @@ and crucially **the set varies run-to-run** — the smoking gun for a race.
   parse run on a confirmed-clean boot (the brute-scan can't see texture binds; CHUNKCP desyncs). So Option A
   (the parse) is not dead — it is **gated on first getting a clean run**, which reframes the whole renderer:
   step 1 = race-free scheduling, step 2 = parse device+13568 on a clean run to confirm/extract textured draws.
+
+## cont.12(c10) — pivotal experiment DONE: device+13568 is a STATE directory (no draws); even a clean run builds NO textured content
+
+Ran the pivotal experiment the user picked. Cracked the device+13568 format and followed it on confirmed-clean
+menu boots. **Answer: NO — a race-free run does not build textured draws; the divergence is deeper than the race.**
+
+- **device+13568 is NOT inline PM4 — it's the title's SEGMENT DIRECTORY.** Each chunk holds records + segment
+  descriptors **{0x81LLLLLL, phys_addr}** (LLLLLL = segment length in dwords) plus 0xC1/0xC2-tagged pointers.
+  Resolve a descriptor's segment to a guest address with **guest = 0xA0000000 | (addr & 0x1FFFFFFF)** — verified
+  correct (the segments then parse cleanly as PM4). (Brute-scanning the directory for op-0x22 headers gives
+  FALSE POSITIVES: the 0xC134xxxx record/pointer words decode as op 0x22 — that's why the earlier "1–16
+  draws/chunk" counts were noise.) Menu-frame directories carry ~11–20 descriptors; init chunks ~3.
+- **Every followed segment is render STATE / EVENT / CALLBACK — ZERO draws.** Over 3 confirmed-CLEAN menu boots
+  (g_nonBenignInd==0, swap#4002/4019, 11–13 descriptors each) the per-segment tally is `realDraws=0 rectDraws=0
+  texFetch=0` for EVERY segment, no exceptions. The segment-start signatures: `C0004600`=COND_WRITE(0x46),
+  `C0006000/C0006100`=op0x60/0x61, `C0003B00…C0025800`=EVENT_WRITE(0x58), SET_CONSTANT blocks (8/4 per state
+  segment, all non-texture — texFetch=0), repeating data records `00000A31 0X000000 00010A2F`, and CALLBACK
+  records **`0001057C 821CC7A0 <ctx>`** — a code pointer into the render executor region (sub_821CC*, the same
+  family as sub_821CC310). So the directory is the per-frame **state + work-queue**; the actual DRAW packets
+  (the init=0x30088 degenerate rects) are emitted to the **main ring** by the executor, and there are **no
+  textured draws anywhere** — clean or raced.
+- **⇒ The NOTOKEN race is NOT the whole render gate.** Fixing it makes the run not crash, but the title STILL
+  emits only degenerate rects + state — never the textured draws prod builds on the identical guest (54
+  pipelines). So the renderer is blocked by a **deeper divergence in the draw-issuing path itself**, not by the
+  race, not by the cmd-buffer parse (device+13568 parses fine — it just contains no draws), and not by coverage
+  (the draws ARE found; they're simply all rects). This unifies the entire multi-session search: ring, staging
+  (SEGCP), and now the device+13568 directory ALL show only init=0x30088 rects with 0 textures.
+- **Next direction (deep): why does variant A's render code emit only rects?** The thread to pull is the
+  executor callback **0x821CC7A0** (carried by the `0001057C 821CC7A0` segment records) and its family
+  sub_821CC310 — trace what it emits per work-item and why the textured-content draws prod issues are absent
+  (a degraded render-object state that takes a degenerate path, or a content-draw subsystem that never runs).
+  The race fix and the device+13568 parser remain useful downstream but are no longer the leading blocker.
+- Diagnostics (gated, default boot unregressed VdSwap=6/segv=0): REX_CHUNKDUMP now = per-swap segment-descriptor
+  count + CLEAN/RACED (g_nonBenignInd) + a one-time segment-FOLLOW of the first settled menu directory (resolves
+  each {0x81LLLLLL,addr}, parses the segment, tallies realDraws/rectDraws/setConst/texFetch). g_nonBenignInd =
+  count of non-benign (lr!=0x82292D08) INDIRECT-NULLs = the race indicator.
