@@ -52,8 +52,20 @@
   variant-A конкурентности+неинициализированных объектов: (a) NOTOKEN guest-гонки; (b) VblankPump host-CP
   асинхронно vs guest GPU-submission; (c) string-as-code коррупция; (d) jump-table sub_82367B88.** Фиксить
   краши по одному под NOTOKEN-гонками = whack-a-mole; СТРУКТУРНЫЙ фикс = **синхронизированный CP (рендерер).**
-  Пул + guard — корректные стопгапы, довели меню до загрузки ШЕЙДЕРОВ. STRATEGIC DECISION (USER): продолжать
-  grind меню-крашей ИЛИ заняться CP/render/concurrency-архитектурой.
+  Пул + guard — корректные стопгапы, довели меню до загрузки ШЕЙДЕРОВ.
+- ✅**USER выбрал CP-СИНХРОНИЗАЦИЮ → СДЕЛАНО (commit 6079c3a):** корень гонок (b) — VblankPump (host) под NOTOKEN
+  не берёт лока, исполняет ExecuteRing+FireGfxInterrupt(guest-колбэк) конкурентно с guest. Фикс: `g_gpuMutex`
+  (NOTOKEN-only) — памп держит его на CP+interrupt-батче, и guest GPU-границы (kick sub_821C6600 + completion-setup
+  sub_821C73D8 пишет device+10900) тоже → сериализация памп↔guest БЕЗ глобал-токена (декодеры конкурентны;
+  recursive). Без дедлока, дефолт не регрессит. РЕЗУЛЬТАТ: **gfx-interrupt краш sub_821C7170 УШЁЛ**, тайтл прошёл
+  В СВОЙ RENDER-КОД → SIGSEGV ~33с на INDIRECT-NULL с **FLOAT-таргетами** (0x43A04000=320.5f, 0x421A0000=38.5f) в
+  0x821Bxxxx/0x821Cxxxx = render-код тайтла читает ВЕРШИННЫЕ/render-данные как функции (stub-CP не держит draw-state).
+- ⭐⭐**МЕНЮ ДОСТИГЛО ГРАНИЦЫ РЕНДЕРЕРА (естественно, без REX_XFLAG).** Цепочка сессии: пул→синглтон→шейдеры;
+  CP-sync→памп не гонит guest→меню РЕНДЕРИТ; рендеринг требует настоящего GPU draw-state. **СЛЕДУЮЩЕЕ = РЕНДЕРЕР
+  (RENDERER-PHASE-PLAN, теперь достижим через natural menu):** транслятор draw-state (vfetch reg0x4800→верт.буферы+layout,
+  ALU reg0x4000→юниформы, текстуры, RT/viewport) + 19 .updb шейдеров→SPIR-V → vkCmdDraw в swapchain (рендер-тред владеет).
+  Прочее (не на пути к рендереру): jump-table sub_82367B88 (boundary-limited), декодеры/фильм под NOTOKEN.
+  Запуск: `REX_NOTOKEN=1 REX_CSLEAK=1 ...default.xex` → меню(шейдеры) → render-SIGSEGV ~33с. Диаг REX_INDDUMP.
 - ⭐⭐**МЕНЮ КИКАЕТ РЕАЛЬНУЮ GPU-РАБОТУ — РИНГ ОЖИЛ** (был WPTR=37 весь intro): SIGSEGV ~34с в стеке VblankPump→
   ExecuteRing(rptr=37)→ExecutePM4→ExecuteType3(op=0x54 EVENT_WRITE)→FireGfxInterrupt→**sub_821C7170**→
   PPC_STORE(r31+0) r31=garbage. Меню грузит Global/Meshes/Textures + эмитит PM4 EVENT_WRITE → fires gfx-interrupt
