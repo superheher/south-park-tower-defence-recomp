@@ -43,9 +43,17 @@
   аренами из g_virtNext; ABI r3=size r4=tag r5=type). РЕЗУЛЬТАТ: синглтон СТРОИТСЯ (sub_824883E0 0→1), меню идёт
   НАМНОГО ДАЛЬШЕ — грузит СВОИ РЕНДЕР-АССЕТЫ (шейдеры SPTextured/SPBackdropTextured.xbv/.xbp, текстуры
   Global.bin/LipSyncTextures). Дефолт-бут НЕ регрессит ([stub] ExAllocatePoolType исчез). **Cluster item 1 РЕШЁН.**
-- ⚡**SIGSEGV СДВИНУЛСЯ ВПЕРЁД** (был sub_821C7170 gfx-interrupt): теперь **sub_82368028 ← sub_8233DFD0 ←
-  sub_8233E198** (ppc_recomp.52:24506, menu/UI регион у пропущенной jump-table sub_82367B88). = НОВЫЙ блокер
-  (cluster items 2/3). RE его следующим. Запуск: `REX_NOTOKEN=1 REX_CSLEAK=1 ...default.xex`.
+- ⚡**Post-pool краши = NOTOKEN+stub-CP ГОНКИ** (host VblankPump-CP фаерит GPU-прерывания / re-run'ит ринг
+  параллельно menu-потоку): (item2, commit fc297da) **gfx-interrupt sub_821C7170** дереференсит completion-объект
+  `*(device+10900)`, который = sentinel 0xFFFFFFFF между сабмишенами → наш CP фаерит source=1 спурьёзно →
+  wild-deref 0xFFFFFFFF → SIGSEGV. GUARD в FireGfxInterrupt (skip source=1 если device+10900==0xFFFFFFFF) —
+  краш ушёл, дефолт не регрессит. НО тайтл всё равно дохнет ~32с в **sub_82204D08**: INDIRECT-NULL каскад с
+  таргетами-ASCII (path-строка исполняется как vtable) = downstream-коррупция. ⇒ **past пул-фикса меню — болото
+  variant-A конкурентности+неинициализированных объектов: (a) NOTOKEN guest-гонки; (b) VblankPump host-CP
+  асинхронно vs guest GPU-submission; (c) string-as-code коррупция; (d) jump-table sub_82367B88.** Фиксить
+  краши по одному под NOTOKEN-гонками = whack-a-mole; СТРУКТУРНЫЙ фикс = **синхронизированный CP (рендерер).**
+  Пул + guard — корректные стопгапы, довели меню до загрузки ШЕЙДЕРОВ. STRATEGIC DECISION (USER): продолжать
+  grind меню-крашей ИЛИ заняться CP/render/concurrency-архитектурой.
 - ⭐⭐**МЕНЮ КИКАЕТ РЕАЛЬНУЮ GPU-РАБОТУ — РИНГ ОЖИЛ** (был WPTR=37 весь intro): SIGSEGV ~34с в стеке VblankPump→
   ExecuteRing(rptr=37)→ExecutePM4→ExecuteType3(op=0x54 EVENT_WRITE)→FireGfxInterrupt→**sub_821C7170**→
   PPC_STORE(r31+0) r31=garbage. Меню грузит Global/Meshes/Textures + эмитит PM4 EVENT_WRITE → fires gfx-interrupt
