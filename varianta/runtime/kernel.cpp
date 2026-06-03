@@ -1118,9 +1118,10 @@ static void FireGfxInterrupt(uint32_t cb, uint32_t source, uint32_t cpu = 2) {
     static const bool g_intlog = getenv("REX_INTLOG") != nullptr;
     if (source == 1 && g_intlog) {
         uint32_t B = g_interruptData ? GLD32(g_interruptData + 10900) : 0;
-        uint32_t cbslot = (g_interruptData && B && B != 0xFFFFFFFFu) ? GLD32(B + 0x10) : 0;
-        fprintf(stderr, "[int] FireGfx src=1 cpu=%u iData=0x%08X B=*(+10900)=0x%08X *(B+0x10)=0x%08X -> %s\n",
-                cpu, g_interruptData, B, cbslot, (g_interruptData && B == 0xFFFFFFFFu) ? "SKIP(sentinel)" : "FIRE");
+        bool bv = (g_interruptData && B && B != 0xFFFFFFFFu);
+        fprintf(stderr, "[int] FireGfx src=1 cpu=%u iData=0x%08X B=0x%08X B[0]=0x%08X *(B+0x10)=0x%08X *(B+0x14)=0x%08X -> %s\n",
+                cpu, g_interruptData, B, bv ? GLD32(B) : 0, bv ? GLD32(B + 0x10) : 0, bv ? GLD32(B + 0x14) : 0,
+                (g_interruptData && B == 0xFFFFFFFFu) ? "SKIP(sentinel)" : "FIRE");
     }
     // REX_BOOTSTRAP (cont.14): the render producer sub_821CC7A0 is the completion callback at *(B+0x10),
     // B=*(device+10900); in variant A that slot is null (the per-frame submit that registers it never runs),
