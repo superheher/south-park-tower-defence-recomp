@@ -767,6 +767,7 @@ std::condition_variable g_waitCv;
 // Cooperative token by default; REX_NOTOKEN=1 runs guest threads PREEMPTIVELY (relies on the title's
 // own critical sections/atomics for correctness — needed when a pure busy-wait would deadlock the token).
 const bool g_coop = (getenv("REX_NOTOKEN") == nullptr);
+const bool g_preempt = !g_coop;   // REX_NOTOKEN: guest threads run preemptively on real cores (no run-token)
 const bool g_evtrace = (getenv("REX_EVTRACE") != nullptr);
 
 // ---- Fair cooperative scheduler (REX_FAIRSCHED) ------------------------------------------------------
@@ -870,7 +871,7 @@ int64_t TimeoutMs(uint32_t timeoutPtr) {
 void GuestThreadRun(ThreadRec* rec) {
     if (g_fair && getenv("REX_INITDIAG")) fprintf(stderr, "[initdiag] GuestThreadRun start=0x%X WAITING (g_tok next=%llu serving=%llu held=%d)\n",
         rec->startAddr, (unsigned long long)g_tok.next_, (unsigned long long)g_tok.serving_, (int)g_tok.held_);
-    if (g_fair) g_tok.lock(); else g_waitMutex.lock();   // acquire the execution token (FIFO-fair if g_fair)
+    if (g_fair) g_tok.lock(); else if (g_coop) g_waitMutex.lock();   // acquire the execution token (FIFO-fair if g_fair); no token under REX_NOTOKEN (preemptive)
     if (g_fair && getenv("REX_INITDIAG")) fprintf(stderr, "[initdiag] GuestThreadRun start=0x%X GOT token -> running\n", rec->startAddr);
     PPCContext ctx{};
     ctx.fpscr.csr = 0x1F80;                  // default MXCSR: all FP exceptions masked
@@ -885,7 +886,7 @@ void GuestThreadRun(ThreadRec* rec) {
         CallGuest(rec->startAddr, ctx);
     }
     SignalObject(rec->threadAddr, 1);        // wake anyone waiting on this thread object (header type 6)
-    if (g_fair) g_tok.unlock(); else g_waitMutex.unlock();
+    if (g_fair) g_tok.unlock(); else if (g_coop) g_waitMutex.unlock();
 }
 } // namespace
 
@@ -1368,7 +1369,7 @@ PPC_FUNC(sub_8222A9F8)
 extern "C" PPC_FUNC(__imp__sub_821C6E58);
 PPC_FUNC(sub_821C6E58)
 {
-    if (g_coop) {
+    if (g_coop || g_preempt) {   // stopgap fires in BOTH scheduler modes — variant A has no real CP in either
         uint32_t device = ctx.r3.u32, target = ctx.r4.u32;
         uint32_t fenceptr = GLD32(device + 10896);
         if (fenceptr) {
@@ -1411,7 +1412,7 @@ PPC_FUNC(sub_821C6E58)
 extern "C" PPC_FUNC(__imp__sub_821C5DF0);
 PPC_FUNC(sub_821C5DF0)
 {
-    if (g_coop) {
+    if (g_coop || g_preempt) {   // stopgap fires in BOTH scheduler modes — variant A has no real CP in either
         uint32_t device = ctx.r3.u32, off = ctx.r4.u32, posTagged = ctx.r5.u32;
         uint32_t fenceptr = GLD32(device + 10896);
         if (fenceptr) {

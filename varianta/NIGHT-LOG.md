@@ -1726,3 +1726,66 @@ Decisive chain of evidence:
   This is THE Step-1 item; it gates both the natural intro→menu transition (→ real draws for the renderer)
   and smooth playback. Next concrete sub-task: prototype a real blocking fence (replace fence-forward in the
   ~6 sub_821B9270 waiters) and re-measure per-thread CPU + whether sub_8210AF90 fires.
+
+## 2026-06-03 (cont. 12) — true concurrency (REX_NOTOKEN) made to BOOT; scheduler is NOT the root blocker (overturns cont.11)
+Resumed at HEAD=4555fb8 with the prior session's UNTESTED `BlockFenceYield` (REX_BLOCKFENCE) prototype in the
+working tree. Tested it, then pivoted to true concurrency. Decisive results:
+
+### 1) `BlockFenceYield` (REX_BLOCKFENCE) — DISPROVEN (the cont.11 planned "blocking fence" next-step)
+- The prototype cedes a FIFO run-token round at the fence-forward sites, intending to un-starve the workers.
+- A/B per-thread CPU (REX_FAIRSCHED vs +REX_BLOCKFENCE=0 vs =50): **IDENTICAL** — one thread 99%, all others
+  ~0%, total still 100% (one core). With =50µs the total CPU did NOT drop ⇒ the cede barely fires.
+- Why: (a) the fence-forward (sub_821C6E58/sub_821C5DF0) runs only ~per-frame (around present), NOT in the hot
+  intro loop (VdGetSystemCommandBuffer ×thousands), so BlockFenceYield ≈ the EXISTING per-frame yield; (b) gdb
+  thread-state map (REX_FAIRSCHED): the workers/decoders are blocked in `g_objCv.wait` (FairWaitUntil:820 —
+  waiting for a guest OBJECT to be signaled), NOT in the `g_tok` run-token queue. Ceding the run-token is a
+  no-op when nobody is waiting for the token. ⇒ removed BlockFenceYield from the tree.
+
+### 2) The cooperative single-token serializes ALL guest threads onto ONE core (root of the 10× slow movie)
+- gdb (cooperative, REX_FAIRSCHED): the token DOES circulate (caught a VC-1 decoder sub_82339458 mid-decode
+  holding it, main blocked at the per-frame yield), but only one runs at a time. 4 decoders + main + tid=10
+  share one core ⇒ ~10× slow. This is inherent to the cooperative model, not a fairness bug.
+
+### 3) REX_NOTOKEN (preemptive / true concurrency) was HALF-IMPLEMENTED — fixed 2 bugs, now BOOTS
+- Out of the box REX_NOTOKEN dead-locked at **124 lines**. Two bugs (both default-safe — the cooperative path
+  is byte-identical; only the REX_NOTOKEN branch changes):
+  - **Fix #1 — GuestThreadRun token hold.** `GuestThreadRun` did `if (g_fair) g_tok.lock(); else g_waitMutex.lock();`
+    with NO `g_coop` guard (unlike `LockGuestExecution`). Under NOTOKEN it held g_waitMutex for the thread's
+    whole lifetime, so a spawned thread re-locking it inside `WaitObject` self-deadlocked (non-recursive mutex).
+    Gated it `else if (g_coop)`. → boot **124 → 1387 lines, reaches VdSwap #1**.
+  - **Fix #2 — fence-forward gate.** The forward overrides (sub_821C6E58/sub_821C5DF0) were wrapped in
+    `if (g_coop)`, so under NOTOKEN the GPU-fence-spin (sub_821B9270) was never satisfied → a spawned thread
+    span forever in sub_821C6E58→sub_821B9270 while main blocked on NtWaitForSingleObjectEx waiting for it
+    (gdb-confirmed). Added `g_preempt = !g_coop` and gated the forward `if (g_coop || g_preempt)`. → boot
+    **1387 → 369750 lines** (≈2× past the default cooperative boot), reaches the steady per-frame intro loop.
+- **TRUE CONCURRENCY CONFIRMED:** per-thread CPU under NOTOKEN = **2 threads at ~99% (total 199%)** — two host
+  cores running guest code simultaneously (the cooperative token can never exceed ~100%). No crash (segv=0),
+  and the **default cooperative boot is UNREGRESSED** (57k non-spam lines/22s, 0 device-overwrite, reaches intro).
+
+### 4) ⭐ But concurrency does NOT unblock the movie or the transition — they are BLOCKED-WAITING, not CPU-starved
+This OVERTURNS cont.11's "starvation" diagnosis. Under true concurrency, with their own cores available:
+- **Movie**: the VC-1 decoder threads (sub_82339428→…→KeWaitForSingleObject) sit BLOCKED in object-waits at
+  ~0% CPU, and the frame pool is uniform/black at swap#220 (`[video]` varied=0 for all Y/UV buffers) — i.e. NOT
+  decoding. (Cooperative-FAIRSCHED, cont.10, DID decode: buf4-11 varied=8552..64589. The per-frame yield there
+  happened to drive the decode; NOTOKEN's free-running threads leave the decoder blocked on a signal/input that
+  never comes.) ⚠ swap#220 arrives at ~11 s under NOTOKEN (main runs ~5-6× faster on its own core), so "black at
+  swap#220" is partly an early sample — but the gdb-confirmed object-blocked decoders are the stronger signal.
+- **Transition**: tid=10 (sub_8211B740) under concurrency progresses FURTHER than cont.11 (it gets PAST the
+  sub_82132918→sub_822C14E8 SIMD section cont.11 thought was the wall) and then BLOCKS deeper, at
+  sub_8211B740→sub_8212BE48→…→sub_82427858→sub_82435C48 (~0% CPU = a wait, not a spin). It still never reaches
+  sub_8210AF90 (0x828E82A6 stays 0) even after 90 s with a full dedicated core. So sub_8211B740 is gated on an
+  object/condition variant A doesn't satisfy, NOT on CPU.
+- ⇒ **CONCLUSION:** the cooperative scheduler made the decoder + tid=10 LOOK CPU-starved, but with full
+  concurrency they are revealed as BLOCKED on missing signals / unmet state — deeper title-specific RE problems.
+  The scheduler is NOT the root blocker for either the movie or the natural transition. REX_NOTOKEN is a real
+  infrastructure milestone (true concurrency now boots, default-safe) and likely the right long-term base, but
+  it does not by itself produce a smoother movie or the natural intro→menu transition.
+
+### Committed (default-safe, NOT pushed): the 2 NOTOKEN fixes + BlockFenceYield removal.
+### NEXT (deep, title-specific RE — pick one; awaiting user):
+- (a) Why do the VC-1 decoder threads stay blocked on their object-waits under NOTOKEN? (what input/signal —
+  demux feed, buffer-ready event, 4-thread decode handshake — are they waiting for that variant A never posts?)
+- (b) What does tid=10's new blocker sub_82435C48 wait for? (the deeper transition gate, past the SIMD init).
+- (c) Keep the renderer on the REX_XFLAG forced-transition path (reach a menu screen for real draws) and treat
+  the scheduler/movie as a separate track.
+- Diag this session (all gated/reversible): per-thread CPU + gdb thread-state scripts; `[video]` swap#220 dump.
