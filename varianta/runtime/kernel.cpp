@@ -1254,6 +1254,36 @@ void ExecutePM4(uint32_t addr, uint32_t dwords, int depth);   // fwd
 void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
     if (g_cptrace) fprintf(stderr, "[cp]%*s T3 op=0x%02X count=%u d0=0x%X d1=0x%X d2=0x%X\n", depth*2, "", op, count,
                            GLD32(addr), count>1?GLD32(addr+4):0, count>2?GLD32(addr+8):0);
+    // GPU-build step (a): result-gate scan (REX_RESULTSCAN). The A<->B coupling gate is a "real GPU
+    // result" the title observes before it kicks the content IBs. Faking the swap counter / completion
+    // fence (which live in memory) is exhausted, so the gate must be something only real pixel work
+    // produces: an occlusion query (ZPASS_DONE / VIZ_QUERY), a GPU->CPU memory poll (WAIT_REG_MEM), a
+    // register readback (REG_TO_MEM), or an EDRAM resolve (RB_COPY). Log each as the CP executes the
+    // kicked stream so we can pin which one. Event/op/reg constants per rexglue xenos.h. Gated, default off.
+    static const bool s_resultscan = getenv("REX_RESULTSCAN") != nullptr;
+    if (s_resultscan) {
+        static std::atomic<int> rsn{0};
+        if (rsn.load() < 400) switch (op) {
+          case 0x3C: {                                   // WAIT_REG_MEM: poll mem/reg until (val&mask) <fn> ref
+              uint32_t info=GLD32(addr), poll=GLD32(addr+4), ref=GLD32(addr+8), mask=GLD32(addr+12);
+              static const char* fn[8]={"always","<","<=","==","!=",">=",">","never"};
+              fprintf(stderr,"[result] WAIT_REG_MEM %s poll=%s:0x%X ref=0x%X mask=0x%X\n",
+                      fn[info&7],(info&0x10)?"mem":"reg",poll,ref,mask); ++rsn; break; }
+          case 0x52: case 0x53:                          // WAIT_REG_EQ / WAIT_REG_GTE
+              fprintf(stderr,"[result] WAIT_REG_%s reg=0x%X ref=0x%X\n",op==0x52?"EQ":"GTE",GLD32(addr),GLD32(addr+4)); ++rsn; break;
+          case 0x46: { uint32_t ev=GLD32(addr)&0x3F;     // EVENT_WRITE
+              if (ev==21||ev==7||ev==8) { fprintf(stderr,"[result] EVENT_WRITE event=%u (%s)\n",ev,
+                  ev==21?"ZPASS_DONE":ev==7?"VIZQUERY_START":"VIZQUERY_END"); ++rsn; } break; }
+          case 0x5B:                                     // EVENT_WRITE_ZPD: occlusion (z-pass) sample count
+              fprintf(stderr,"[result] EVENT_WRITE_ZPD (ZPASS_DONE) sampleCountAddr(reg0x2325)=0x%X\n",
+                      GLD32(0x7FC80000u+0x2325*4u)); ++rsn; break;
+          case 0x23:                                     // VIZ_QUERY: begin/end viz (occlusion) query
+              fprintf(stderr,"[result] VIZ_QUERY d0=0x%X\n",GLD32(addr)); ++rsn; break;
+          case 0x3E:                                     // REG_TO_MEM: read GPU reg -> system memory (readback)
+              fprintf(stderr,"[result] REG_TO_MEM reg=0x%X -> mem 0x%X\n",GLD32(addr)&0xFFFF,GLD32(addr+4)); ++rsn; break;
+          default: break;
+        }
+    }
     switch (op) {
       case PM4_INDIRECT_BUFFER:
       case PM4_INDIRECT_BUFFER_PFD: {
@@ -1302,6 +1332,15 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
       case PM4_DRAW_INDX: case PM4_DRAW_INDX_2: {
         uint32_t init = GLD32(addr), numInd = init >> 16, prim = init & 0x3F;
         g_drawCount.fetch_add(1);
+        // step (a) result-gate: a resolve (EDRAM->texture readback) is a draw with an active copy command —
+        // RB_COPY_CONTROL (0x2318) non-zero AND RB_COPY_DEST_BASE (0x2319) set. (destBase alone is often a
+        // stale register value, so require ctl != 0.) The title reads pixel results back to system memory.
+        if (s_resultscan) {
+            uint32_t copyCtl = GLD32(0x7FC80000u + 0x2318*4u), copyDest = GLD32(0x7FC80000u + 0x2319*4u);
+            if (copyCtl && copyDest) fprintf(stderr,"[result] RESOLVE (EDRAM readback) ctl=0x%X destBase=0x%X destInfo=0x%X "
+                                  "sampleCountAddr=0x%X\n", copyCtl, copyDest,
+                                  GLD32(0x7FC80000u+0x231B*4u), GLD32(0x7FC80000u+0x2325*4u));
+        }
         // REX_DRAWLOG: log non-degenerate draws + their bound texture fetch constants (reg 0x4800,
         // 6 dwords/slot) — to find the intro movie's full-screen quad and its decoded-frame texture.
         static const int drawlog = []{ const char* e = getenv("REX_DRAWLOG"); int v = e ? atoi(e) : 0; return v > 1 ? v : (e ? 24 : 0); }();
@@ -2218,37 +2257,98 @@ PPC_FUNC(__imp__VdSwap) {
         if (valid && nDesc > 0 && lastN.exchange(n) != (int)n)
             fprintf(stderr, "[chunkscan] swap#%u segDescs=%d nonBenignInd=%d %s\n",
                     n, nDesc, g_nonBenignInd.load(), g_nonBenignInd.load()==0?"CLEAN":"RACED");
-        static std::atomic<bool> cd{false}; bool ce=false;
         // Trigger swap# is configurable via REX_CHUNKDUMP=N (N>1 => fire at n>=N; default 4000). This lets the
         // content census run at the most-advanced NOTOKEN+MOVIE_EOF full-menu state, where n (=swap count) stays
-        // small (~6-13) — the cont.10/12 runs used n>=4000 which that state never reaches.
+        // small (~6-13) — the cont.10/12 runs used n>=4000 which that state never reaches. Re-fire whenever a
+        // RICHER frame (more segment descriptors) appears, so a run that race-crashes early still yields the
+        // best census it reached, and a surviving run captures the full ~11-segment menu frame.
+        static std::atomic<int> maxDumped{0};
         static const uint32_t s_cdAt = []{ const char* e = getenv("REX_CHUNKDUMP"); uint32_t v = e ? (uint32_t)atoi(e) : 0; return v > 1 ? v : 4000u; }();
-        if (valid && nDesc >= 10 && n >= s_cdAt && cd.compare_exchange_strong(ce, true)) {   // >=10 descs @ settled = a MENU frame
+        int prevMax = maxDumped.load();
+        if (valid && nDesc >= 3 && n >= s_cdAt && nDesc > prevMax && maxDumped.compare_exchange_strong(prevMax, nDesc)) {   // richer frame
             int totReal=0, totTex=0, totRect=0;
+            // step (a) result-gate totals: the "real GPU result" the A<->B gate may need. WAIT_REG_MEM
+            // (GPU->CPU poll), ZPASS_DONE/VIZ_QUERY (occlusion), REG_TO_MEM/COND_WRITE (readback),
+            // RB_COPY resolve (EDRAM->texture). Captures the first WAIT_REG_MEM poll target seen.
+            int totWait=0, totZp=0, totViz=0, totRb=0, totRes=0; uint32_t fwPoll=0, fwRef=0, fwInfo=0;
             fprintf(stderr, "[chunkdump] swap#%u base=0x%X len=0x%X %s(ind=%d) segDescs=%d — FOLLOWING:\n",
                     n, base, wptr-base, g_nonBenignInd.load()==0?"CLEAN":"RACED", g_nonBenignInd.load(), nDesc);
             for (int di = 0; di < nDesc && di < 24; di++) {
                 uint32_t len = descs[di].len, addr = descs[di].addr, guest = 0xA0000000u | (addr & 0x1FFFFFFFu);
-                int dReal=0, dRect=0, setc=0, tex=0; uint32_t a = guest, end = guest + (len < 1024 ? len : 1024)*4;
+                int dReal=0, dRect=0, setc=0, tex=0, dWait=0, dZp=0, dViz=0, dRb=0, dRes=0;
+                uint32_t firstReal=0; bool desync=false;   // firstReal = init of first non-clear DRAW; desync = not clean PM4
+                // CORRECT PM4 walker (mirrors ExecutePM4): advance type-0 by its reg count, type-1 by 2,
+                // type-2 by 0, type-3 by its data count. The old census only advanced type-3 by count and
+                // every other packet by 1 dword, which MISALIGNED after any SET_CONSTANT/reg-write and both
+                // HID real content past dword 1024 and FABRICATED false type-3 "draws" (cont.10's warning).
+                uint32_t a = guest, end = guest + len*4;
                 bool mapped = guest >= 0xA0000000u;
-                for (int i = 0; mapped && i < 1024 && a + 4 <= end; ) {
-                    uint32_t pkt = GLD32(a);
-                    if ((pkt>>30) == 3) {
+                for (int g = 0; mapped && a + 4 <= end && g < 100000; g++) {
+                    uint32_t pkt = GLD32(a); a += 4; uint32_t t = pkt >> 30;
+                    if (t == 0) {                                              // type-0: write cnt regs from baseIdx
+                        uint32_t cnt=((pkt>>16)&0x3FFF)+1, bi=pkt&0x7FFF; bool one=(pkt>>15)&1;
+                        if (!one && bi>=0x4800 && bi<0x4900 && cnt>=6) tex++;   // FETCH constants (textures/vertex streams) via type-0
+                        for (uint32_t m=0;m<cnt&&a+4<=end;m++,a+=4){ uint32_t r=one?bi:bi+m;
+                            if (r>=0x2318&&r<=0x2325) dRes++; else if (r==0x2293) dViz++; }
+                    } else if (t == 1) { a += 8; }                             // type-1: 2 reg writes
+                    else if (t == 2) { /* no-op */ }                          // type-2
+                    else {                                                     // type-3: opcode packet
                         uint32_t op=(pkt>>8)&0x7F, cnt=((pkt>>16)&0x3FFF)+1;
-                        if (op==0x22||op==0x36) { uint32_t init=GLD32(a+4); (init==0x30088u)?dRect++:dReal++; }
-                        else if (op==0x2D||op==0x55) { setc++; uint32_t ot=GLD32(a+4);
-                            if (((ot>>16)&0xFF)==1) for (uint32_t j=2;j<cnt&&a+j*4+4<=end;j++)
-                                if (((GLD32(a+j*4)>>12)&0xFFFFF)<<12 >= 0xA0000000u) { tex++; break; } }
-                        a += 4+cnt*4; i += 1+cnt;
-                    } else { a += 4; i += 1; }
+                        if (a + cnt*4 > end) { desync=true; break; }           // count overruns segment => not clean PM4
+                        if (op==0x22||op==0x36){ uint32_t init=(op==0x22)?GLD32(a+4):GLD32(a);   // 0x22: initiator is data[1]
+                            if(init==0x30088u)dRect++; else {dReal++; if(!firstReal)firstReal=init?init:0xFFFFFFFFu;} }
+                        else if (op==0x2D){ setc++; uint32_t ot=GLD32(a); uint32_t ty=(ot>>16)&0xFF, ix=ot&0x7FF;
+                            if (ty==1) for(uint32_t j=1;j<cnt&&a+j*4+4<=end;j++) if((((GLD32(a+j*4)>>12)&0xFFFFF)<<12)>=0xA0000000u){tex++;break;}
+                            if (ty==4&&ix>=0x318&&ix<=0x325) dRes++;
+                            if (ty==4&&ix==0x293) dViz++; }
+                        else if (op==0x55) setc++;
+                        else if (op==0x3C){ dWait++; if(!fwPoll){fwInfo=GLD32(a);fwPoll=GLD32(a+4);fwRef=GLD32(a+8);} }
+                        else if (op==0x52||op==0x53) dWait++;                  // WAIT_REG_EQ / GTE
+                        else if (op==0x5B) dZp++;                              // EVENT_WRITE_ZPD
+                        else if (op==0x46){ uint32_t ev=GLD32(a)&0x3F; if(ev==21)dZp++; else if(ev==7||ev==8)dViz++; }
+                        else if (op==0x23) dViz++;                             // VIZ_QUERY
+                        else if (op==0x3E||op==0x45) dRb++;                    // REG_TO_MEM / COND_WRITE
+                        a += cnt*4;
+                    }
                 }
                 totReal+=dReal; totRect+=dRect; totTex+=tex;
-                fprintf(stderr, "  desc#%d @+0x%05X {len=0x%X addr=0x%08X->0x%08X}: realDraws=%d rect=%d setConst=%d texFetch=%d  raw0=%08X %08X %08X\n",
-                        di, descs[di].off, len, addr, guest, dReal, dRect, setc, tex, GLD32(guest), GLD32(guest+4), GLD32(guest+8));
+                totWait+=dWait; totZp+=dZp; totViz+=dViz; totRb+=dRb; totRes+=dRes;
+                fprintf(stderr, "  desc#%d @+0x%05X {len=0x%X addr=0x%08X->0x%08X}: realDraws=%d(init0=0x%X) rect=%d setConst=%d texFetch=%d | wait=%d zpass=%d viz=%d readback=%d resolve=%d %s  raw0=%08X %08X %08X\n",
+                        di, descs[di].off, len, addr, guest, dReal, firstReal, dRect, setc, tex, dWait, dZp, dViz, dRb, dRes, desync?"DESYNC":"clean", GLD32(guest), GLD32(guest+4), GLD32(guest+8));
+                // One-shot: dump the full packet sequence of the FIRST clean content segment, to verify it is
+                // genuine PM4 (sensible opcodes/draw-inits/copy-regs) and not a lucky clean walk over data.
+                static std::atomic<bool> segDumped{false}; bool sde=false;
+                if ((dReal>0||dRes>0) && !desync && segDumped.compare_exchange_strong(sde,true)) {
+                    fprintf(stderr, "[segdump] desc#%d @0x%08X len=0x%X — full packet walk:\n", di, guest, len);
+                    uint32_t a2=guest, e2=guest+len*4; int pk=0;
+                    for (int g=0; a2+4<=e2 && g<4000; g++) {
+                        uint32_t pkt=GLD32(a2); a2+=4; uint32_t t=pkt>>30;
+                        if (t==0){ uint32_t cnt=((pkt>>16)&0x3FFF)+1, bi=pkt&0x7FFF; bool one=(pkt>>15)&1;
+                            if (pk++<120) fprintf(stderr,"  [%d] T0 reg=0x%X cnt=%u%s v0=0x%X\n",g,bi,cnt,one?" one":"",GLD32(a2));
+                            a2+=cnt*4; }
+                        else if (t==1){ if(pk++<120)fprintf(stderr,"  [%d] T1 r=0x%X,0x%X\n",g,pkt&0x7FF,(pkt>>11)&0x7FF); a2+=8; }
+                        else if (t==2){ if(pk++<120)fprintf(stderr,"  [%d] T2 nop\n",g); }
+                        else { uint32_t op=(pkt>>8)&0x7F, cnt=((pkt>>16)&0x3FFF)+1;
+                            if (a2+cnt*4>e2){ fprintf(stderr,"  [%d] T3 op=0x%X cnt=%u OVERRUN\n",g,op,cnt); break; }
+                            const char* on = op==0x22?"DRAW_INDX":op==0x36?"DRAW_INDX_2":op==0x2D?"SET_CONSTANT":op==0x55?"SET_CONST2":
+                                op==0x3C?"WAIT_REG_MEM":op==0x23?"VIZ_QUERY":op==0x46?"EVENT_WRITE":op==0x5B?"EVENT_ZPD":op==0x10?"NOP":"?";
+                            if (pk++<120){ if(op==0x22||op==0x36) fprintf(stderr,"  [%d] T3 %s cnt=%u init=0x%X\n",g,on,cnt,GLD32(a2));
+                                else if(op==0x2D){ uint32_t ot=GLD32(a2); fprintf(stderr,"  [%d] T3 %s cnt=%u type=%u idx=0x%X (reg=0x%X)\n",g,on,cnt,(ot>>16)&0xFF,ot&0x7FF,((ot>>16)&0xFF)==4?0x2000+(ot&0x7FF):((ot>>16)&0xFF)==1?0x4800+(ot&0x7FF):(ot&0x7FF)); }
+                                else fprintf(stderr,"  [%d] T3 %s cnt=%u d0=0x%X\n",g,on,cnt,GLD32(a2)); }
+                            a2+=cnt*4; }
+                    }
+                    fprintf(stderr,"[segdump] (end; %d packets shown)\n", pk<120?pk:120);
+                }
             }
             fprintf(stderr, "[chunkdump] TOTALS over %d segments: realDraws=%d rectDraws=%d texFetch=%d  => %s\n",
                     nDesc<24?nDesc:24, totReal, totRect, totTex,
                     (totReal>0||totTex>0) ? "*** TEXTURED/REAL CONTENT PRESENT ***" : "only rects / no textures");
+            fprintf(stderr, "[chunkdump] RESULT-GATES: waitRegMem=%d zpass/occlusion=%d vizQuery=%d readback=%d resolve(RB_COPY)=%d  => %s%s\n",
+                    totWait, totZp, totViz, totRb, totRes,
+                    (totZp||totViz) ? "*** OCCLUSION QUERY PRESENT ***" : "no occlusion query",
+                    totRes ? " *** EDRAM RESOLVE PRESENT ***" : (totWait ? " (waits present)" : ""));
+            if (fwPoll) fprintf(stderr, "[chunkdump] first WAIT_REG_MEM: info=0x%X poll=%s:0x%X ref=0x%X\n",
+                    fwInfo, (fwInfo&0x10)?"mem":"reg", fwPoll, fwRef);
         }
     }
     // One-time (settled frame): dump the device struct's segment-tracking region to find the flush queue /
