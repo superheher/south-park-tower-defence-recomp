@@ -14,8 +14,12 @@ class Pool(gdb.Breakpoint):
     def stop(self):
         self.n += 1
         if self.n <= 12:
-            gdb.write("=== POOL WRITE #%d (0x%x) ===\n" % (self.n, int(gdb.parse_and_eval("$pc"))))
-            try: gdb.execute("bt 6")
+            gdb.write("=== POOL WRITE #%d ===\n" % self.n)
+            # variant A is -O0: read the guest context (dest r3, src r4, return-LR = the memcpy caller)
+            for r in ("r3","r4","r5","lr"):
+                try: gdb.write("  ctx.%s=0x%x\n" % (r, int(gdb.parse_and_eval("ctx.%s.u32" % r))))
+                except Exception as e: gdb.write("  ctx.%s err %s\n" % (r, e))
+            try: gdb.execute("bt 12")
             except Exception as e: gdb.write("bt err %s\n" % e)
         return False   # don't stop — keep running
 class GetBase(gdb.Breakpoint):
