@@ -16,4 +16,10 @@ void Present(uint32_t frontBufferGuestAddr);
 // Frame layout (RE'd): planar I420, full-range BT.601, as 3 consecutive allocations per frame — Y plane
 // (size 0x101440, pitch 1344, 1280x720) then U then V (size 0x40520 each, pitch 672, 640x360).
 void PublishVideo(const uint32_t* guestBufAddrs, const uint32_t* guestBufSizes, int count);
+
+// GPU-build piece 3b (Layer 2): submit extracted menu geometry to the render thread. `clipXY` is
+// `vertCount` interleaved clip-space (x,y) float pairs (already transformed); the render thread draws
+// them as a TRIANGLE_LIST via the menu-quad pipeline on the next present. Replaces the REX_MENUTEST
+// hardcoded quads once real geometry arrives. One-shot from the CP at a menu frame for now.
+void SubmitMenuGeometry(const float* clipXY, int vertCount);
 }

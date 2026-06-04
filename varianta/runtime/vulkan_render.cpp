@@ -18,6 +18,7 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 extern uint8_t* g_base;   // guest memory base (4 GiB), defined in runtime.cpp — render thread reads it directly
 
@@ -74,6 +75,10 @@ VkDeviceMemory   g_menuVBMem  = VK_NULL_HANDLE;
 void*            g_menuVBMap  = nullptr;
 VkDeviceSize     g_menuVBCap  = 0;
 struct MenuPC { float mvp[16]; float color[4]; };   // push constant: 80 bytes (<=128 min)
+// Layer 2: menu geometry submitted by the CP (clip-space XY pairs), drawn instead of the test quads.
+std::mutex          g_menuGeomMtx;
+std::vector<float>  g_menuGeom;                      // interleaved clip XY, guarded by g_menuGeomMtx
+std::atomic<int>    g_menuGeomVerts{0};              // vertex count currently submitted
 
 // In-engine screenshot (REX_RENDER_SHOT=<frame> -> capture that present to /tmp/varianta_shot.ppm).
 // Self-contained: external Wayland capture tools (spectacle/grim/import) don't work here.
@@ -574,8 +579,11 @@ bool PresentOnce() {
             -0.8f,-0.8f,  0.2f,-0.8f,  0.2f, 0.2f,  -0.8f,-0.8f,  0.2f, 0.2f, -0.8f, 0.2f,   // A
             -0.2f,-0.2f,  0.8f,-0.2f,  0.8f, 0.8f,  -0.2f,-0.2f,  0.8f, 0.8f, -0.2f, 0.8f,   // B
              0.1f,-0.6f,  0.6f,-0.6f,  0.6f,-0.1f,   0.1f,-0.6f,  0.6f,-0.1f,  0.1f,-0.1f }; // C
-        EnsureMenuVB(sizeof(quads));
-        if (g_menuVBMap) memcpy(g_menuVBMap, quads, sizeof(quads));
+        int subVerts = g_menuGeomVerts.load();                   // Layer 2: real geometry if submitted
+        if (subVerts > 0) { std::lock_guard<std::mutex> lk(g_menuGeomMtx);
+            EnsureMenuVB(g_menuGeom.size()*sizeof(float));
+            if (g_menuVBMap) memcpy(g_menuVBMap, g_menuGeom.data(), g_menuGeom.size()*sizeof(float));
+        } else { EnsureMenuVB(sizeof(quads)); if (g_menuVBMap) memcpy(g_menuVBMap, quads, sizeof(quads)); }
         VkClearValue cv{}; cv.color.float32[0]=0.06f; cv.color.float32[1]=0.06f; cv.color.float32[2]=0.10f; cv.color.float32[3]=1.0f;
         VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         rp.renderPass = g_renderPass; rp.framebuffer = g_framebuffers[idx];
@@ -587,12 +595,20 @@ bool PresentOnce() {
         vkCmdSetViewport(g_cmd, 0, 1, &vp); vkCmdSetScissor(g_cmd, 0, 1, &scs);
         VkDeviceSize voff = 0; vkCmdBindVertexBuffers(g_cmd, 0, 1, &g_menuVB, &voff);
         MenuPC pc{}; for (int i = 0; i < 16; i++) pc.mvp[i] = (i % 5 == 0) ? 1.0f : 0.0f;   // identity (verts already clip-space)
-        const float cols[3][4] = {{1.0f,0.2f,0.2f,0.6f},{0.2f,1.0f,0.2f,0.6f},{0.3f,0.4f,1.0f,0.8f}};
-        for (int q = 0; q < 3; q++) { memcpy(pc.color, cols[q], 16);
+        if (subVerts > 0) {                                      // Layer 2: draw the real menu geometry (flat color)
+            const float white[4] = {0.85f, 0.85f, 0.90f, 0.85f}; memcpy(pc.color, white, 16);
             vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-            vkCmdDraw(g_cmd, 6, 1, q * 6, 0); }
+            vkCmdDraw(g_cmd, subVerts, 1, 0, 0);
+        } else {                                                 // REX_MENUTEST: hardcoded validation rects
+            const float cols[3][4] = {{1.0f,0.2f,0.2f,0.6f},{0.2f,1.0f,0.2f,0.6f},{0.3f,0.4f,1.0f,0.8f}};
+            for (int q = 0; q < 3; q++) { memcpy(pc.color, cols[q], 16);
+                vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+                vkCmdDraw(g_cmd, 6, 1, q * 6, 0); }
+        }
         vkCmdEndRenderPass(g_cmd);
-        bool cap = g_shotTarget && g_frame == g_shotTarget;
+        static bool s_geomCap = false;   // capture the first frame that has REAL submitted geometry
+        bool cap = (g_shotTarget && g_frame == g_shotTarget) || (subVerts > 0 && !s_geomCap);
+        if (subVerts > 0) s_geomCap = true;
         if (cap) { EnsureCaptureBuffer();
             if (g_capBuf) {
                 ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -785,6 +801,14 @@ void PublishVideo(const uint32_t* guestBufAddrs, const uint32_t* guestBufSizes, 
     g_vbufs.store(guestBufAddrs);    // points at kernel.cpp's g_videoBufs[] (stable once captured)
     g_vsizes.store(guestBufSizes);   // and g_videoBufSz[]
     g_vbufN.store(count);
+}
+
+void SubmitMenuGeometry(const float* clipXY, int vertCount) {
+    if (!g_enabled || vertCount <= 0) return;
+    std::lock_guard<std::mutex> lk(g_menuGeomMtx);
+    g_menuGeom.assign(clipXY, clipXY + (size_t)vertCount * 2);
+    g_menuGeomVerts.store(vertCount);
+    fprintf(stderr, "[render] GPU-build: menu geometry submitted (%d verts)\n", vertCount);
 }
 
 } // namespace rex_render

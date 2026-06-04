@@ -2280,6 +2280,7 @@ PPC_FUNC(__imp__VdSwap) {
             // frame (the title sets state once, draws many times). Pure read/track — NO execution, NO side
             // effects (unlike running ExecutePM4 on the segments, which would fire interrupts/fences).
             uint32_t st[0x340] = {0}, fetch[0x180] = {0}; int drawDumps = 0;   // fetch[] = vertex/texture fetch consts 0x4800-0x497F
+            uint32_t menuPoolBase = 0;   // Layer 2: the content draws' kVertex pool base, captured during the walk
             auto stset = [&](uint32_t r, uint32_t v){ if (r >= 0x2000 && r < 0x2340) st[r-0x2000] = v;
                                                       else if (r >= 0x4800 && r < 0x4980) fetch[r-0x4800] = v; };
             auto stget = [&](uint32_t r){ return (r >= 0x2000 && r < 0x2340) ? st[r-0x2000] : (r >= 0x4800 && r < 0x4980 ? fetch[r-0x4800] : 0u); };
@@ -2330,6 +2331,7 @@ PPC_FUNC(__imp__VdSwap) {
                                 int nvb=0; uint32_t firstVb=0; for(uint32_t s=0;s<48&&nvb<3;s++){ uint32_t d0=stget(0x4800+s*2); if((d0&3)!=3)continue;
                                     uint32_t d1=stget(0x4800+s*2+1), vb=d0&0xFFFFFFFCu, vw=(d1>>2)&0xFFFFFF;
                                     if(!vb||!vw)continue; if(!firstVb)firstVb=vb; go+=snprintf(g+go,sizeof(g)-go," | vf%u@0x%X(%uB)",s,vb,vw*4); nvb++; }
+                                if (firstVb && !menuPoolBase) menuPoolBase = firstVb;   // Layer 2: remember the pool base
                                 fprintf(stderr, "  [drawgeo] seg#%d #%d %s\n", di, drawDumps, g);
                                 // Piece-3b increment 3: one-shot dump to RE the vertex format. Show ALL fetch slots (raw),
                                 // then locate the actual vertex data (scan candidate base translations for non-zero).
@@ -2395,6 +2397,36 @@ PPC_FUNC(__imp__VdSwap) {
                             a2+=cnt*4; }
                     }
                     fprintf(stderr,"[segdump] (end; %d packets shown)\n", pk<120?pk:120);
+                }
+            }
+            // Piece-3b Layer 2: extract the menu geometry from the vertex pool + submit to the render thread
+            // (auto-fit to clip). The vertex stream is fetch slot 1 (RE'd). Collect contiguous screen-coord
+            // float2 verts from the pool's dense region, treat as quad-list (groups of 4 -> 2 tris), map the
+            // bbox to clip [-0.9,0.9] (Y-flipped). One-shot, only when the renderer is active. APPROXIMATE
+            // (per-draw pool offset still unpinned) — a "does the title's real geometry form a UI" test.
+            if (rex_render::Enabled()) {
+                static std::atomic<bool> submitted{false}; bool se=false;
+                if (menuPoolBase && submitted.compare_exchange_strong(se,true)) {   // pool base from the content draws
+                    uint32_t vg = 0xA0000000u | (menuPoolBase & 0x1FFFFFFFu);
+                    auto scr=[&](uint32_t w){ float f; memcpy(&f,&w,4); return f>=1.0f && f<=2048.0f; };
+                    uint32_t dense=0; for(uint32_t o=0;o<0xC00000 && !dense;o+=4){ int h=0; for(int k=0;k<16;k++) if(scr(GLD32(vg+o+k*4)))h++; if(h>=6)dense=o; }
+                    std::vector<float> v; int gap=0;                       // contiguous screen-coord float2 verts
+                    for(uint32_t o=dense; o<dense+0x80000 && v.size()<16000; o+=8){
+                        uint32_t wx=GLD32(vg+o), wy=GLD32(vg+o+4); float x,y; memcpy(&x,&wx,4); memcpy(&y,&wy,4);
+                        bool ok = x>=0&&x<=4096&&y>=0&&y<=4096 && !(x==0&&y==0);
+                        if(ok){ v.push_back(x); v.push_back(y); gap=0; } else if(++gap>32 && !v.empty()) break;
+                    }
+                    if(v.size()>=8){ float minx=1e30f,miny=1e30f,maxx=-1e30f,maxy=-1e30f;
+                        for(size_t i=0;i<v.size();i+=2){ if(v[i]<minx)minx=v[i]; if(v[i]>maxx)maxx=v[i]; if(v[i+1]<miny)miny=v[i+1]; if(v[i+1]>maxy)maxy=v[i+1]; }
+                        float sx=(maxx>minx)?1.8f/(maxx-minx):0.0f, sy=(maxy>miny)?1.8f/(maxy-miny):0.0f;
+                        std::vector<float> tri; size_t nq=(v.size()/2)/4;   // quad-list -> tri-list (0,1,2, 0,2,3)
+                        for(size_t q=0;q<nq;q++){ float qx[4],qy[4];
+                            for(int k=0;k<4;k++){ qx[k]=(v[(q*4+k)*2]-minx)*sx-0.9f; qy[k]=-((v[(q*4+k)*2+1]-miny)*sy-0.9f); }
+                            static const int id6[6]={0,1,2,0,2,3}; for(int t=0;t<6;t++){ tri.push_back(qx[id6[t]]); tri.push_back(qy[id6[t]]); } }
+                        fprintf(stderr,"[menugeo] pool=0x%X dense=+0x%X collected %zu verts -> %zu tris bbox=(%.0f,%.0f)-(%.0f,%.0f)\n",
+                                vg, dense, v.size()/2, tri.size()/6, minx,miny,maxx,maxy);
+                        rex_render::SubmitMenuGeometry(tri.data(), (int)(tri.size()/2));
+                    }
                 }
             }
             fprintf(stderr, "[chunkdump] TOTALS over %d segments: realDraws=%d rectDraws=%d texFetch=%d  => %s\n",
