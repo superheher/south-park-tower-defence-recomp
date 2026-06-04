@@ -595,10 +595,16 @@ bool PresentOnce() {
         vkCmdSetViewport(g_cmd, 0, 1, &vp); vkCmdSetScissor(g_cmd, 0, 1, &scs);
         VkDeviceSize voff = 0; vkCmdBindVertexBuffers(g_cmd, 0, 1, &g_menuVB, &voff);
         MenuPC pc{}; for (int i = 0; i < 16; i++) pc.mvp[i] = (i % 5 == 0) ? 1.0f : 0.0f;   // identity (verts already clip-space)
-        if (subVerts > 0) {                                      // Layer 2: draw the real menu geometry (flat color)
-            const float white[4] = {0.85f, 0.85f, 0.90f, 0.85f}; memcpy(pc.color, white, 16);
-            vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-            vkCmdDraw(g_cmd, subVerts, 1, 0, 0);
+        if (subVerts > 0) {                                      // Layer 2: draw the real menu geometry, per-quad colors
+            // Draw in 6-vert (1 quad = 2 tris) chunks with a cycling palette + alpha, so individual UI
+            // rectangles are distinguishable (a flat color makes overlaps an unreadable soup).
+            static const float pal[6][3] = {{0.95f,0.35f,0.35f},{0.35f,0.85f,0.40f},{0.40f,0.55f,0.95f},
+                                            {0.95f,0.85f,0.35f},{0.85f,0.45f,0.90f},{0.40f,0.90f,0.90f}};
+            for (int q = 0; q*6 + 6 <= subVerts; q++) {
+                pc.color[0]=pal[q%6][0]; pc.color[1]=pal[q%6][1]; pc.color[2]=pal[q%6][2]; pc.color[3]=0.55f;
+                vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+                vkCmdDraw(g_cmd, 6, 1, q * 6, 0);
+            }
         } else {                                                 // REX_MENUTEST: hardcoded validation rects
             const float cols[3][4] = {{1.0f,0.2f,0.2f,0.6f},{0.2f,1.0f,0.2f,0.6f},{0.3f,0.4f,1.0f,0.8f}};
             for (int q = 0; q < 3; q++) { memcpy(pc.color, cols[q], 16);
