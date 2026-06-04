@@ -131,8 +131,10 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
             // child[0] = r30 (obj+144). Its completion poll is child->vtable[9] (=*(child_vt+36), called at
             // sub_82248010 lr=0x822481A0; returns 2=pending/3=advance/else=done). Pin it + what it reads.
             uint32_t cvt = rd(r30), poll9 = cvt ? rd(cvt + 36) : 0;
-            fprintf(stderr, "[polldiag] #%d pump=0x%08X r30=0x%08X *(r30+136)=%u(state) r31=0x%08X obj=*(r31-4412)=0x%08X vtable=0x%08X method+32=0x%08X | child[0]_vtable=0x%08X completion_poll=vtable[9]=sub_%08X\n",
-                    pn, target, r30, rd(r30 + 136), r31, obj, vt, vt ? rd(vt + 32) : 0, cvt, poll9);
+            // *(child+208) is the completion field the state-3 handler reads (via vtable[9]=sub_82105948).
+            // PROD: sub_822484D0 sets it to 1 (ready) -> state 3 reaches done. Compare variant A's value.
+            fprintf(stderr, "[polldiag] #%d state=*(r30+136)=%u *(child+208)=%u(prod=1=ready) child[0]_vtable=0x%08X poll9=sub_%08X | r30=0x%08X r31=0x%08X\n",
+                    pn, rd(r30 + 136), rd(r30 + 208), cvt, poll9, r30, r31);
         }
     }
     // (cont.22 loop-iter 6: a REX_POLLFORCE experiment that forced *(r30+136)=done + skipped the pump did NOT
