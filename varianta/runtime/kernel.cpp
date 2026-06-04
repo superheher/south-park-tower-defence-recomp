@@ -58,6 +58,30 @@ void PPCIndirectNull(uint32_t target, uint32_t lr)
         fprintf(stderr, "[INDIRECT-NULL] target=0x%08X (caller lr=0x%08X)\n", target, lr);
 }
 
+// A dispatch-table slot must hold one of the recompiled function pointers. Compute the valid host-pointer
+// range [lo,hi] once from PPCFuncMappings[]; a slot outside it is corruption, not a real function.
+// cont.22: the dispatch table lives in GUEST-WRITABLE space at g_base+0x82930000 (= PPC_IMAGE_BASE+SIZE,
+// right after the image), and the title's own post-image runtime data — file-path strings ("game:\\media\\…"),
+// floats, 0xFFFFFFFF sentinels — OVERWRITES the slots for its frontend/render fns (measured: 0x82150970..
+// 0x821CC7A0 all garbage). PPC_LOOKUP_FUNC / DispatchLookup then return a GARBAGE non-null pointer that the
+// old `if (fn)` null-check happily CALLED -> SIGSEGV at a wild rip (e.g. 0xffffffff40f62598, called by the
+// VblankPump's source=0 graphics-interrupt). This is almost certainly the root of the long-standing
+// render-path "string-as-code" / INDIRECT-NULL crashes (cont.10–21). Validating the pointer turns the crash
+// into a clean log+skip. [The real fix is to RELOCATE the table out of guest-usable space — NIGHT-LOG cont.22.]
+static bool ValidHostFn(PPCFunc* fn) {
+    static const std::pair<uintptr_t, uintptr_t> bounds = []{
+        uintptr_t lo = ~uintptr_t(0), hi = 0;
+        for (size_t i = 0; PPCFuncMappings[i].host; i++) {
+            uintptr_t h = reinterpret_cast<uintptr_t>(PPCFuncMappings[i].host);
+            if (h < lo) lo = h;
+            if (h > hi) hi = h;
+        }
+        return std::make_pair(lo, hi);
+    }();
+    uintptr_t p = reinterpret_cast<uintptr_t>(fn);
+    return p >= bounds.first && p <= bounds.second;
+}
+
 // Every guest indirect branch/call (bctr/bctrl) routes here via rex_indirect.h's PPC_CALL_INDIRECT_FUNC.
 // CRITICAL: bounds-check the target against the recompiled code range BEFORE indexing the function table.
 // A recovered switch-table's out-of-range fallback (or any corrupted code pointer) can hand us a wild
@@ -65,6 +89,15 @@ void PPCIndirectNull(uint32_t target, uint32_t lr)
 // target far below CODE_BASE wraps to a slot gigabytes past the 4 GiB guest mapping — faulting the lookup
 // READ itself. So: dispatch only in-range, mapped targets; log+skip everything else (in-range-but-unmapped
 // = a still-missing jump-table case; out-of-range = a data divergence the title would also fault on).
+// ⚠ The upper bound MUST be CODE_BASE+CODE_SIZE (the table's real extent: 1 PPCFunc* per 4 guest code
+// bytes), NOT IMAGE_BASE+IMAGE_SIZE. The image (0x82000000..0x82930000) extends ~3.3 MiB of .data/.rodata
+// PAST the code end (0x825F0C18) — and the title's vtables/rodata live exactly there (0x826xxxx..0x828xxxx).
+// A target in [code_end, image_end) passed the old (IMAGE_SIZE) check, then indexed PAST the function table
+// into adjacent guest memory: a non-null GARBAGE host pointer that sailed past the `if (fn)` null-check and
+// was CALLED -> SIGSEGV at a wild rip. cont.22: this crashed the source=0 vblank graphics-interrupt (the
+// pump-driven render DPC sub_821BF748 dispatched a stale pooled callback holding a DATA/vtable pointer in
+// that window — a NOTOKEN pump↔guest race). Bounding by CODE_SIZE turns those into clean log+skip. Valid
+// code targets are all < code_end, so legit dispatch (and the default cooperative boot) is unaffected.
 void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
 {
     // REX_TRACEB740: log every indirect (bctrl) call made from within sub_8211B740 (its call sites'
@@ -73,14 +106,21 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
     // dispatch to sub_8210AF90 (the 0x828E82A6 setter) ever fires.
     uint32_t lr = static_cast<uint32_t>(ctx.lr);
     bool trace = g_traceB740 && lr >= 0x8211B748u && lr < 0x8211C000u;
-    if (target >= PPC_CODE_BASE && target < (PPC_IMAGE_BASE + PPC_IMAGE_SIZE))
+    if (target >= PPC_CODE_BASE && target < (PPC_CODE_BASE + PPC_CODE_SIZE))
     {
         PPCFunc* fn = PPC_LOOKUP_FUNC(base, target);
-        if (fn) {
+        if (ValidHostFn(fn)) {
             fn(ctx, base);
             if (trace) fprintf(stderr, "[b740] bctrl lr=0x%08X -> 0x%08X returned r3=0x%08X%s\n",
                                lr, target, ctx.r3.u32, target == 0x8210AF90u ? "  <== sub_8210AF90!" : "");
             return;
+        }
+        if (fn) {   // non-null but outside the valid host-fn range = a CORRUPTED table slot (cont.22) —
+            static std::mutex cm; static std::unordered_set<uint32_t> cseen;   // log once/target, then skip
+            std::lock_guard<std::mutex> clk(cm);
+            if (cseen.insert(target).second)
+                fprintf(stderr, "[DISPATCH-CORRUPT] guest 0x%08X slot=%p (lr=0x%08X) — table overwritten, skipped\n",
+                        target, (void*)fn, lr);
         }
     }
     // Recompiler jump-table-gap recovery: XenonAnalyse misidentified some switch jump-tables as code and
@@ -781,8 +821,10 @@ PPCFunc* DispatchLookup(uint32_t addr) {
         + (uint64_t(addr - PPC_CODE_BASE) * 2));
 }
 void CallGuest(uint32_t addr, PPCContext& ctx) {
-    if (PPCFunc* fn = DispatchLookup(addr)) fn(ctx, g_base);
-    else fprintf(stderr, "[thread] CallGuest: no host fn at 0x%X\n", addr);
+    PPCFunc* fn = DispatchLookup(addr);
+    if (ValidHostFn(fn)) fn(ctx, g_base);     // ValidHostFn rejects a corrupted/garbage slot (cont.22) so
+    else fprintf(stderr, "[thread] CallGuest: corrupt/missing slot for 0x%X (fn=%p) — skipped\n",
+                 addr, (void*)fn);             // we log+skip instead of calling a wild pointer -> SIGSEGV
 }
 
 // Per-thread arena (KTHREAD+KPCR+TLS) + worker stacks, all ABOVE the image so the title's big

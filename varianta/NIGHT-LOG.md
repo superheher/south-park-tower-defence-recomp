@@ -2338,3 +2338,51 @@ Implemented the corrected pillar A (kernel.cpp, gated `REX_CPCOMPLETE`, default 
 **Bonus:** `REX_CPCOMPLETE` is a genuine improvement to keep — it flows the ring AND stabilizes the title (60s no-crash, reaches shader-load) where the prior baseline SIGSEGV'd ~33s. Good foundation for pillar B.
 
 **NEXT (the real remaining work = pillar B + the coupling):** build the DRAW_INDX→Vulkan translator (VkPipeline from reg-file state + the now-loaded .updb shaders→SPIR-V + vertex-fetch + textures), wire it so executing a kicked submission produces a REAL completion (fence advance + counter decrement reflecting actual GPU work), and iterate the A↔B coupling so the title advances from setup IBs to content draw IBs. Run CPCOMPLETE as the ring-flow + stability base. Committed (gated, default-safe, NOT pushed).
+
+## cont.22 (2026-06-04, autonomous) — ⭐ RE-GROUNDING cont.21: title is NOT at menu-content render (it's stuck in the frontend MOVIE/ATTRACT loop); ring-flow ≠ content; and the real crash is DISPATCH-TABLE corruption (the table lives in guest-WRITABLE space)
+
+cont.21 concluded "second gate = pillar-A↔B coupling; build the PM4→Vulkan draw translator." Three independent measurements this session **correct that framing**: the title never reaches menu-content rendering at all, so there are no content draws to translate yet — the blocker is upstream, and the crash that limits every run is a memory-corruption bug in the harness, not a renderer gap.
+
+### 1. The pending-counter device+0x2b04: variant-A RUNAWAY vs prod BOUNDED-at-1 (measured)
+- Variant A, natural CPCOMPLETE path (`REX_KICKGATE`): **r3 == dev == g_interruptData == 0x26F80** (all the same object — CPCOMPLETE drains the *correct* counter; not a wrong-counter bug). The title is **NOT idle**: it calls the kick gate sub_821C6C80 **15,768×** (16 KICK + **15,752 DEFER**) — it *hammers* the submit path. `device+0x2b04` climbs monotonically 0→0xA+ because CPCOMPLETE drains **1/vblank (~60/s)** while the title increments **~7–8/vblank** (`[cpcomplete]` log shows the counter jump 1→9→16→24 between drains). The gate is permanently closed by a **drain-RATE mismatch**, NOT "the title stopped submitting" (cont.21's wording corrected).
+- **Prod** (`tools/prod_counter.gdb`, break sub_821C6C80 / sub_821CC140 / sub_821CCA28; dev=0x40016f80): `device+0x2b04` oscillates **strictly 0↔1 — cmax=1 over 33,000 kick-gate samples** (hist {0:18019, 1:14981}, ~55% KICK), the decrement keeping per-submission pace. ⇒ the faithful pillar-A drain must be **per-submission (bounding ≤1)**, NOT 1/vblank. But see §2 — this does not unlock content.
+
+### 2. Ring flow ≠ content (measured + cont.15)
+Across all kick rates — 16 (natural, this session) and 2725 (forced-to-0, cont.15) — the title builds **only `init=0x30088` degenerate rects, 0 textured draws**. More ring flow does NOT produce content. The pending-counter is a solved-in-principle downstream lever; it is **not** the content gate.
+
+### 3. cont.21's OPEN QUESTION resolved — the title is in the frontend MOVIE/ATTRACT loop, not the menu (measured backtrace)
+gdb all-thread bt at the natural plateau — the **main thread**:
+```
+sub_82150970 (frontend) → sub_82222258 → sub_822132A0 → sub_82426E50 → sub_824267B0
+  → sub_82425BF8 (the intro/attract MOVIE WIDGET) → sub_821BE680 → sub_821BDF00/DE40
+  → sub_821C0A70 → sub_821C6E58 (GPU fence-wait) → sub_821B9270 (spin)
+```
+The main thread is **driving the movie widget and spinning on a GPU fence** — NOT at menu-content rendering. The "menu shaders loaded (Simple/SPTextured/SimpleCol/SpHud…)" is **precache** during the movie screen, not active menu draw. (cont.21's "reaches the menu" is overstated: it reaches the *frontend* but is stuck on the movie/attract screen.) The forced path (MOVIE_EOF+XFLAG, cont.7/21) gets *past* the movie but stalls at menu-SETUP null vtable sub_8215DE84 — also not content. **Neither path reaches menu-content rendering.**
+
+⇒ cont.21's "build the PM4→Vulkan translator NOW" is **premature / out of order**: there are no content draws to translate because the title never gets to content rendering. (The translator is not *wrong* — prod's menu renders 54 pipelines, so variant A's menu will eventually need it — it's just next-after reaching the menu.)
+
+### 4. The natural-path crash is OURS: DISPATCH-TABLE CORRUPTION (measured + root-caused)
+The natural path crashes ~15–20s (NOT cont.21's "60s no-crash" — that was a lucky race outcome; the INDIRECT-NULL cascade is the cont.12(c9) race). Crash bt: **the VblankPump** → `FireGfxInterrupt(cb=0x821C7170, source=0/vblank) → CallGuest(0x821C7170)` → a garbage rip **0xffffffff40f62598**, with **no sub_821C7170 frame** — `DispatchLookup(0x821C7170)` *itself* returned the garbage. The dispatch-table slot for sub_821C7170 (called fine early, cont.13) is **corrupted**.
+
+Direct gdb read of the table at the crash — **every sampled slot is garbage**:
+```
+sub_821C7170  slot=guest 0x82abe2e0  *slot=0xffffffff40f62598
+sub_821C6600  slot=guest 0x82abcc00  *slot=0xffffffff00008f82
+sub_82150970  slot=guest 0x829d12e0  *slot=0xffffffffffffffff
+sub_821CC7A0  slot=guest 0x82ac8f40  *slot=0x0000000000000000
+raw bytes @ slot:  98 25 f6 40 ff ff ff ff … 67 61 6d 65 3a 5c 6d 65 64 69 61 5c  = "game:\media\"
+```
+**ROOT CAUSE:** the dispatch table is placed at `g_base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE = g_base + 0x82930000` — i.e. **inside the guest-writable 4 GiB mmap, immediately after the image** — and extends to 0x83311830 (CODE_SIZE·2, 1 PPCFunc* per 4 code bytes). The title's own **post-image runtime data** (file-path strings `"game:\media\…"`, floats, 0xFFFFFFFF sentinels) lands in [0x82930000, …) and **overwrites the table slots for its frontend/render functions** (measured corruption spans the slots for 0x82150970..0x821CC7A0). `DispatchLookup`/`PPC_LOOKUP_FUNC` then return garbage pointers that the unguarded `if (fn)` happily CALLED → SIGSEGV. **This is almost certainly the root of the long-standing render-path "string-as-code" / INDIRECT-NULL crashes (cont.10–21)** — this session also logged INDIRECT-NULL targets `0x67616D65`("game"), `0x6C6F6261`("Glob"), `0x41737365`("Asse"ts), `0x74735C47` at lr=0x82204D08 (the cont.12 string-as-code site), all path fragments interpreted as code.
+
+### Fixes shipped (default-safe, default-boot verified unregressed)
+- **(a) PPCInvokeGuest range bound: IMAGE_SIZE → CODE_SIZE.** The dispatch check admitted targets up to image_end (0x82930000), but the table only covers code_end (0x825F0C18); the [code_end, image_end) gap — where the title's vtables/rodata (0x826xxxx–0x828xxxx) live — indexed PAST the table into garbage. Correct latent bug, fixed.
+- **(b) Host-fn-pointer validity guard (`ValidHostFn`).** Compute [lo,hi] of the recompiled fn pointers once from `PPCFuncMappings[]`; in BOTH `PPCInvokeGuest` and `CallGuest`, skip+log (`[DISPATCH-CORRUPT]` / `CallGuest: corrupt`) a looked-up pointer outside that range instead of calling it. Turns the corrupted-slot crash into a clean skip.
+- **Verification:** default boot — 0 guard-fires, 0 device-overwrite, 30s no crash (unregressed). Natural path — under gdb it ran the **full 55s with NO crash while the guard caught 2107 corrupted-slot dispatches** (render-path sites lr=0x821BF834/0x821C84C0/0x821C8578). Non-gdb 3× sample: **2/3 survived 45s (guard caught 1515/1528)**, 1/3 still crashed (40 catches before a different-path fault). So the guard substantially improves stability (was always-crash ~15s) but is a **partial** mitigation — it catches the dispatch-READ crash class; it does NOT stop the corruption, and skipping a needed call can perturb downstream state.
+- ⚠ **The complete fix = RELOCATE the dispatch table out of guest-usable space.** Either (best) put it in a SEPARATE host allocation (not inside g_base), or move its base from `PPC_IMAGE_BASE+PPC_IMAGE_SIZE` to a verified-unused guest region. Both touch `PPC_LOOKUP_FUNC` (ppc/ppc_context.h:113) + runtime.cpp:70 + kernel.cpp `DispatchLookup` → full recompile. The title's post-image data extends at least to ~0x82ac9000 (measured); pick the relocation target well clear of the title's data.
+
+### NEXT (corrected priorities)
+1. **Relocate the dispatch table** out of [0x82930000, …) (separate host allocation is cleanest) — the real fix for the corruption / string-as-code crash class; likely unblocks much of the render-path instability seen across cont.10–21.
+2. **Reach the actual menu** (the true content-render gate): resolve the frontend movie/attract→menu transition — the movie GPU-fence sub_821C6E58 / movie EOS via the real VC-1 decoder + fair scheduler (the cont.9/10 Step-1 thread); or, on the forced path, recover the menu-setup null vtable sub_8215DE84 (cont.7).
+3. **THEN** assess menu content draws and build pillar B (DRAW_INDX→Vulkan). The faithful pillar-A counter drain (per-submission, bounding ≤1 like prod) is a downstream lever, not the gate.
+
+New tool: `tools/prod_counter.gdb` (prod device+0x2b04 oscillation + inc/dec rates — reusable). Committed (gated, default-safe, NOT pushed).
