@@ -2327,10 +2327,30 @@ PPC_FUNC(__imp__VdSwap) {
                                     go+=snprintf(g+go,sizeof(g)-go,"idx %s base=0x%X count=%u",(init>>11)&1?"u32":"u16",ib,sz); }
                                 else go+=snprintf(g+go,sizeof(g)-go,"%s",src==2?"auto-index":src==1?"immediate":"?");
                                 // vertex streams: fetch constants (2-dword slots @0x4800), type[1:0]==3 = kVertex.
-                                int nvb=0; for(uint32_t s=0;s<48&&nvb<3;s++){ uint32_t d0=stget(0x4800+s*2); if((d0&3)!=3)continue;
+                                int nvb=0; uint32_t firstVb=0; for(uint32_t s=0;s<48&&nvb<3;s++){ uint32_t d0=stget(0x4800+s*2); if((d0&3)!=3)continue;
                                     uint32_t d1=stget(0x4800+s*2+1), vb=d0&0xFFFFFFFCu, vw=(d1>>2)&0xFFFFFF;
-                                    if(!vb||!vw)continue; go+=snprintf(g+go,sizeof(g)-go," | vf%u@0x%X(%uB)",s,vb,vw*4); nvb++; }
-                                fprintf(stderr, "  [drawgeo] seg#%d #%d %s\n", di, drawDumps, g); } }
+                                    if(!vb||!vw)continue; if(!firstVb)firstVb=vb; go+=snprintf(g+go,sizeof(g)-go," | vf%u@0x%X(%uB)",s,vb,vw*4); nvb++; }
+                                fprintf(stderr, "  [drawgeo] seg#%d #%d %s\n", di, drawDumps, g);
+                                // Piece-3b increment 3: one-shot dump to RE the vertex format. Show ALL fetch slots (raw),
+                                // then locate the actual vertex data (scan candidate base translations for non-zero).
+                                static std::atomic<bool> vdumped{false}; bool vde=false;
+                                if (firstVb && vdumped.compare_exchange_strong(vde,true)) {
+                                    fprintf(stderr, "[vtxdump] draw op=0x%X prim=%u numI=%u — fetch slots (d0 d1 -> type/byteaddr/words):\n", op, init&0x3F, init>>16);
+                                    for(uint32_t s=0;s<24;s++){ uint32_t d0=stget(0x4800+s*2),d1=stget(0x4800+s*2+1);
+                                        if(!d0&&!d1)continue; fprintf(stderr,"  slot%u: %08X %08X  type=%u addr=0x%X words=%u\n",s,d0,d1,d0&3,d0&0xFFFFFFFCu,(d1>>2)&0xFFFFFF); }
+                                    // The fetch addr could be the 0xA physical window, a direct low guest addr, or offset into a
+                                    // 10MB pool that's mostly empty. Scan each candidate for the first non-zero 16B and dump it.
+                                    uint32_t cands[2] = { 0xA0000000u|(firstVb&0x1FFFFFFFu), firstVb };
+                                    for(int ci=0; ci<2; ci++){ uint32_t bvg=cands[ci]; uint32_t hit=0;
+                                        for(uint32_t o=0;o<0xC00000;o+=16){ if(GLD32(bvg+o)||GLD32(bvg+o+4)||GLD32(bvg+o+8)||GLD32(bvg+o+12)){hit=o;break;} }
+                                        fprintf(stderr,"[vtxdump] base 0x%X: first non-zero @+0x%X%s\n", bvg, hit, hit==0?"(or none)":"");
+                                        if(hit||GLD32(bvg)){ for(int r=0;r<8;r++){ char ln[256]; size_t lo=0; uint32_t b=bvg+hit+r*16;
+                                            lo+=snprintf(ln+lo,sizeof(ln)-lo,"   +0x%X:",hit+r*16);
+                                            for(int c=0;c<4;c++){uint32_t w=GLD32(b+c*4);lo+=snprintf(ln+lo,sizeof(ln)-lo," %08X",w);}
+                                            lo+=snprintf(ln+lo,sizeof(ln)-lo,"  |");
+                                            for(int c=0;c<4;c++){uint32_t w=GLD32(b+c*4);float f;memcpy(&f,&w,4);lo+=snprintf(ln+lo,sizeof(ln)-lo," %g",f);}
+                                            fprintf(stderr,"%s\n",ln); } } }
+                                } } }
                         else if (op==0x2D){ setc++; uint32_t ot=GLD32(a); uint32_t ty=(ot>>16)&0xFF, ix=ot&0x7FF;
                             if (ty==1){ bool t1=false; for(uint32_t j=1;j<cnt&&a+j*4+4<=end;j++){ stset(0x4800+ix+(j-1), GLD32(a+j*4));
                                             if(!t1 && (((GLD32(a+j*4)>>12)&0xFFFFF)<<12)>=0xA0000000u){tex++;t1=true;} } }
