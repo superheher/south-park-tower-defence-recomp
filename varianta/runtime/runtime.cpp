@@ -13,6 +13,7 @@
 #include <cstring>
 
 uint8_t* g_base = nullptr;
+uint8_t* g_funcTableBase = nullptr;   // dispatch table — a SEPARATE host allocation (see kernel.h / cont.22)
 
 static PPCFunc* LookupHost(uint32_t guestAddr)
 {
@@ -60,15 +61,26 @@ int main(int argc, char** argv)
             memcpy(g_base + s.base, s.data, s.size);
     }
 
-    // 4. Populate the indirect-call dispatch table (PPC_LOOKUP_FUNC layout) from PPCFuncMappings[].
-    fprintf(stderr, "[loader] sections mapped; populating dispatch table at guest 0x%llX...\n",
-        (unsigned long long)(PPC_IMAGE_BASE + PPC_IMAGE_SIZE));
+    // 4. Allocate + populate the indirect-call dispatch table (PPC_LOOKUP_FUNC byte layout: one PPCFunc* per
+    //    4 guest code bytes, byte-indexed by (addr-CODE_BASE)*2) from PPCFuncMappings[]. cont.22: this table
+    //    MUST live OUTSIDE the guest 4 GiB mmap. Placing it at g_base+PPC_IMAGE_BASE+PPC_IMAGE_SIZE (=0x82930000,
+    //    immediately after the image) put it in guest-WRITABLE memory the title uses for its own post-image
+    //    data (path strings "game:\\media\\…", floats) — which overwrote the slots for the title's render/
+    //    frontend functions and crashed every indirect call through them (SIGSEGV on a wild pointer). A
+    //    separate host allocation is unreachable by guest stores. Layout/index unchanged, so the read sites in
+    //    kernel.cpp (PPCInvokeGuest / DispatchLookup -> HostFnAt) just point at g_funcTableBase instead.
+    size_t tableBytes = static_cast<size_t>(PPC_CODE_SIZE) * 2 + 4096;   // +slack for the last 8-byte slot
+    g_funcTableBase = static_cast<uint8_t*>(mmap(nullptr, tableBytes, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+    if (g_funcTableBase == MAP_FAILED) { perror("mmap dispatch table"); return 1; }
+    fprintf(stderr, "[loader] sections mapped; dispatch table at host %p (0x%zX B, OUT of guest space)...\n",
+        (void*)g_funcTableBase, tableBytes);
     size_t nfuncs = 0;
     for (size_t i = 0; PPCFuncMappings[i].host != nullptr; i++)
     {
         uint32_t addr = static_cast<uint32_t>(PPCFuncMappings[i].guest);
-        *reinterpret_cast<PPCFunc**>(g_base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE
-            + (uint64_t(addr - PPC_CODE_BASE) * 2)) = PPCFuncMappings[i].host;
+        *reinterpret_cast<PPCFunc**>(g_funcTableBase + (uint64_t(addr - PPC_CODE_BASE) * 2))
+            = PPCFuncMappings[i].host;
         ++nfuncs;
     }
     fprintf(stderr, "[loader] mapped %zu sections, %zu functions into the dispatch table\n",

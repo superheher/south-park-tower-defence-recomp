@@ -58,16 +58,23 @@ void PPCIndirectNull(uint32_t target, uint32_t lr)
         fprintf(stderr, "[INDIRECT-NULL] target=0x%08X (caller lr=0x%08X)\n", target, lr);
 }
 
-// A dispatch-table slot must hold one of the recompiled function pointers. Compute the valid host-pointer
-// range [lo,hi] once from PPCFuncMappings[]; a slot outside it is corruption, not a real function.
-// cont.22: the dispatch table lives in GUEST-WRITABLE space at g_base+0x82930000 (= PPC_IMAGE_BASE+SIZE,
-// right after the image), and the title's own post-image runtime data — file-path strings ("game:\\media\\…"),
-// floats, 0xFFFFFFFF sentinels — OVERWRITES the slots for its frontend/render fns (measured: 0x82150970..
-// 0x821CC7A0 all garbage). PPC_LOOKUP_FUNC / DispatchLookup then return a GARBAGE non-null pointer that the
-// old `if (fn)` null-check happily CALLED -> SIGSEGV at a wild rip (e.g. 0xffffffff40f62598, called by the
-// VblankPump's source=0 graphics-interrupt). This is almost certainly the root of the long-standing
-// render-path "string-as-code" / INDIRECT-NULL crashes (cont.10–21). Validating the pointer turns the crash
-// into a clean log+skip. [The real fix is to RELOCATE the table out of guest-usable space — NIGHT-LOG cont.22.]
+// Resolve a guest code address to its recompiled host fn via the dispatch table. cont.22: the table now lives
+// in a SEPARATE host allocation (g_funcTableBase, allocated out of guest space by runtime.cpp) — NOT at the
+// old g_base+PPC_IMAGE_BASE+PPC_IMAGE_SIZE (which was inside the guest 4 GiB mmap, right after the image, and
+// got overwritten by the title's own post-image data → garbage fn pointers → SIGSEGV). Byte layout unchanged:
+// one PPCFunc* per 4 guest code bytes, byte-indexed by (addr-CODE_BASE)*2. Out-of-code-range addr -> null.
+static inline PPCFunc* HostFnAt(uint32_t guestAddr) {
+    if (guestAddr < PPC_CODE_BASE || guestAddr >= PPC_CODE_BASE + PPC_CODE_SIZE) return nullptr;
+    return *reinterpret_cast<PPCFunc**>(g_funcTableBase + (uint64_t(guestAddr - PPC_CODE_BASE) * 2));
+}
+
+// Belt-and-suspenders after the cont.22 relocation: a slot must still hold one of the recompiled function
+// pointers. Compute the valid host-pointer range [lo,hi] once from PPCFuncMappings[]; a slot outside it is
+// corruption, not a real function. (The table now lives out of guest space, so a guest store can no longer
+// corrupt it — this should never fire; if it ever does, something else did. The old in-guest table at
+// g_base+0x82930000 was overwritten by the title's post-image data, garbaging the slots for its render/
+// frontend fns and crashing every indirect call through them — almost certainly the root of the cont.10–21
+// render-path "string-as-code" crashes.) Cheap sanity net; the default boot never trips it.
 static bool ValidHostFn(PPCFunc* fn) {
     static const std::pair<uintptr_t, uintptr_t> bounds = []{
         uintptr_t lo = ~uintptr_t(0), hi = 0;
@@ -89,15 +96,11 @@ static bool ValidHostFn(PPCFunc* fn) {
 // target far below CODE_BASE wraps to a slot gigabytes past the 4 GiB guest mapping — faulting the lookup
 // READ itself. So: dispatch only in-range, mapped targets; log+skip everything else (in-range-but-unmapped
 // = a still-missing jump-table case; out-of-range = a data divergence the title would also fault on).
-// ⚠ The upper bound MUST be CODE_BASE+CODE_SIZE (the table's real extent: 1 PPCFunc* per 4 guest code
-// bytes), NOT IMAGE_BASE+IMAGE_SIZE. The image (0x82000000..0x82930000) extends ~3.3 MiB of .data/.rodata
-// PAST the code end (0x825F0C18) — and the title's vtables/rodata live exactly there (0x826xxxx..0x828xxxx).
-// A target in [code_end, image_end) passed the old (IMAGE_SIZE) check, then indexed PAST the function table
-// into adjacent guest memory: a non-null GARBAGE host pointer that sailed past the `if (fn)` null-check and
-// was CALLED -> SIGSEGV at a wild rip. cont.22: this crashed the source=0 vblank graphics-interrupt (the
-// pump-driven render DPC sub_821BF748 dispatched a stale pooled callback holding a DATA/vtable pointer in
-// that window — a NOTOKEN pump↔guest race). Bounding by CODE_SIZE turns those into clean log+skip. Valid
-// code targets are all < code_end, so legit dispatch (and the default cooperative boot) is unaffected.
+// ⚠ The upper bound is CODE_BASE+CODE_SIZE (the table's real extent: 1 PPCFunc* per 4 guest code bytes),
+// NOT IMAGE_BASE+IMAGE_SIZE — a target in [code_end 0x825F0C18, image_end 0x82930000) would index PAST the
+// table (HostFnAt's own range check enforces this too). Valid code targets are all < code_end, so legit
+// dispatch and the default cooperative boot are unaffected. (cont.22: the table now lives out of guest space
+// — HostFnAt — so it can't be corrupted by guest stores; ValidHostFn below is a remaining sanity net.)
 void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
 {
     // REX_TRACEB740: log every indirect (bctrl) call made from within sub_8211B740 (its call sites'
@@ -108,7 +111,7 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
     bool trace = g_traceB740 && lr >= 0x8211B748u && lr < 0x8211C000u;
     if (target >= PPC_CODE_BASE && target < (PPC_CODE_BASE + PPC_CODE_SIZE))
     {
-        PPCFunc* fn = PPC_LOOKUP_FUNC(base, target);
+        PPCFunc* fn = HostFnAt(target);
         if (ValidHostFn(fn)) {
             fn(ctx, base);
             if (trace) fprintf(stderr, "[b740] bctrl lr=0x%08X -> 0x%08X returned r3=0x%08X%s\n",
@@ -814,12 +817,9 @@ PPC_FUNC(__imp__RtlInitAnsiString)
 // ====================================================================================================
 namespace {
 
-// Resolve a guest code address to its recompiled host fn via the in-memory dispatch table (the same
-// layout runtime.cpp populates: base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE + (addr - PPC_CODE_BASE)*2).
-PPCFunc* DispatchLookup(uint32_t addr) {
-    return *reinterpret_cast<PPCFunc**>(g_base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE
-        + (uint64_t(addr - PPC_CODE_BASE) * 2));
-}
+// Resolve a guest code address to its recompiled host fn via the relocated dispatch table (HostFnAt reads
+// g_funcTableBase, the separate out-of-guest-space allocation — cont.22; returns null for out-of-range addr).
+PPCFunc* DispatchLookup(uint32_t addr) { return HostFnAt(addr); }
 void CallGuest(uint32_t addr, PPCContext& ctx) {
     PPCFunc* fn = DispatchLookup(addr);
     if (ValidHostFn(fn)) fn(ctx, g_base);     // ValidHostFn rejects a corrupted/garbage slot (cont.22) so

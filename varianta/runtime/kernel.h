@@ -5,6 +5,11 @@
 
 extern uint8_t* g_base;   // guest memory base (4 GiB), defined in runtime.cpp
 
+// The recompiled-function dispatch table, allocated + populated by runtime.cpp. It lives in a SEPARATE host
+// allocation, NOT inside the guest 4 GiB mmap — so guest stores can never corrupt it. (cont.22: the old
+// in-guest table at g_base+PPC_IMAGE_BASE+PPC_IMAGE_SIZE was overwritten by the title's own post-image data.)
+extern uint8_t* g_funcTableBase;
+
 namespace kernel {
 
 // Host directory the guest filesystem maps to (the extracted game dir; set by runtime.cpp from the
