@@ -1343,6 +1343,33 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
             fprintf(stderr, "[drawdec] #%d %s numInd=%u init=0x%X vertexbufs=%d%s\n",
                     (int)ddn.load(), pn, numInd, init, nvb, vbuf);
         }
+        // GPU-build piece 3a (draw-state extraction): read the pipeline state a real draw binds — render
+        // target (RB_SURFACE_INFO pitch/msaa, RB_COLOR_INFO base/format), viewport (PA_CL_VPORT scale/
+        // offset -> width/height), window scissor, blend (RB_BLENDCONTROL0/RB_COLORCONTROL), cull
+        // (PA_SU_SC_MODE_CNTL) and shader-program control (SQ_PROGRAM_CNTL). This is exactly the state the
+        // DRAW_INDX->Vulkan translator turns into a VkPipeline + VkViewport + render pass. Reads the register
+        // file the CP maintains from SET_CONSTANT (0x7FC80000 + reg*4). Reg numbers per rexglue
+        // register_table.inc. Gated REX_DRAWSTATE=N (dump first N non-degenerate draws), default boot off.
+        static const int dsn = []{ const char* e = getenv("REX_DRAWSTATE"); return e ? atoi(e) : 0; }();
+        static std::atomic<int> dsc{0};
+        if (dsn && numInd > 2 && dsc.fetch_add(1) < dsn) {
+            auto rr = [&](uint32_t r){ return GLD32(0x7FC80000u + r*4u); };
+            auto rf = [&](uint32_t r){ uint32_t u = rr(r); float f; memcpy(&f, &u, 4); return f; };
+            const char* pn2 = prim==1?"point":prim==2?"line":prim==4?"tri-list":prim==5?"tri-strip":
+                              prim==6?"tri-fan":prim==8?"RECT-list":prim==0xD?"quad":"?";
+            uint32_t surf = rr(0x2000), col = rr(0x2001), mode = rr(0x2208);
+            uint32_t blend0 = rr(0x2201), cctl = rr(0x2202), progc = rr(0x2180), sumode = rr(0x2205);
+            uint32_t sciTL = rr(0x2081), sciBR = rr(0x2082);
+            float vpw = 2.0f * rf(0x210F), vph = 2.0f * rf(0x2111);   // x/y scale -> viewport w/h (y may be -)
+            fprintf(stderr, "[drawstate] #%d %s numInd=%u | RT pitch=%u msaa=%u colorFmt=%u colorBase=0x%X | "
+                    "vp %.0fx%.0f off(%.1f,%.1f) | scissor (%u,%u)-(%u,%u) | blend0=0x%X colorCtl=0x%X "
+                    "progCntl=0x%X suMode=0x%X mode=0x%X\n",
+                    (int)dsc.load(), pn2, numInd,
+                    (surf & 0x3FFF), (surf>>14)&3, (col>>16)&0xF, (col & 0xFFF),
+                    vpw, vph, rf(0x2110), rf(0x2112),
+                    sciTL & 0x7FFF, (sciTL>>16)&0x7FFF, sciBR & 0x7FFF, (sciBR>>16)&0x7FFF,
+                    blend0, cctl, progc, sumode, mode);
+        }
         break;
       }
       case PM4_XE_SWAP:
