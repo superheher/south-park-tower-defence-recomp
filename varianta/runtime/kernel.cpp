@@ -123,19 +123,20 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
     // stuck state value + the pumped subsystem's object/vtable. Gated, default boot unaffected.
     static const bool g_polldiag = getenv("REX_POLLDIAG") != nullptr;
     if (g_polldiag && lr == 0x82248224u) {
-        static std::mutex pm; static int pn = 0;
+        static std::mutex pm; static int pn = 0; static uint32_t seen = 0; static bool doneLog = false;
         std::lock_guard<std::mutex> lk(pm);
+        auto rd = [&](uint32_t a){ uint32_t b; memcpy(&b, base + a, 4); return __builtin_bswap32(b); };
+        uint32_t r30 = ctx.r30.u32, st = rd(r30 + 136);
         if (pn++ < 8) {
-            auto rd = [&](uint32_t a){ uint32_t b; memcpy(&b, base + a, 4); return __builtin_bswap32(b); };
-            uint32_t r30 = ctx.r30.u32, r31 = ctx.r31.u32, obj = rd(r31 - 4412), vt = obj ? rd(obj) : 0;
-            // child[0] = r30 (obj+144). Its completion poll is child->vtable[9] (=*(child_vt+36), called at
-            // sub_82248010 lr=0x822481A0; returns 2=pending/3=advance/else=done). Pin it + what it reads.
-            uint32_t cvt = rd(r30), poll9 = cvt ? rd(cvt + 36) : 0;
-            // *(child+208) is the completion field the state-3 handler reads (via vtable[9]=sub_82105948).
-            // PROD: sub_822484D0 sets it to 1 (ready) -> state 3 reaches done. Compare variant A's value.
+            uint32_t r31 = ctx.r31.u32, cvt = rd(r30), poll9 = cvt ? rd(cvt + 36) : 0;
             fprintf(stderr, "[polldiag] #%d state=*(r30+136)=%u *(child+208)=%u(prod=1=ready) child[0]_vtable=0x%08X poll9=sub_%08X | r30=0x%08X r31=0x%08X\n",
-                    pn, rd(r30 + 136), rd(r30 + 208), cvt, poll9, r30, r31);
+                    pn, st, rd(r30 + 208), cvt, poll9, r30, r31);
         }
+        // Decisive: does the loader EVER reach done (state 1 or 12), or is it truly stuck cycling? Track each
+        // NEW state value (uncapped) + a one-time DONE flag, over a long run — answers "stuck vs merely slow".
+        uint32_t bit = st < 31 ? (1u << st) : 0x80000000u;
+        if (!(seen & bit)) { seen |= bit; fprintf(stderr, "[polldiag] NEW state=%u (mask=0x%X) at poll #%d\n", st, seen, pn); }
+        if ((st == 1 || st == 12) && !doneLog) { doneLog = true; fprintf(stderr, "[polldiag] *** LOADER REACHED DONE state=%u after %d polls ***\n", st, pn); }
     }
     // (cont.22 loop-iter 6: a REX_POLLFORCE experiment that forced *(r30+136)=done + skipped the pump did NOT
     // clear the transition — the state re-cycled and the title stalled, i.e. forcing an incomplete async result
