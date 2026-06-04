@@ -2219,7 +2219,11 @@ PPC_FUNC(__imp__VdSwap) {
             fprintf(stderr, "[chunkscan] swap#%u segDescs=%d nonBenignInd=%d %s\n",
                     n, nDesc, g_nonBenignInd.load(), g_nonBenignInd.load()==0?"CLEAN":"RACED");
         static std::atomic<bool> cd{false}; bool ce=false;
-        if (valid && nDesc >= 10 && n >= 4000 && cd.compare_exchange_strong(ce, true)) {   // >=10 descs @ settled = a MENU frame
+        // Trigger swap# is configurable via REX_CHUNKDUMP=N (N>1 => fire at n>=N; default 4000). This lets the
+        // content census run at the most-advanced NOTOKEN+MOVIE_EOF full-menu state, where n (=swap count) stays
+        // small (~6-13) — the cont.10/12 runs used n>=4000 which that state never reaches.
+        static const uint32_t s_cdAt = []{ const char* e = getenv("REX_CHUNKDUMP"); uint32_t v = e ? (uint32_t)atoi(e) : 0; return v > 1 ? v : 4000u; }();
+        if (valid && nDesc >= 10 && n >= s_cdAt && cd.compare_exchange_strong(ce, true)) {   // >=10 descs @ settled = a MENU frame
             int totReal=0, totTex=0, totRect=0;
             fprintf(stderr, "[chunkdump] swap#%u base=0x%X len=0x%X %s(ind=%d) segDescs=%d — FOLLOWING:\n",
                     n, base, wptr-base, g_nonBenignInd.load()==0?"CLEAN":"RACED", g_nonBenignInd.load(), nDesc);
