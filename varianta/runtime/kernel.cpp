@@ -2336,6 +2336,10 @@ PPC_FUNC(__imp__VdSwap) {
                                     uint32_t d1=stget(0x4800+s*2+1), vb=d0&0xFFFFFFFCu, vw=(d1>>2)&0xFFFFFF;
                                     if(!vb||!vw)continue; if(!firstVb)firstVb=vb; go+=snprintf(g+go,sizeof(g)-go," | vf%u@0x%X(%uB)",s,vb,vw*4); nvb++; }
                                 if (firstVb && !menuPoolBase) menuPoolBase = firstVb;   // Layer 2: remember the pool base
+                                // The VS vfetch reads fetch SLOT 0 (RE'd) — probe it per-draw: its base + first vertex.
+                                { uint32_t s0=stget(0x4800), s0b=s0&0xFFFFFFFCu, sg=0xA0000000u|(s0b&0x1FFFFFFFu);
+                                  float x,y; uint32_t wx=GLD32(sg),wy=GLD32(sg+4); memcpy(&x,&wx,4); memcpy(&y,&wy,4);
+                                  go+=snprintf(g+go,sizeof(g)-go," | SLOT0=%08X ty=%u @0x%X v0=(%.1f,%.1f)",s0,s0&3,s0b,x,y); }
                                 fprintf(stderr, "  [drawgeo] seg#%d #%d %s\n", di, drawDumps, g);
                                 // Piece-3b increment 3: one-shot dump to RE the vertex format. Show ALL fetch slots (raw),
                                 // then locate the actual vertex data (scan candidate base translations for non-zero).
@@ -2371,6 +2375,28 @@ PPC_FUNC(__imp__VdSwap) {
                         else if (op==0x46){ uint32_t ev=GLD32(a)&0x3F; if(ev==21)dZp++; else if(ev==7||ev==8)dViz++; }
                         else if (op==0x23) dViz++;                             // VIZ_QUERY
                         else if (op==0x3E||op==0x45) dRb++;                    // REG_TO_MEM / COND_WRITE
+                        else if (op==0x2B) {                                   // IM_LOAD_IMMEDIATE: embedded shader microcode
+                            // Decode the VS vertex format: scan the microcode for vfetch instructions (3 dwords;
+                            // d0[4:0]=opcode kVertexFetch=0 + d0[19]=must_be_one; d1[21:16]=VertexFormat;
+                            // d2[7:0]=dword stride, d2[30:8]=signed dword offset). Layout per rexglue ucode.h.
+                            static std::atomic<int> vfDumped{0};
+                            uint32_t shType=GLD32(a), szdw=GLD32(a+4)&0xFFFF;
+                            if (shType==0 && szdw>3 && szdw<8192 && vfDumped.fetch_add(1)<8) {   // VS only
+                                int kk=vfDumped.load(), found=0;
+                                fprintf(stderr,"[vfetch] VS #%d size=%u dw:\n", kk, szdw);
+                                for (uint32_t i=0;i+2<szdw && found<16;i++){
+                                    uint32_t d0=GLD32(a+8+i*4), d1=GLD32(a+8+(i+1)*4), d2=GLD32(a+8+(i+2)*4);
+                                    if ((d0&0x1F)!=0 || !((d0>>19)&1)) continue;       // kVertexFetch + must_be_one
+                                    uint32_t fmt=(d1>>16)&0x3F, stride=d2&0xFF; int32_t off=(d2>>8)&0x7FFFFF; if(off&0x400000)off-=0x800000;
+                                    if (fmt!=36&&fmt!=37&&fmt!=38&&fmt!=6&&fmt!=35) continue;   // float/float2/float4/ubyte4/uint4
+                                    const char* fn=fmt==36?"float":fmt==37?"float2":fmt==38?"float4":fmt==6?"ubyte4":"uint4";
+                                    fprintf(stderr,"  vfetch%s slot=%u(ci=%u sel=%u) fmt=%s stride=%udw off=%ddw dst=r%u | raw=%08X %08X %08X\n",
+                                            (d1>>30)&1?"_mini":"", ((d0>>20)&0x1F)*3+((d0>>25)&3), (d0>>20)&0x1F,(d0>>25)&3, fn, stride, off, (d0>>12)&0x3F, d0,d1,d2);
+                                    found++;
+                                }
+                                fprintf(stderr,"[vfetch] (%d vfetch in VS #%d)\n", found, kk);
+                            }
+                        }
                         a += cnt*4;
                     }
                 }
