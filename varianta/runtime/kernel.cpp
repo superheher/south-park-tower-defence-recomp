@@ -1336,7 +1336,11 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
         break;
       }
       case PM4_DRAW_INDX: case PM4_DRAW_INDX_2: {
-        uint32_t init = GLD32(addr), numInd = init >> 16, prim = init & 0x3F;
+        // op 0x22 (DRAW_INDX): VGT_DRAW_INITIATOR is data[1] (data[0] is a control/viz word); op 0x36
+        // (DRAW_INDX_2): it's data[0]. Reading data[0] for BOTH misdecoded every 0x22 draw (e.g. the bogus
+        // prim=11 numI=33024 from a 0x8100_000B word). The census already reads data[1] for 0x22.
+        uint32_t init = (op == PM4_DRAW_INDX) ? GLD32(addr + 4) : GLD32(addr);
+        uint32_t numInd = init >> 16, prim = init & 0x3F;
         g_drawCount.fetch_add(1);
         // T2b-step-1: during REX_EXECSEGS, capture THIS draw's live fetch slot-0 (the foundation vkCmdDraw needs,
         // and resolves the open sub-Q: do ALL ~7-8 draws/frame point at real kVertex verts, or only the last?).
@@ -1346,9 +1350,22 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                 uint32_t fc0 = GLD32(0x7FC80000u + 0x4800u*4u), base = fc0 & 0xFFFFFFFCu;
                 uint32_t g = 0xA0000000u | (base & 0x1FFFFFFFu), d1 = GLD32(0x7FC80000u + 0x4801u*4u);
                 float v[4]; for (int i=0;i<4;i++){ uint32_t u=GLD32(g+i*4); memcpy(&v[i],&u,4); }
-                fprintf(stderr, "[esdraw] #%d numI=%u prim=%u fc0=%08X type=%u base=0x%X words=%u v0=(%.1f,%.1f) v1=(%.1f,%.1f)\n",
-                        k, numInd, prim, fc0, fc0&3, g, (d1>>2)&0xFFFFFFu, v[0],v[1],v[2],v[3]);
+                // Find the draw's VERTEX source: scan fetch slots (2dw each) for the first type-3 (kVertex)
+                // entry — the backdrop uses slot 0, but the sprite/text draws' slot 0 is a texture (type 2),
+                // so their verts must be in a different slot. vslot=-1 = no kVertex fetch (verts elsewhere/none).
+                int vslot=-1; uint32_t vbase=0, vwords=0;
+                for (int s=0;s<48;s++){ uint32_t f0=GLD32(0x7FC80000u+(0x4800u+s*2)*4u);
+                    if((f0&3)==3){ uint32_t f1=GLD32(0x7FC80000u+(0x4800u+s*2+1)*4u);
+                        vslot=s; vbase=0xA0000000u|((f0&0xFFFFFFFCu)&0x1FFFFFFFu); vwords=(f1>>2)&0xFFFFFFu; break; } }
+                fprintf(stderr, "[esdraw] #%d op=0x%X numI=%u prim=%u | slot0 fc=%08X type=%u | vtxSlot=%d base=0x%X words=%u\n",
+                        k, op, numInd, prim, fc0, fc0&3, vslot, vbase, vwords);
             }
+            // Task #4: which PRIMS does execsegs actually execute? Log each distinct prim once (across the whole
+            // run, past the [esdraw] cap) — confirms whether the rich UI (prim 5 sprites / prim 13 text the census
+            // found) is ever in the executed segments, or only the prim-8 backdrop + prim-0 setup.
+            { static std::atomic<uint32_t> primSeen{0}; uint32_t bit = 1u << (prim & 31);
+              if (!(primSeen.load() & bit)) { primSeen.fetch_or(bit);
+                  fprintf(stderr, "[esprim] NEW prim=%u numI=%u fetchType=%u\n", prim, numInd, GLD32(0x7FC80000u+0x4800u*4u)&3); } }
             // T2b-step-2: carve THIS draw's geometry into clip-space triangles for the render bridge.
             // Content draws = prim 8 (kRectangleList) numI 3, fetch type-3 kVertex, float2 (stride 2dw) screen
             // coords. kRectangleList: v0,v1,v2 given + v3 = v1+v2-v0 (the parallelogram's 4th corner) → 2 tris.
@@ -2331,6 +2348,12 @@ PPC_FUNC(__imp__VdSwap) {
                 for (int i=0;i<24;i++){ uint32_t u=GLD32(fcGuest+i*4); float f; memcpy(&f,&u,4); fprintf(stderr,"%.3g ", f); }
                 fprintf(stderr, "\n");
             }
+            // Task #4: track the RICHEST frame (most descriptors / most draws) across the whole run — catches
+            // rich UI frames even past the per-frame log cap. The census found ~107 draws in a rich frame; if
+            // execsegs never sees descs>3 / draws>8, the rich UI is NOT in device+13568 at VdSwap time.
+            { static std::atomic<int> maxD{0}; int pm = maxD.load(); uint64_t dd = g_drawCount.load()-drBefore;
+              if (descsFound > pm && maxD.compare_exchange_strong(pm, descsFound))
+                  fprintf(stderr, "[execsegs] NEW-MAX descs=%d segs=%d draws+%llu (swap#%u)\n", descsFound, segs, (unsigned long long)dd, n); }
             static std::atomic<int> logged{0};
             if (g_ktrace && logged.fetch_add(1) < 60)
                 fprintf(stderr, "[execsegs] swap#%u descs=%d segs=%d draws+%llu slot0(A2000000)Head %08X->%08X real=%d | liveFetch0=%08X->0x%X real=%d | swaps=%llu drawTotal=%llu\n",
