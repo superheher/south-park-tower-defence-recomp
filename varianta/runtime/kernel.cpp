@@ -109,6 +109,25 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
     // dispatch to sub_8210AF90 (the 0x828E82A6 setter) ever fires.
     uint32_t lr = static_cast<uint32_t>(ctx.lr);
     bool trace = g_traceB740 && lr >= 0x8211B748u && lr < 0x8211C000u;
+    // REX_POLLDIAG (cont.22 loop-iter 6): the intro→menu transition worker blocks in sub_822481E0's async-
+    // completion delay-poll `while(*(r30+136)∉{1,12}){ (*(r31-4412))->vtable[8](); KeDelayExecutionThread(10);}`.
+    // The pump call is the indirect bctrl at guest lr=0x82248224. Log the live ctx there (frame-reads of the
+    // blocked worker are unreliable — non-volatiles are saved/restored down the call chain) to identify the
+    // stuck state value + the pumped subsystem's object/vtable. Gated, default boot unaffected.
+    static const bool g_polldiag = getenv("REX_POLLDIAG") != nullptr;
+    if (g_polldiag && lr == 0x82248224u) {
+        static std::mutex pm; static int pn = 0;
+        std::lock_guard<std::mutex> lk(pm);
+        if (pn++ < 8) {
+            auto rd = [&](uint32_t a){ uint32_t b; memcpy(&b, base + a, 4); return __builtin_bswap32(b); };
+            uint32_t r30 = ctx.r30.u32, r31 = ctx.r31.u32, obj = rd(r31 - 4412), vt = obj ? rd(obj) : 0;
+            fprintf(stderr, "[polldiag] #%d pump=0x%08X r30=0x%08X *(r30+136)=%u(state) r31=0x%08X obj=*(r31-4412)=0x%08X vtable=0x%08X method+32=0x%08X\n",
+                    pn, target, r30, rd(r30 + 136), r31, obj, vt, vt ? rd(vt + 32) : 0);
+        }
+    }
+    // (cont.22 loop-iter 6: a REX_POLLFORCE experiment that forced *(r30+136)=done + skipped the pump did NOT
+    // clear the transition — the state re-cycled and the title stalled, i.e. forcing an incomplete async result
+    // breaks the worker. Removed: stopgaps don't substitute for real completion here. See NIGHT-LOG cont.22.)
     if (target >= PPC_CODE_BASE && target < (PPC_CODE_BASE + PPC_CODE_SIZE))
     {
         PPCFunc* fn = HostFnAt(target);
