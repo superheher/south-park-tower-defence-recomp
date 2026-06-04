@@ -2348,6 +2348,13 @@ PPC_FUNC(__imp__VdSwap) {
                                     fprintf(stderr, "[vtxdump] draw op=0x%X prim=%u numI=%u — fetch slots (d0 d1 -> type/byteaddr/words):\n", op, init&0x3F, init>>16);
                                     for(uint32_t s=0;s<24;s++){ uint32_t d0=stget(0x4800+s*2),d1=stget(0x4800+s*2+1);
                                         if(!d0&&!d1)continue; fprintf(stderr,"  slot%u: %08X %08X  type=%u addr=0x%X words=%u\n",s,d0,d1,d0&3,d0&0xFFFFFFFCu,(d1>>2)&0xFFFFFF); }
+                                    // The vfetch reads SLOT 0 (RE'd). Scan slot-0's region for data (head may be zero like slot 1).
+                                    { uint32_t s0b=stget(0x4800)&0xFFFFFFFCu, sg=0xA0000000u|(s0b&0x1FFFFFFFu);
+                                      uint32_t hit=0, nz=0; for(uint32_t o=0;o<0x800000;o+=4){ if(GLD32(sg+o)){ nz++; if(!hit)hit=o; } }
+                                      fprintf(stderr,"[vtxdump] SLOT0 guest=0x%X: nonzero-dwords=%u firstNonZero=+0x%X — float dump:\n", sg, nz, hit);
+                                      for(int r=0;r<6;r++){ char ln[256]; size_t lo=snprintf(ln,sizeof(ln),"  +0x%X:",hit+r*16);
+                                        for(int c=0;c<4;c++){ uint32_t w=GLD32(sg+hit+r*16+c*4); float f; memcpy(&f,&w,4); lo+=snprintf(ln+lo,sizeof(ln)-lo," %08X(%g)",w,f); }
+                                        fprintf(stderr,"%s\n",ln); } }
                                     // Crack the vertex FORMAT: scan the pool (physical window) for a DENSE region — a
                                     // 16-dword window where >=6 dwords are floats in screen-coord range [1,1280] — = a
                                     // packed vertex array. Dump 32 dwords there so the repeating stride is visible.
