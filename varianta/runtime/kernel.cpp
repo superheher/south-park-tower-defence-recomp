@@ -109,6 +109,13 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
     // dispatch to sub_8210AF90 (the 0x828E82A6 setter) ever fires.
     uint32_t lr = static_cast<uint32_t>(ctx.lr);
     bool trace = g_traceB740 && lr >= 0x8211B748u && lr < 0x8211C000u;
+    // REX_TASKDIAG (cont.22 loop-iter 8): classify the transition's leaf async sub-ops. sub_82248010 (the
+    // per-child state machine) advances each stage on a polymorphic sub-op call returning status 3 / waits on
+    // status 2; log those calls (lr inside sub_82248010 = [0x82248010,0x82248260)) + the returned status, to
+    // see which sub-op stays "pending" (status 2) and whether its target is I/O (sub_8244xxxx) or GPU/render
+    // (sub_821Bxxxx/821Cxxxx) code — that classifies the completion variant A must drive. Gated, default-off.
+    static const bool g_taskdiag = getenv("REX_TASKDIAG") != nullptr;
+    bool taskdiag = g_taskdiag && lr >= 0x82248010u && lr < 0x82248260u;
     // REX_POLLDIAG (cont.22 loop-iter 6): the intro→menu transition worker blocks in sub_822481E0's async-
     // completion delay-poll `while(*(r30+136)∉{1,12}){ (*(r31-4412))->vtable[8](); KeDelayExecutionThread(10);}`.
     // The pump call is the indirect bctrl at guest lr=0x82248224. Log the live ctx there (frame-reads of the
@@ -135,6 +142,8 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
             fn(ctx, base);
             if (trace) fprintf(stderr, "[b740] bctrl lr=0x%08X -> 0x%08X returned r3=0x%08X%s\n",
                                lr, target, ctx.r3.u32, target == 0x8210AF90u ? "  <== sub_8210AF90!" : "");
+            if (taskdiag) { static std::atomic<int> tn{0}; if (tn.fetch_add(1) < 60)
+                fprintf(stderr, "[task] lr=0x%08X sub-op->0x%08X status=%u\n", lr, target, ctx.r3.u32); }
             return;
         }
         if (fn) {   // non-null but outside the valid host-fn range = a CORRUPTED table slot (cont.22) —
