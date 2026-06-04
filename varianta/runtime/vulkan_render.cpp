@@ -8,6 +8,7 @@
 // can't stall the guest. Single frame-in-flight, FIFO present, clear via vkCmdClearColorImage.
 #include "rex_render.h"
 #include "test_shaders.h"   // GPU-build piece 1: embedded SPIR-V for the test-triangle pipeline
+#include "menu_shaders.h"   // GPU-build piece 3b: float2-position menu-quad pipeline (mvp/color push const)
 #include <vulkan/vulkan.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
@@ -59,6 +60,20 @@ VkPipelineLayout g_pipeLayout = VK_NULL_HANDLE;
 VkPipeline       g_testPipe   = VK_NULL_HANDLE;
 std::vector<VkImageView>   g_imageViews;
 std::vector<VkFramebuffer> g_framebuffers;
+
+// --- GPU build (piece 3b): menu-quad pipeline (float2 screen-space pos -> mvp -> clip; flat color) -----
+// The menu content draws are float2 (x,y) vertices (8-byte stride, RE'd) transformed by $worldviewProj.
+// This pipeline takes a float2 vertex buffer + a push-constant {mat4 mvp, vec4 color}, alpha-blended for
+// UI compositing (blend src=SRC_ALPHA dst=ONE_MINUS_SRC_ALPHA — the title's 0x7060706). REX_MENUTEST
+// validates it with hardcoded clip-space quads; the real path feeds extracted menu geometry.
+const bool g_menutest = (getenv("REX_MENUTEST") != nullptr);
+VkPipelineLayout g_menuLayout = VK_NULL_HANDLE;
+VkPipeline       g_menuPipe   = VK_NULL_HANDLE;
+VkBuffer         g_menuVB     = VK_NULL_HANDLE;     // host-visible float2 vertex buffer (persistently mapped)
+VkDeviceMemory   g_menuVBMem  = VK_NULL_HANDLE;
+void*            g_menuVBMap  = nullptr;
+VkDeviceSize     g_menuVBCap  = 0;
+struct MenuPC { float mvp[16]; float color[4]; };   // push constant: 80 bytes (<=128 min)
 
 // In-engine screenshot (REX_RENDER_SHOT=<frame> -> capture that present to /tmp/varianta_shot.ppm).
 // Self-contained: external Wayland capture tools (spectacle/grim/import) don't work here.
@@ -312,6 +327,80 @@ bool CreateGraphicsPipeline() {
     return true;
 }
 
+// GPU build (piece 3b): the menu-quad pipeline — float2 vertex input + {mat4 mvp, vec4 color} push const,
+// alpha-blended, TRIANGLE_LIST (quads expanded to 2 tris on the CPU). Reuses g_renderPass.
+bool CreateMenuPipeline() {
+    if (g_menuPipe) return true;
+    if (!g_renderPass) return false;
+    auto mk = [](const uint32_t* code, size_t bytes) -> VkShaderModule {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = bytes; mi.pCode = code; VkShaderModule m = VK_NULL_HANDLE;
+        vkCreateShaderModule(g_device, &mi, nullptr, &m); return m; };
+    VkShaderModule vs = mk(kMenuQuadVertSpv, sizeof(kMenuQuadVertSpv));
+    VkShaderModule fs = mk(kMenuQuadFragSpv, sizeof(kMenuQuadFragSpv));
+    if (!vs || !fs) { fprintf(stderr, "[render] menu shader module create failed\n"); return false; }
+    VkPipelineShaderStageCreateInfo st[2]{};
+    st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = vs; st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
+    VkVertexInputBindingDescription vb{0, 8, VK_VERTEX_INPUT_RATE_VERTEX};   // float2 = 8-byte stride
+    VkVertexInputAttributeDescription va{0, 0, VK_FORMAT_R32G32_SFLOAT, 0};
+    VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vin.vertexBindingDescriptionCount = 1; vin.pVertexBindingDescriptions = &vb;
+    vin.vertexAttributeDescriptionCount = 1; vin.pVertexAttributeDescriptions = &va;
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vps.viewportCount = 1; vps.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA; cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE; cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO; cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT|VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dst{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dst.dynamicStateCount = 2; dst.pDynamicStates = dyn;
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(MenuPC)};
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pcr;
+    vkCreatePipelineLayout(g_device, &pl, nullptr, &g_menuLayout);
+    VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pci.stageCount = 2; pci.pStages = st;
+    pci.pVertexInputState = &vin; pci.pInputAssemblyState = &ia; pci.pViewportState = &vps;
+    pci.pRasterizationState = &rs; pci.pMultisampleState = &ms; pci.pColorBlendState = &cb;
+    pci.pDynamicState = &dst; pci.layout = g_menuLayout; pci.renderPass = g_renderPass; pci.subpass = 0;
+    VkResult r = vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &pci, nullptr, &g_menuPipe);
+    vkDestroyShaderModule(g_device, vs, nullptr); vkDestroyShaderModule(g_device, fs, nullptr);
+    if (r != VK_SUCCESS) { fprintf(stderr, "[render] menu pipeline create = %d\n", (int)r); return false; }
+    fprintf(stderr, "[render] GPU-build: menu-quad pipeline created (float2 + mvp/color push const, alpha blend)\n");
+    return true;
+}
+
+// Host-visible vertex buffer for the menu quads, persistently mapped (grows on demand).
+bool EnsureMenuVB(VkDeviceSize bytes) {
+    if (g_menuVB && g_menuVBCap >= bytes) return true;
+    if (g_menuVB) { vkDeviceWaitIdle(g_device); vkDestroyBuffer(g_device, g_menuVB, nullptr); vkFreeMemory(g_device, g_menuVBMem, nullptr); g_menuVB = VK_NULL_HANDLE; }
+    VkDeviceSize cap = bytes < 0x10000 ? 0x10000 : bytes;   // min 64 KiB
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = cap; bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VKCHECK(vkCreateBuffer(g_device, &bi, nullptr, &g_menuVB));
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_device, g_menuVB, &mr);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = FindMemoryType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VKCHECK(vkAllocateMemory(g_device, &ai, nullptr, &g_menuVBMem));
+    vkBindBufferMemory(g_device, g_menuVB, g_menuVBMem, 0);
+    vkMapMemory(g_device, g_menuVBMem, 0, cap, 0, &g_menuVBMap);
+    g_menuVBCap = cap;
+    return true;
+}
+
 bool CreateSwapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     VKCHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_phys, g_surface, &caps));
@@ -354,7 +443,7 @@ bool CreateSwapchain() {
     g_images.resize(n);
     vkGetSwapchainImagesKHR(g_device, g_swapchain, &n, g_images.data());
     fprintf(stderr, "[render] swapchain %ux%u fmt=%d images=%u\n", g_extent.width, g_extent.height, (int)g_format, n);
-    if (g_drawtest) { CreateRenderPass(); CreateFramebuffers(); }   // GPU build (piece 1)
+    if (g_drawtest || g_menutest) { CreateRenderPass(); CreateFramebuffers(); }   // GPU build (piece 1 / 3b)
     return true;
 }
 
@@ -419,6 +508,7 @@ bool Init() {
 
     if (!CreateSwapchain()) return false;
     if (g_drawtest) CreateGraphicsPipeline();   // GPU build (piece 1): render pass already made in CreateSwapchain
+    if (g_menutest) CreateMenuPipeline();       // GPU build (piece 3b): the menu-quad pipeline
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -475,6 +565,62 @@ bool PresentOnce() {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_cmd, &bi);
+
+    if (g_menutest && g_menuPipe && idx < g_framebuffers.size()) {
+        // GPU build (piece 3b): the menu-quad pipeline. REX_MENUTEST validates it with 3 overlapping
+        // alpha-blended clip-space rects (proves float2 vertex input + {mvp,color} push const + blend +
+        // multi-draw). The real path will feed extracted menu geometry + the $worldviewProj matrix here.
+        static const float quads[] = {                          // 3 rects, each 2 tris (6 verts), clip space
+            -0.8f,-0.8f,  0.2f,-0.8f,  0.2f, 0.2f,  -0.8f,-0.8f,  0.2f, 0.2f, -0.8f, 0.2f,   // A
+            -0.2f,-0.2f,  0.8f,-0.2f,  0.8f, 0.8f,  -0.2f,-0.2f,  0.8f, 0.8f, -0.2f, 0.8f,   // B
+             0.1f,-0.6f,  0.6f,-0.6f,  0.6f,-0.1f,   0.1f,-0.6f,  0.6f,-0.1f,  0.1f,-0.1f }; // C
+        EnsureMenuVB(sizeof(quads));
+        if (g_menuVBMap) memcpy(g_menuVBMap, quads, sizeof(quads));
+        VkClearValue cv{}; cv.color.float32[0]=0.06f; cv.color.float32[1]=0.06f; cv.color.float32[2]=0.10f; cv.color.float32[3]=1.0f;
+        VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rp.renderPass = g_renderPass; rp.framebuffer = g_framebuffers[idx];
+        rp.renderArea.extent = g_extent; rp.clearValueCount = 1; rp.pClearValues = &cv;
+        vkCmdBeginRenderPass(g_cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_menuPipe);
+        VkViewport vp{0.0f, 0.0f, (float)g_extent.width, (float)g_extent.height, 0.0f, 1.0f};
+        VkRect2D scs{{0, 0}, g_extent};
+        vkCmdSetViewport(g_cmd, 0, 1, &vp); vkCmdSetScissor(g_cmd, 0, 1, &scs);
+        VkDeviceSize voff = 0; vkCmdBindVertexBuffers(g_cmd, 0, 1, &g_menuVB, &voff);
+        MenuPC pc{}; for (int i = 0; i < 16; i++) pc.mvp[i] = (i % 5 == 0) ? 1.0f : 0.0f;   // identity (verts already clip-space)
+        const float cols[3][4] = {{1.0f,0.2f,0.2f,0.6f},{0.2f,1.0f,0.2f,0.6f},{0.3f,0.4f,1.0f,0.8f}};
+        for (int q = 0; q < 3; q++) { memcpy(pc.color, cols[q], 16);
+            vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+            vkCmdDraw(g_cmd, 6, 1, q * 6, 0); }
+        vkCmdEndRenderPass(g_cmd);
+        bool cap = g_shotTarget && g_frame == g_shotTarget;
+        if (cap) { EnsureCaptureBuffer();
+            if (g_capBuf) {
+                ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                VkBufferImageCopy rgn{}; rgn.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                rgn.imageExtent = {g_extent.width, g_extent.height, 1};
+                vkCmdCopyImageToBuffer(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_capBuf, 1, &rgn);
+                ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_READ_BIT, 0);
+            } else cap = false; }
+        vkEndCommandBuffer(g_cmd);
+        VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.waitSemaphoreCount = 1; si.pWaitSemaphores = &g_acquireSem; si.pWaitDstStageMask = &ws;
+        si.commandBufferCount = 1; si.pCommandBuffers = &g_cmd;
+        si.signalSemaphoreCount = 1; si.pSignalSemaphores = &g_presentSem;
+        vkQueueSubmit(g_queue, 1, &si, g_fence);
+        if (cap) { vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, UINT64_MAX); WriteCapturePPM("/tmp/varianta_menu.ppm"); }
+        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &g_presentSem;
+        pi.swapchainCount = 1; pi.pSwapchains = &g_swapchain; pi.pImageIndices = &idx;
+        VkResult pr = vkQueuePresentKHR(g_queue, &pi);
+        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) { vkDeviceWaitIdle(g_device); CreateSwapchain(); }
+        if ((g_frame % 300) == 0) fprintf(stderr, "[render] GPU-build: menu-quad test frame %llu\n", (unsigned long long)g_frame);
+        g_frame++;
+        return true;
+    }
 
     if (g_drawtest && g_testPipe && idx < g_framebuffers.size()) {
         // GPU build (piece 1): render the test triangle via the graphics pipeline. The render pass takes the
