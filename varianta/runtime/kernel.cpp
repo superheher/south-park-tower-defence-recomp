@@ -1611,6 +1611,23 @@ PPC_FUNC(sub_821C73D8) { GpuLock _gl; __imp__sub_821C73D8(ctx, base); }
 extern "C" PPC_FUNC(__imp__sub_821C6C80);
 PPC_FUNC(sub_821C6C80) {
     static const bool kg = getenv("REX_KICKGATE") != nullptr;
+    // REX_POOLCHK: the faithful-CP test. The content draws' vfetch source = slot-0 pool 0xA2000000 (RE'd),
+    // which is 0x0BADF00D poison at the SWAP-time census. Sample it HERE (the kick gate fires ~1410x/frame =
+    // dense MID-FRAME sampling), tracking whether it is EVER real float2 verts. If maxRealFloats stays low +
+    // poison dominates => the title's vertex-gen never writes it (deeper gap); if it jumps high => the pool
+    // IS written mid-frame (timing) => the faithful-CP approach (execute segments mid-frame) is viable.
+    static const bool poolchk = getenv("REX_POOLCHK") != nullptr;
+    if (poolchk) {
+        static int samples=0;
+        // sample BOTH candidate pools mid-frame: slot 0 (vfetch source, RE'd) + slot 1 (the type-3 kVertex
+        // constant that HAD screen coords). Whichever is ever real float2 verts holds the menu geometry.
+        static uint32_t pools[2]={0xA2000000u,0xA01FE0FCu}; static int realMax[2]={0,0};
+        for(int p=0;p<2;p++){ int real=0; for(int i=0;i<64;i++){ uint32_t w=GLD32(pools[p]+i*4); if(!w||w==0xFFFFFFFFu||w==0x0BADF00Du)continue;
+            float f; memcpy(&f,&w,4); if(f==f && f>-4096.0f && f<4096.0f && (f>0.0078125f||f<-0.0078125f)) real++; } if(real>realMax[p])realMax[p]=real; }
+        samples++;
+        if ((samples%4000)==1) fprintf(stderr,"[poolchk] samples=%d | slot0@0x%X maxRealFloats/64=%d head=%08X %08X | slot1@0x%X maxRealFloats/64=%d head=%08X %08X\n",
+            samples, pools[0], realMax[0], GLD32(pools[0]), GLD32(pools[0]+4), pools[1], realMax[1], GLD32(pools[1]), GLD32(pools[1]+4));
+    }
     // NOTE (cont.15): forcing the kick gate open here (GST32(r3+0x2b04,0)) DOES flow the ring (2725 kicks)
     // but yields ONLY init=0x30088 rects (no textured draws) and crashes (skips segment bookkeeping).
     // PROVEN non-viable — the textured draws are producer/consumer work items, not kicked segments.
@@ -2388,7 +2405,7 @@ PPC_FUNC(__imp__VdSwap) {
                             // d2[7:0]=dword stride, d2[30:8]=signed dword offset). Layout per rexglue ucode.h.
                             static std::atomic<int> vfDumped{0};
                             uint32_t shType=GLD32(a), szdw=GLD32(a+4)&0xFFFF;
-                            if (shType==0 && szdw>3 && szdw<8192 && vfDumped.fetch_add(1)<8) {   // VS only
+                            if (shType==0 && szdw>3 && szdw<8192 && vfDumped.fetch_add(1)<40) {   // VS only
                                 int kk=vfDumped.load(), found=0;
                                 fprintf(stderr,"[vfetch] VS #%d size=%u dw:\n", kk, szdw);
                                 for (uint32_t i=0;i+2<szdw && found<16;i++){
