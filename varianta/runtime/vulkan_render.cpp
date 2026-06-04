@@ -612,9 +612,10 @@ bool PresentOnce() {
                 vkCmdDraw(g_cmd, 6, 1, q * 6, 0); }
         }
         vkCmdEndRenderPass(g_cmd);
-        static bool s_geomCap = false;   // capture the first frame that has REAL submitted geometry
-        bool cap = (g_shotTarget && g_frame == g_shotTarget) || (subVerts > 0 && !s_geomCap);
-        if (subVerts > 0) s_geomCap = true;
+        static int s_maxCap = 0;   // capture the RICHEST frame seen (most submitted verts) — steady-state menu
+        bool richer = subVerts > s_maxCap;                       // frames carry 12-30 rects vs the first frame's 4
+        bool cap = (g_shotTarget && g_frame == g_shotTarget) || richer;
+        if (richer) s_maxCap = subVerts;
         if (cap) { EnsureCaptureBuffer();
             if (g_capBuf) {
                 ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,

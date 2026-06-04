@@ -1249,6 +1249,10 @@ thread_local bool tl_execsegs = false;
 // T2b-step-2: per-draw carved geometry accumulated during a REX_EXECSEGS frame (clip-space XY, interleaved),
 // submitted to the render bridge after the exec loop. Touched ONLY on the VdSwap thread under tl_execsegs.
 thread_local std::vector<float> tl_esVerts;
+// T2b-step-5: the VS microcode loaded by the most-recent IM_LOAD_IMMEDIATE (op 0x2B) during execution — so a
+// DRAW can decode the VS's OWN vfetch (which fetch slot + dword offset it reads). The sprite/text VS's slot
+// 0 is a texture, so their verts come from a different slot/offset that only the vfetch instruction names.
+thread_local uint32_t tl_vsUcode = 0, tl_vsSize = 0;
 std::atomic<uint64_t> g_drawCount{0}, g_swapCount{0};
 const bool g_cptrace = (getenv("REX_CPTRACE") != nullptr);
 
@@ -1378,6 +1382,24 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                     fprintf(stderr, "[esidx] #%d prim=%u src=%u fmt=%s idxBase=0x%X sz=0x%X idx=[%u %u %u %u]%s\n",
                             k, prim, srcSel, idxFmt?"u32":"u16", ig, ibSz, idx[0],idx[1],idx[2],idx[3], vb);
                 }
+                // T2b-step-5: decode the ACTIVE VS's own vfetch (the authoritative per-draw vertex source —
+                // which fetch slot + dword OFFSET it reads). The sprite/text verts sit deep in the slot-1 pool;
+                // a non-zero vfetch offset (vs the backdrop VS's off=0) would explain where. Decode the verts
+                // at base + off*stride to confirm they're real screen/authoring coords.
+                if ((prim==5 || prim==13 || prim==4) && tl_vsUcode && tl_vsSize >= 3) {
+                    for (uint32_t w=0; w+3 <= tl_vsSize && w < 256; w++) {
+                        uint32_t a0=GLD32(tl_vsUcode+w*4), a1=GLD32(tl_vsUcode+w*4+4), a2=GLD32(tl_vsUcode+w*4+8);
+                        if ((a0&0x1F)!=0 || !((a0>>19)&1)) continue;          // kVertexFetch + must_be_one
+                        uint32_t fslot=((a0>>20)&0x1F)*3+((a0>>25)&3), ffmt=(a1>>16)&0x3F, fstr=a2&0xFF;
+                        int foff=(int)((a2>>8)&0x7FFFFF); if(foff&0x400000) foff-=0x800000;   // signed 23-bit dwords
+                        uint32_t fc=GLD32(0x7FC80000u+(0x4800u+fslot*2)*4u), fb=0xA0000000u|((fc&0xFFFFFFFCu)&0x1FFFFFFFu);
+                        uint32_t va=fb + (uint32_t)foff*4u; float vx,vy; uint32_t ux=GLD32(va),uy=GLD32(va+4);
+                        memcpy(&vx,&ux,4); memcpy(&vy,&uy,4);
+                        fprintf(stderr,"[esvf] draw#%d prim=%u VS vfetch slot=%u type=%u fmt=0x%X stride=%udw off=%ddw | base=0x%X +off=0x%X v0=(%.1f,%.1f)\n",
+                                k, prim, fslot, fc&3, ffmt, fstr, foff, fb, va, vx, vy);
+                        break;
+                    }
+                }
             }
             // Task #4: which PRIMS does execsegs actually execute? Log each distinct prim once (across the whole
             // run, past the [esdraw] cap) — confirms whether the rich UI (prim 5 sprites / prim 13 text the census
@@ -1488,6 +1510,11 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
       case PM4_XE_SWAP:
         g_gpuCounter.fetch_add(1); g_swapCount.fetch_add(1);
         if (g_cptrace) fprintf(stderr, "[cp] XE_SWAP #%llu\n", (unsigned long long)g_swapCount.load());
+        break;
+      case 0x2B:   // IM_LOAD_IMMEDIATE: embedded shader microcode. data[0] bit0 = type (0=VS,1=PS),
+        if (tl_execsegs && (GLD32(addr) & 1) == 0) {   // VS: remember the microcode for the next draw's vfetch decode
+            tl_vsUcode = addr + 8; tl_vsSize = GLD32(addr + 4) & 0xFFFF;   // data[1]&0xFFFF = size in dwords
+        }
         break;
       default: break;   // ME_INIT/NOP/SET_CONSTANT/WAIT_REG_MEM/state: not modeled yet (no Vulkan) — skip
     }
