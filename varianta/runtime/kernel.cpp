@@ -1318,6 +1318,29 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                 }
             }
         }
+        // GPU-build piece 2 (decode): identify the draw's vertex inputs — the vertex-fetch constants in the
+        // 0x4800 fetch space (2-dword entries; dword_0 = type:2|address:30 [dwords], dword_1 = endian:2|
+        // size:24 [words]; type 3 = kVertex per rexglue xenos.h). These are the geometry the DRAW_INDX->Vulkan
+        // translator must upload + vkCmdDraw. prim 8 = kRectangleList (the title's 2D rects). Gated REX_DRAWDECODE.
+        static const int decn = []{ const char* e = getenv("REX_DRAWDECODE"); return e ? atoi(e) : 0; }();
+        static std::atomic<int> ddn{0};
+        if (decn && ddn.fetch_add(1) < decn) {
+            const char* pn = prim==1?"point":prim==2?"line":prim==4?"tri-list":prim==5?"tri-strip":
+                             prim==6?"tri-fan":prim==8?"RECT-list":prim==0xD?"quad":"?";
+            int nvb = 0; char vbuf[256]; size_t off = 0; vbuf[0] = 0;
+            for (uint32_t i = 0; i < 96; i++) {
+                uint32_t d0 = GLD32(0x7FC80000u + (0x4800u + i*2u)*4u);
+                if ((d0 & 3u) != 3u) continue;                         // 3 = kVertex
+                uint32_t d1 = GLD32(0x7FC80000u + (0x4800u + i*2u + 1u)*4u);
+                uint32_t vbAddr = d0 & 0xFFFFFFFCu, vbBytes = ((d1 >> 2) & 0xFFFFFFu) * 4u;
+                if (!vbAddr || vbBytes == 0 || vbBytes > 0x800000u) continue;   // plausible vertex buffer
+                if (nvb < 4 && off + 48 < sizeof(vbuf))
+                    off += snprintf(vbuf+off, sizeof(vbuf)-off, " [vf%u addr=0x%X sz=%u]", i, vbAddr, vbBytes);
+                nvb++;
+            }
+            fprintf(stderr, "[drawdec] #%d %s numInd=%u init=0x%X vertexbufs=%d%s\n",
+                    (int)ddn.load(), pn, numInd, init, nvb, vbuf);
+        }
         break;
       }
       case PM4_XE_SWAP:
