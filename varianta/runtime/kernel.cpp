@@ -2279,10 +2279,10 @@ PPC_FUNC(__imp__VdSwap) {
             // DRAW_INDX->Vulkan translator must turn into a VkPipeline. State carries across segments within a
             // frame (the title sets state once, draws many times). Pure read/track — NO execution, NO side
             // effects (unlike running ExecutePM4 on the segments, which would fire interrupts/fences).
-            uint32_t st[0x340] = {0}; int drawDumps = 0; uint32_t shaderBase = 0;
+            uint32_t st[0x340] = {0}, fetch[0x180] = {0}; int drawDumps = 0;   // fetch[] = vertex/texture fetch consts 0x4800-0x497F
             auto stset = [&](uint32_t r, uint32_t v){ if (r >= 0x2000 && r < 0x2340) st[r-0x2000] = v;
-                                                      else if (r == 0x21F7) shaderBase = v; };   // SQ_PROGRAM base hint
-            auto stget = [&](uint32_t r){ return (r >= 0x2000 && r < 0x2340) ? st[r-0x2000] : 0u; };
+                                                      else if (r >= 0x4800 && r < 0x4980) fetch[r-0x4800] = v; };
+            auto stget = [&](uint32_t r){ return (r >= 0x2000 && r < 0x2340) ? st[r-0x2000] : (r >= 0x4800 && r < 0x4980 ? fetch[r-0x4800] : 0u); };
             for (int di = 0; di < nDesc && di < 24; di++) {
                 uint32_t len = descs[di].len, addr = descs[di].addr, guest = 0xA0000000u | (addr & 0x1FFFFFFFu);
                 int dReal=0, dRect=0, setc=0, tex=0, dWait=0, dZp=0, dViz=0, dRb=0, dRes=0;
@@ -2317,9 +2317,23 @@ PPC_FUNC(__imp__VdSwap) {
                                         (surf&0x3FFF),(surf>>14)&3,(col>>16)&0xF,(col&0xFFF),
                                         2.0f*rf(0x210F),2.0f*rf(0x2111), rf(0x2110), rf(0x2112),
                                         stget(0x2081)&0x7FFF,(stget(0x2081)>>16)&0x7FFF, stget(0x2082)&0x7FFF,(stget(0x2082)>>16)&0x7FFF,
-                                        stget(0x2201), stget(0x2202), stget(0x2180), stget(0x2200), stget(0x2208)); } }
+                                        stget(0x2201), stget(0x2202), stget(0x2180), stget(0x2200), stget(0x2208));
+                                // Piece-3b increment 2: decode the geometry this draw consumes. src_select (init[7:6]):
+                                // 0=kDMA (indexed; data[2]=VGT_DMA_BASE index buffer, data[3]=VGT_DMA_SIZE.num_words),
+                                // 2=kAutoIndex (sequential, no index buffer). idx fmt = init[11] (0=int16,1=int32).
+                                uint32_t src=(init>>6)&3;
+                                char g[256]; size_t go=0; g[0]=0;
+                                if (op==0x22 && src==0){ uint32_t ib=GLD32(a+8), sz=GLD32(a+12)&0xFFFFFF;
+                                    go+=snprintf(g+go,sizeof(g)-go,"idx %s base=0x%X count=%u",(init>>11)&1?"u32":"u16",ib,sz); }
+                                else go+=snprintf(g+go,sizeof(g)-go,"%s",src==2?"auto-index":src==1?"immediate":"?");
+                                // vertex streams: fetch constants (2-dword slots @0x4800), type[1:0]==3 = kVertex.
+                                int nvb=0; for(uint32_t s=0;s<48&&nvb<3;s++){ uint32_t d0=stget(0x4800+s*2); if((d0&3)!=3)continue;
+                                    uint32_t d1=stget(0x4800+s*2+1), vb=d0&0xFFFFFFFCu, vw=(d1>>2)&0xFFFFFF;
+                                    if(!vb||!vw)continue; go+=snprintf(g+go,sizeof(g)-go," | vf%u@0x%X(%uB)",s,vb,vw*4); nvb++; }
+                                fprintf(stderr, "  [drawgeo] seg#%d #%d %s\n", di, drawDumps, g); } }
                         else if (op==0x2D){ setc++; uint32_t ot=GLD32(a); uint32_t ty=(ot>>16)&0xFF, ix=ot&0x7FF;
-                            if (ty==1) for(uint32_t j=1;j<cnt&&a+j*4+4<=end;j++) if((((GLD32(a+j*4)>>12)&0xFFFFF)<<12)>=0xA0000000u){tex++;break;}
+                            if (ty==1){ bool t1=false; for(uint32_t j=1;j<cnt&&a+j*4+4<=end;j++){ stset(0x4800+ix+(j-1), GLD32(a+j*4));
+                                            if(!t1 && (((GLD32(a+j*4)>>12)&0xFFFFF)<<12)>=0xA0000000u){tex++;t1=true;} } }
                             if (ty==4){ for(uint32_t j=1;j<cnt&&a+j*4+4<=end;j++) stset(0x2000+ix+(j-1), GLD32(a+j*4));
                                         if(ix>=0x318&&ix<=0x325) dRes++; if(ix==0x293) dViz++; } }
                         else if (op==0x55) setc++;
