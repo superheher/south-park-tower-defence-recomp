@@ -7,6 +7,7 @@
 // lazily starts the thread — it NEVER calls Vulkan/SDL or blocks on present, so a slow/stalled compositor
 // can't stall the guest. Single frame-in-flight, FIFO present, clear via vkCmdClearColorImage.
 #include "rex_render.h"
+#include "test_shaders.h"   // GPU-build piece 1: embedded SPIR-V for the test-triangle pipeline
 #include <vulkan/vulkan.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
@@ -46,6 +47,18 @@ VkSemaphore      g_acquireSem = VK_NULL_HANDLE;
 VkSemaphore      g_presentSem = VK_NULL_HANDLE;
 VkFence          g_fence    = VK_NULL_HANDLE;
 uint64_t         g_frame    = 0;
+
+// --- GPU build (piece 1): graphics pipeline foundation ------------------------------------------------
+// A real render pass + per-image framebuffers + a VkPipeline (the test-triangle shaders), the machinery the
+// DRAW_INDX->Vulkan translator plugs into. The current present path is clear/blit only; this adds the draw
+// path. Gated behind REX_DRAWTEST so the default present (movie/clear) is unchanged until the translator
+// wires the title's real draws in. See NIGHT-LOG cont.22 "GPU build".
+const bool g_drawtest = (getenv("REX_DRAWTEST") != nullptr);
+VkRenderPass     g_renderPass = VK_NULL_HANDLE;
+VkPipelineLayout g_pipeLayout = VK_NULL_HANDLE;
+VkPipeline       g_testPipe   = VK_NULL_HANDLE;
+std::vector<VkImageView>   g_imageViews;
+std::vector<VkFramebuffer> g_framebuffers;
 
 // In-engine screenshot (REX_RENDER_SHOT=<frame> -> capture that present to /tmp/varianta_shot.ppm).
 // Self-contained: external Wayland capture tools (spectacle/grim/import) don't work here.
@@ -210,6 +223,95 @@ bool PickAndFillVideo() {
     return true;
 }
 
+// GPU build (piece 1): render pass — one color attachment, clear -> present.
+bool CreateRenderPass() {
+    if (g_renderPass) return true;
+    VkAttachmentDescription att{};
+    att.format = g_format; att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1; sub.pColorAttachments = &ref;
+    VkSubpassDependency dep{};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL; dep.dstSubpass = 0;
+    dep.srcStageMask = dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    ci.attachmentCount = 1; ci.pAttachments = &att;
+    ci.subpassCount = 1; ci.pSubpasses = &sub;
+    ci.dependencyCount = 1; ci.pDependencies = &dep;
+    VKCHECK(vkCreateRenderPass(g_device, &ci, nullptr, &g_renderPass));
+    return true;
+}
+
+// GPU build (piece 1): per-image views + framebuffers (recreated on swapchain change).
+bool CreateFramebuffers() {
+    for (auto fb : g_framebuffers) if (fb) vkDestroyFramebuffer(g_device, fb, nullptr);
+    for (auto iv : g_imageViews) if (iv) vkDestroyImageView(g_device, iv, nullptr);
+    g_framebuffers.clear(); g_imageViews.clear();
+    if (!g_renderPass) return false;
+    g_imageViews.resize(g_images.size()); g_framebuffers.resize(g_images.size());
+    for (size_t i = 0; i < g_images.size(); i++) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = g_images[i]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = g_format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VKCHECK(vkCreateImageView(g_device, &vi, nullptr, &g_imageViews[i]));
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fi.renderPass = g_renderPass; fi.attachmentCount = 1; fi.pAttachments = &g_imageViews[i];
+        fi.width = g_extent.width; fi.height = g_extent.height; fi.layers = 1;
+        VKCHECK(vkCreateFramebuffer(g_device, &fi, nullptr, &g_framebuffers[i]));
+    }
+    return true;
+}
+
+// GPU build (piece 1): the test-triangle pipeline (no vertex input; dynamic viewport/scissor).
+bool CreateGraphicsPipeline() {
+    if (g_testPipe) return true;
+    auto mkModule = [](const uint32_t* code, size_t bytes) -> VkShaderModule {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = bytes; mi.pCode = code;
+        VkShaderModule m = VK_NULL_HANDLE; vkCreateShaderModule(g_device, &mi, nullptr, &m); return m;
+    };
+    VkShaderModule vs = mkModule(kTestVertSpv, sizeof(kTestVertSpv));
+    VkShaderModule fs = mkModule(kTestFragSpv, sizeof(kTestFragSpv));
+    if (!vs || !fs) { fprintf(stderr, "[render] test shader module create failed\n"); return false; }
+    VkPipelineShaderStageCreateInfo st[2]{};
+    st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = vs; st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vps.viewportCount = 1; vps.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT|VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dst{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dst.dynamicStateCount = 2; dst.pDynamicStates = dyn;
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    vkCreatePipelineLayout(g_device, &pl, nullptr, &g_pipeLayout);
+    VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pci.stageCount = 2; pci.pStages = st;
+    pci.pVertexInputState = &vin; pci.pInputAssemblyState = &ia; pci.pViewportState = &vps;
+    pci.pRasterizationState = &rs; pci.pMultisampleState = &ms; pci.pColorBlendState = &cb;
+    pci.pDynamicState = &dst; pci.layout = g_pipeLayout; pci.renderPass = g_renderPass; pci.subpass = 0;
+    VkResult r = vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &pci, nullptr, &g_testPipe);
+    vkDestroyShaderModule(g_device, vs, nullptr); vkDestroyShaderModule(g_device, fs, nullptr);
+    if (r != VK_SUCCESS) { fprintf(stderr, "[render] test pipeline create = %d\n", (int)r); return false; }
+    fprintf(stderr, "[render] GPU-build: test-triangle pipeline created (render pass + pipeline ready)\n");
+    return true;
+}
+
 bool CreateSwapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     VKCHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_phys, g_surface, &caps));
@@ -252,6 +354,7 @@ bool CreateSwapchain() {
     g_images.resize(n);
     vkGetSwapchainImagesKHR(g_device, g_swapchain, &n, g_images.data());
     fprintf(stderr, "[render] swapchain %ux%u fmt=%d images=%u\n", g_extent.width, g_extent.height, (int)g_format, n);
+    if (g_drawtest) { CreateRenderPass(); CreateFramebuffers(); }   // GPU build (piece 1)
     return true;
 }
 
@@ -315,6 +418,7 @@ bool Init() {
     vkGetDeviceQueue(g_device, g_qfam, 0, &g_queue);
 
     if (!CreateSwapchain()) return false;
+    if (g_drawtest) CreateGraphicsPipeline();   // GPU build (piece 1): render pass already made in CreateSwapchain
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -371,6 +475,54 @@ bool PresentOnce() {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_cmd, &bi);
+
+    if (g_drawtest && g_testPipe && idx < g_framebuffers.size()) {
+        // GPU build (piece 1): render the test triangle via the graphics pipeline. The render pass takes the
+        // image UNDEFINED -> PRESENT_SRC, so no manual barriers. Proves render pass + pipeline + vkCmdDraw.
+        VkClearValue cv{}; cv.color.float32[0]=0.06f; cv.color.float32[1]=0.06f; cv.color.float32[2]=0.10f; cv.color.float32[3]=1.0f;
+        VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rp.renderPass = g_renderPass; rp.framebuffer = g_framebuffers[idx];
+        rp.renderArea.extent = g_extent; rp.clearValueCount = 1; rp.pClearValues = &cv;
+        vkCmdBeginRenderPass(g_cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_testPipe);
+        VkViewport vp{0.0f, 0.0f, (float)g_extent.width, (float)g_extent.height, 0.0f, 1.0f};
+        VkRect2D scs{{0, 0}, g_extent};
+        vkCmdSetViewport(g_cmd, 0, 1, &vp); vkCmdSetScissor(g_cmd, 0, 1, &scs);
+        vkCmdDraw(g_cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(g_cmd);
+        bool cap = g_shotTarget && g_frame == g_shotTarget;   // REX_RENDER_SHOT=N -> capture frame N to PPM
+        if (cap) {
+            EnsureCaptureBuffer();
+            if (g_capBuf) {
+                ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                VkBufferImageCopy rgn{};
+                rgn.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                rgn.imageExtent = {g_extent.width, g_extent.height, 1};
+                vkCmdCopyImageToBuffer(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_capBuf, 1, &rgn);
+                ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             VK_ACCESS_TRANSFER_READ_BIT, 0);
+            } else cap = false;
+        }
+        vkEndCommandBuffer(g_cmd);
+        VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.waitSemaphoreCount = 1; si.pWaitSemaphores = &g_acquireSem; si.pWaitDstStageMask = &ws;
+        si.commandBufferCount = 1; si.pCommandBuffers = &g_cmd;
+        si.signalSemaphoreCount = 1; si.pSignalSemaphores = &g_presentSem;
+        vkQueueSubmit(g_queue, 1, &si, g_fence);
+        if (cap) { vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, UINT64_MAX); WriteCapturePPM("/tmp/varianta_shot.ppm"); }
+        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &g_presentSem;
+        pi.swapchainCount = 1; pi.pSwapchains = &g_swapchain; pi.pImageIndices = &idx;
+        VkResult pr = vkQueuePresentKHR(g_queue, &pi);
+        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) { vkDeviceWaitIdle(g_device); CreateSwapchain(); }
+        if ((g_frame % 300) == 0) fprintf(stderr, "[render] GPU-build: test triangle frame %llu\n", (unsigned long long)g_frame);
+        g_frame++;
+        return true;
+    }
 
     ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
