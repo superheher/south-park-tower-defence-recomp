@@ -2338,18 +2338,20 @@ PPC_FUNC(__imp__VdSwap) {
                                     fprintf(stderr, "[vtxdump] draw op=0x%X prim=%u numI=%u — fetch slots (d0 d1 -> type/byteaddr/words):\n", op, init&0x3F, init>>16);
                                     for(uint32_t s=0;s<24;s++){ uint32_t d0=stget(0x4800+s*2),d1=stget(0x4800+s*2+1);
                                         if(!d0&&!d1)continue; fprintf(stderr,"  slot%u: %08X %08X  type=%u addr=0x%X words=%u\n",s,d0,d1,d0&3,d0&0xFFFFFFFCu,(d1>>2)&0xFFFFFF); }
-                                    // The fetch addr could be the 0xA physical window, a direct low guest addr, or offset into a
-                                    // 10MB pool that's mostly empty. Scan each candidate for the first non-zero 16B and dump it.
-                                    uint32_t cands[2] = { 0xA0000000u|(firstVb&0x1FFFFFFFu), firstVb };
-                                    for(int ci=0; ci<2; ci++){ uint32_t bvg=cands[ci]; uint32_t hit=0;
-                                        for(uint32_t o=0;o<0xC00000;o+=16){ if(GLD32(bvg+o)||GLD32(bvg+o+4)||GLD32(bvg+o+8)||GLD32(bvg+o+12)){hit=o;break;} }
-                                        fprintf(stderr,"[vtxdump] base 0x%X: first non-zero @+0x%X%s\n", bvg, hit, hit==0?"(or none)":"");
-                                        if(hit||GLD32(bvg)){ for(int r=0;r<8;r++){ char ln[256]; size_t lo=0; uint32_t b=bvg+hit+r*16;
-                                            lo+=snprintf(ln+lo,sizeof(ln)-lo,"   +0x%X:",hit+r*16);
-                                            for(int c=0;c<4;c++){uint32_t w=GLD32(b+c*4);lo+=snprintf(ln+lo,sizeof(ln)-lo," %08X",w);}
-                                            lo+=snprintf(ln+lo,sizeof(ln)-lo,"  |");
-                                            for(int c=0;c<4;c++){uint32_t w=GLD32(b+c*4);float f;memcpy(&f,&w,4);lo+=snprintf(ln+lo,sizeof(ln)-lo," %g",f);}
-                                            fprintf(stderr,"%s\n",ln); } } }
+                                    // Crack the vertex FORMAT: scan the pool (physical window) for a DENSE region — a
+                                    // 16-dword window where >=6 dwords are floats in screen-coord range [1,1280] — = a
+                                    // packed vertex array. Dump 32 dwords there so the repeating stride is visible.
+                                    uint32_t bvg = 0xA0000000u|(firstVb&0x1FFFFFFFu); uint32_t dense=0;
+                                    auto isScreen=[&](uint32_t w){ float f; memcpy(&f,&w,4); return f>=1.0f && f<=1280.0f; };
+                                    for(uint32_t o=0;o<0xC00000 && !dense;o+=4){ int hits=0; for(int k=0;k<16;k++) if(isScreen(GLD32(bvg+o+k*4))) hits++;
+                                        if(hits>=6) dense=o; }
+                                    fprintf(stderr,"[vtxdump] base 0x%X: dense screen-coord vertex region @+0x%X — 32 dwords (offset:hex|float):\n", bvg, dense);
+                                    for(int r=0;r<8;r++){ char ln[300]; size_t lo=0; uint32_t b=bvg+dense+r*16;
+                                        lo+=snprintf(ln+lo,sizeof(ln)-lo,"   +0x%X:",dense+r*16);
+                                        for(int c=0;c<4;c++){uint32_t w=GLD32(b+c*4);lo+=snprintf(ln+lo,sizeof(ln)-lo," %08X",w);}
+                                        lo+=snprintf(ln+lo,sizeof(ln)-lo,"  |");
+                                        for(int c=0;c<4;c++){uint32_t w=GLD32(b+c*4);float f;memcpy(&f,&w,4);lo+=snprintf(ln+lo,sizeof(ln)-lo," %g",f);}
+                                        fprintf(stderr,"%s\n",ln); }
                                 } } }
                         else if (op==0x2D){ setc++; uint32_t ot=GLD32(a); uint32_t ty=(ot>>16)&0xFF, ix=ot&0x7FF;
                             if (ty==1){ bool t1=false; for(uint32_t j=1;j<cnt&&a+j*4+4<=end;j++){ stset(0x4800+ix+(j-1), GLD32(a+j*4));
