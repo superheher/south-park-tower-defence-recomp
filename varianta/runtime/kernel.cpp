@@ -2233,6 +2233,67 @@ PPC_FUNC(__imp__VdSwap) {
         }
         s_icbLast = cur;
     }
+    // Task #2 / piece 3b (REX_EXECSEGS): EXECUTE the deferred device+13568 DIRECTORY segments through the CP.
+    // The corrected census (REX_CHUNKDUMP) PROVED these segments hold the full menu content — textured DRAW_INDX,
+    // ~2000 ALU constants, 186 fetch constants, viewport/blend/surface state, EDRAM resolves, VIZ queries — that
+    // variant A's CP never executes (only the 3 setup clears are ever kicked). Unlike REX_CHUNKCP (which wrongly
+    // runs the directory itself as inline PM4) and REX_SEGCP (which scans the r3 STAGING range), this follows the
+    // device+13568 directory the census localized content to: scan it with the census's AUTHORITATIVE parse
+    // (top byte 0x81 = descriptor, low 24 bits = segment length in dwords; next dword = phys addr), resolve
+    // guest=0xA0000000|(phys&0x1FFFFFFF), and ExecutePM4 each segment. Executing them fires the REAL
+    // EVENT_WRITE_SHD fences / PM4_INTERRUPT callbacks / resolves the content stream carries — the "real GPU
+    // result" cont.22 found fence-forward FAKING could not reproduce. THE A<->B TEST: does running the real
+    // content stream (vs faking its completion) let the resource-loader/transition proceed — populate the vfetch
+    // pool at slot-0 (0xA2000000) and open the kick-gate on later frames? Observe slot0/draws/swaps across frames.
+    // Gated REX_EXECSEGS=N (fire at swap>=N, default 3); default boot UNREGRESSED. DRAW_INDX is still a no-op
+    // count (T2b wires vkCmdDraw next) — this increment proves execution + measures the downstream A<->B effect.
+    if (getenv("REX_EXECSEGS") && g_device.load()) {
+        static const uint32_t s_esAt = []{ const char* e=getenv("REX_EXECSEGS"); uint32_t v=e?(uint32_t)atoi(e):0; return v>1?v:3u; }();
+        uint32_t dv = g_device.load(), base = GLD32(dv+13568), wptr = GLD32(dv+13572);
+        bool valid = base >= 0xA0000000u && wptr > base && (wptr - base) < 0x100000u;
+        if (valid && n >= s_esAt) {
+            uint32_t slot0Before = GLD32(0xA2000000u);
+            uint64_t drBefore = g_drawCount.load();
+            int descsFound = 0, segs = 0;
+            for (uint32_t a = base; a + 8 <= wptr; a += 4) {
+                uint32_t d = GLD32(a);
+                if ((d >> 24) != 0x81u) continue;                       // census parse: 0x81LLLLLL descriptor tag
+                uint32_t len = d & 0xFFFFFFu, addr = GLD32(a + 4);
+                if (len == 0 || len >= 0x8000u || (addr & 3)) continue;  // sane length (dwords) + aligned addr
+                descsFound++;
+                uint32_t guest = 0xA0000000u | (addr & 0x1FFFFFFFu);
+                if ((GLD32(guest) >> 30) == 2u) continue;               // first packet type-2 (nop) => not a segment
+                ExecutePM4(guest, len, 1);                              // depth 1 = IB body (skips the cpdump path)
+                segs++;
+            }
+            uint32_t slot0After = GLD32(0xA2000000u);
+            // Read the LIVE fetch slot-0 constant the executed draws actually set (reg file 0x7FC80000+0x4800*4),
+            // resolve it (NOT a hardcoded 0xA2000000), and gauge BOTH it and 0xA2000000 for real screen-coord
+            // floats. Guards the "maybe the verts live where the live fetch points, not 0xA2000000" doubt: if the
+            // live pool has real floats, the verts DO exist (placement bug); if both are empty, the verts truly
+            // are never written. The loader should fill the pool with real verts once it proceeds (head stayed
+            // 0xFFFFFFFF/0 filler in all prior runs).
+            uint32_t fc0 = GLD32(0x7FC80000u + 0x4800u*4u), fcBase = fc0 & 0xFFFFFFFCu;
+            uint32_t fcGuest = 0xA0000000u | (fcBase & 0x1FFFFFFFu);
+            auto realFloats = [&](uint32_t g){ int r=0; for(int i=0;i<64;i++){ uint32_t u=GLD32(g+i*4); float f; memcpy(&f,&u,4);
+                if(u && u!=0xFFFFFFFFu && f>-4096.f && f<4096.f) r++; } return r; };
+            int s0real = realFloats(0xA2000000u), fcReal = realFloats(fcGuest);
+            // One-shot RAW dump of the live-fetch pool: confirm the 46/64 "real floats" are STRUCTURED vertex
+            // coords (screen 0..1280 / clip -1..1), not a coincidence of the weak [-4096,4096] filter.
+            static std::atomic<int> rawDumped{0};
+            if (fcReal > 8 && rawDumped.fetch_add(1) < 6) {
+                fprintf(stderr, "[execsegs] RAW live-fetch pool @0x%X (fc0=%08X type=%u) first 24 floats:\n  ", fcGuest, fc0, fc0&3);
+                for (int i=0;i<24;i++){ uint32_t u=GLD32(fcGuest+i*4); float f; memcpy(&f,&u,4); fprintf(stderr,"%.3g ", f); }
+                fprintf(stderr, "\n");
+            }
+            static std::atomic<int> logged{0};
+            if (g_ktrace && logged.fetch_add(1) < 60)
+                fprintf(stderr, "[execsegs] swap#%u descs=%d segs=%d draws+%llu slot0(A2000000)Head %08X->%08X real=%d | liveFetch0=%08X->0x%X real=%d | swaps=%llu drawTotal=%llu\n",
+                        n, descsFound, segs, (unsigned long long)(g_drawCount.load()-drBefore),
+                        slot0Before, slot0After, s0real, fc0, fcGuest, fcReal,
+                        (unsigned long long)g_swapCount.load(), (unsigned long long)g_drawCount.load());
+        }
+    }
     // Renderer part 1 (chunk-CP, route B v2, REX_CHUNKCP=1): the REAL command stream is NOT the r3 staging
     // buffer (0xA01xxxxx) but a pool of command-buffer chunks at 0xA04D-0xA056xxxx tracked in the device
     // struct (records {base, writeptr, 0x1080, base+4, 0, device}). device+13568=current-chunk base,
