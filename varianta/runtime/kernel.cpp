@@ -2273,6 +2273,16 @@ PPC_FUNC(__imp__VdSwap) {
             int totWait=0, totZp=0, totViz=0, totRb=0, totRes=0; uint32_t fwPoll=0, fwRef=0, fwInfo=0;
             fprintf(stderr, "[chunkdump] swap#%u base=0x%X len=0x%X %s(ind=%d) segDescs=%d — FOLLOWING:\n",
                     n, base, wptr-base, g_nonBenignInd.load()==0?"CLEAN":"RACED", g_nonBenignInd.load(), nDesc);
+            // Piece-3b increment 1: a frame-level register shadow (regs 0x2000-0x233F, the RB/PA/SQ state +
+            // RB_COPY block) updated as we walk the segments IN DIRECTORY ORDER, so at each content DRAW we can
+            // dump the pipeline state it binds (RT/viewport/scissor/blend/shader/mode) — exactly what the
+            // DRAW_INDX->Vulkan translator must turn into a VkPipeline. State carries across segments within a
+            // frame (the title sets state once, draws many times). Pure read/track — NO execution, NO side
+            // effects (unlike running ExecutePM4 on the segments, which would fire interrupts/fences).
+            uint32_t st[0x340] = {0}; int drawDumps = 0; uint32_t shaderBase = 0;
+            auto stset = [&](uint32_t r, uint32_t v){ if (r >= 0x2000 && r < 0x2340) st[r-0x2000] = v;
+                                                      else if (r == 0x21F7) shaderBase = v; };   // SQ_PROGRAM base hint
+            auto stget = [&](uint32_t r){ return (r >= 0x2000 && r < 0x2340) ? st[r-0x2000] : 0u; };
             for (int di = 0; di < nDesc && di < 24; di++) {
                 uint32_t len = descs[di].len, addr = descs[di].addr, guest = 0xA0000000u | (addr & 0x1FFFFFFFu);
                 int dReal=0, dRect=0, setc=0, tex=0, dWait=0, dZp=0, dViz=0, dRb=0, dRes=0;
@@ -2288,7 +2298,7 @@ PPC_FUNC(__imp__VdSwap) {
                     if (t == 0) {                                              // type-0: write cnt regs from baseIdx
                         uint32_t cnt=((pkt>>16)&0x3FFF)+1, bi=pkt&0x7FFF; bool one=(pkt>>15)&1;
                         if (!one && bi>=0x4800 && bi<0x4900 && cnt>=6) tex++;   // FETCH constants (textures/vertex streams) via type-0
-                        for (uint32_t m=0;m<cnt&&a+4<=end;m++,a+=4){ uint32_t r=one?bi:bi+m;
+                        for (uint32_t m=0;m<cnt&&a+4<=end;m++,a+=4){ uint32_t r=one?bi:bi+m; stset(r, GLD32(a));
                             if (r>=0x2318&&r<=0x2325) dRes++; else if (r==0x2293) dViz++; }
                     } else if (t == 1) { a += 8; }                             // type-1: 2 reg writes
                     else if (t == 2) { /* no-op */ }                          // type-2
@@ -2296,11 +2306,22 @@ PPC_FUNC(__imp__VdSwap) {
                         uint32_t op=(pkt>>8)&0x7F, cnt=((pkt>>16)&0x3FFF)+1;
                         if (a + cnt*4 > end) { desync=true; break; }           // count overruns segment => not clean PM4
                         if (op==0x22||op==0x36){ uint32_t init=(op==0x22)?GLD32(a+4):GLD32(a);   // 0x22: initiator is data[1]
-                            if(init==0x30088u)dRect++; else {dReal++; if(!firstReal)firstReal=init?init:0xFFFFFFFFu;} }
+                            bool clear=(init==0x30088u); if(clear)dRect++; else {dReal++; if(!firstReal)firstReal=init?init:0xFFFFFFFFu;}
+                            // Piece-3b increment 1: dump the pipeline state each non-clear (content) draw binds.
+                            if (!clear && drawDumps < 14) { ++drawDumps;
+                                auto rf=[&](uint32_t r){ uint32_t u=stget(r); float f; memcpy(&f,&u,4); return f; };
+                                uint32_t surf=stget(0x2000), col=stget(0x2001);
+                                fprintf(stderr, "  [drawstate] seg#%d #%d op=0x%X prim=%u numI=%u | RT pitch=%u msaa=%u fmt=%u base=0x%X | "
+                                        "vp %.0fx%.0f off(%.0f,%.0f) | scis(%u,%u)-(%u,%u) | blend0=0x%X colCtl=0x%X progCntl=0x%X depthCtl=0x%X mode=0x%X\n",
+                                        di, drawDumps, op, init&0x3F, init>>16,
+                                        (surf&0x3FFF),(surf>>14)&3,(col>>16)&0xF,(col&0xFFF),
+                                        2.0f*rf(0x210F),2.0f*rf(0x2111), rf(0x2110), rf(0x2112),
+                                        stget(0x2081)&0x7FFF,(stget(0x2081)>>16)&0x7FFF, stget(0x2082)&0x7FFF,(stget(0x2082)>>16)&0x7FFF,
+                                        stget(0x2201), stget(0x2202), stget(0x2180), stget(0x2200), stget(0x2208)); } }
                         else if (op==0x2D){ setc++; uint32_t ot=GLD32(a); uint32_t ty=(ot>>16)&0xFF, ix=ot&0x7FF;
                             if (ty==1) for(uint32_t j=1;j<cnt&&a+j*4+4<=end;j++) if((((GLD32(a+j*4)>>12)&0xFFFFF)<<12)>=0xA0000000u){tex++;break;}
-                            if (ty==4&&ix>=0x318&&ix<=0x325) dRes++;
-                            if (ty==4&&ix==0x293) dViz++; }
+                            if (ty==4){ for(uint32_t j=1;j<cnt&&a+j*4+4<=end;j++) stset(0x2000+ix+(j-1), GLD32(a+j*4));
+                                        if(ix>=0x318&&ix<=0x325) dRes++; if(ix==0x293) dViz++; } }
                         else if (op==0x55) setc++;
                         else if (op==0x3C){ dWait++; if(!fwPoll){fwInfo=GLD32(a);fwPoll=GLD32(a+4);fwRef=GLD32(a+8);} }
                         else if (op==0x52||op==0x53) dWait++;                  // WAIT_REG_EQ / GTE
