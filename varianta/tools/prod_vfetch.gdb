@@ -1,10 +1,13 @@
-# ⚠ LIMITATION (2026-06-04): prod is an OPTIMIZED RelWithDebInfo build — gdb cannot resolve `this` /
-# the `rex::graphics::CommandProcessor*` cast at this breakpoint (the register read below fails with
-# "No symbol this/rex in current context"). To finish the prod-oracle, either (a) read the register file
-# via RAW MEMBER OFFSETS from $rdi (compute CommandProcessor::register_file_'s offset + RegisterFile::values's
-# offset from a debug build or DWARF), or (b) build a debug prod. The breakpoint + progc-filter scaffold below
-# is correct; only the typed member access needs the offset rewrite. Deferred — the variant-A finding
-# (slot-0 vfetch pool is 0x0BADF00D poison at swap-time) already implies the conclusion (faithful continuous CP).
+# ⚠⚠ BLOCKED (2026-06-04): the prod binary has NO DWARF (readelf -S shows zero .debug_* sections — only the
+# .symtab function names that let breakpoints resolve). So gdb has NO TYPE INFO: `this`, the
+# `rex::graphics::CommandProcessor*` cast, and `ptype` ALL fail ("No symbol table is loaded"). The typed
+# register-file read below CANNOT work on this binary. To finish the prod-oracle: (a) REBUILD prod with debug
+# info (cmake -DCMAKE_BUILD_TYPE=Debug, or -g), or (b) compute CommandProcessor::register_file_ + RegisterFile
+# ::values raw offsets FROM SOURCE (rexglue-sdk command_processor.h + register_file.h class layout — error-prone:
+# base classes/vtable/padding) and read *(uint32_t*)($rdi + reg_off + values_off + 0x4800*4). The breakpoint +
+# progc-filter scaffold is correct; only the member access needs (a) or (b). ⇒ The tractable NO-PROD resolver
+# is instead a VARIANT-A hardware watchpoint on the vertex region (variant A is NOT stripped: bt gives the
+# sub_XXXXXXXX vertex-gen writer) to find why the content vfetch source (slot 0 = 0xA2000000) is empty.
 set pagination off
 set breakpoint pending on
 handle SIGSEGV nostop noprint pass
