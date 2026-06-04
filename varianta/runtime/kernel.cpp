@@ -1345,6 +1345,23 @@ void VblankPump() {
         GST32(GpuRegAddr(0x1951), 1);             // re-assert interrupt-status=vblank (prod ReadRegister)
         FireGfxInterrupt(cb, 0, /*cpu=*/2);       // vblank (prod delivers on cpu 2)
         if (consumed) FireGfxInterrupt(cb, 1, /*cpu=*/2);    // command-buffer complete
+        // REX_CPCOMPLETE (cont.21 pillar A): break the kick-gate DEADLOCK by modeling GPU completion.
+        // The title increments the pending-submission counter device+0x2b04 per submission; the ring kick
+        // sub_821C6C80 fires only when it's 0. With no real GPU to complete submissions it climbs 0->0xA and
+        // never resets -> 6 init kicks then every frame DEFERs (measured cont.21: 6 KICK / 74 DEFER). Drain
+        // it one per vblank (a faithful per-completion decrement — NOT cont.15's blanket force-to-0 in the
+        // kick hook) so the title keeps kicking its draw IBs. Success metric: kicks/WPTR climb past 6/37,
+        // the title submits real frames, and its draw IBs (physical window) reach the CP. g_interruptData ==
+        // the device base (== g_device captured by the kick; both = 0x26F80). [experiment, gated, default-off]
+        static const bool s_cpcomplete = getenv("REX_CPCOMPLETE") != nullptr;
+        if (s_cpcomplete && g_interruptData) {
+            uint32_t c = GLD32(g_interruptData + 0x2b04);
+            if (c > 0) {
+                GST32(g_interruptData + 0x2b04, c - 1);
+                if (g_ktrace) { static int dn = 0; if (dn++ < 40)
+                    fprintf(stderr, "[cpcomplete] device+0x2b04 %u->%u (modeled GPU completion)\n", c, c - 1); }
+            }
+        }
         // REX_PUMPCB (cont.17 fix attempt): drive the render producer/consumer from the PUMP context (its
         // procType matches the consumer's — cont.15 showed a pump-fired interrupt DOES wake the consumer).
         // Scan the device cmd-buffer chunk for the callback records {0001057C,821CC7A0,ctx}; for each, populate
