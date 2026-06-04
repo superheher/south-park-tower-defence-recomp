@@ -1243,6 +1243,9 @@ enum { PM4_ME_INIT=0x48, PM4_NOP=0x10, PM4_INDIRECT_BUFFER=0x3F, PM4_INDIRECT_BU
 constexpr uint32_t XE_GPU_REG_VGT_EVENT_INITIATOR = 0x21F9;
 
 std::atomic<uint32_t> g_gpuCounter{0};   // GPU swap counter — EVENT_WRITE_SHD is_counter fences read it
+// T2b-step-1: set true while REX_EXECSEGS executes the deferred segments, so DRAW_INDX can capture EACH
+// draw's LIVE fetch slot-0 (resolving the census-vs-execution open sub-Q + confirming per-draw verts).
+thread_local bool tl_execsegs = false;
 std::atomic<uint64_t> g_drawCount{0}, g_swapCount{0};
 const bool g_cptrace = (getenv("REX_CPTRACE") != nullptr);
 
@@ -1332,6 +1335,18 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
       case PM4_DRAW_INDX: case PM4_DRAW_INDX_2: {
         uint32_t init = GLD32(addr), numInd = init >> 16, prim = init & 0x3F;
         g_drawCount.fetch_add(1);
+        // T2b-step-1: during REX_EXECSEGS, capture THIS draw's live fetch slot-0 (the foundation vkCmdDraw needs,
+        // and resolves the open sub-Q: do ALL ~7-8 draws/frame point at real kVertex verts, or only the last?).
+        if (tl_execsegs) {
+            static std::atomic<int> esd{0}; int k = esd.fetch_add(1);
+            if (k < 48) {
+                uint32_t fc0 = GLD32(0x7FC80000u + 0x4800u*4u), base = fc0 & 0xFFFFFFFCu;
+                uint32_t g = 0xA0000000u | (base & 0x1FFFFFFFu), d1 = GLD32(0x7FC80000u + 0x4801u*4u);
+                float v[4]; for (int i=0;i<4;i++){ uint32_t u=GLD32(g+i*4); memcpy(&v[i],&u,4); }
+                fprintf(stderr, "[esdraw] #%d numI=%u prim=%u fc0=%08X type=%u base=0x%X words=%u v0=(%.1f,%.1f) v1=(%.1f,%.1f)\n",
+                        k, numInd, prim, fc0, fc0&3, g, (d1>>2)&0xFFFFFFu, v[0],v[1],v[2],v[3]);
+            }
+        }
         // step (a) result-gate: a resolve (EDRAM->texture readback) is a draw with an active copy command —
         // RB_COPY_CONTROL (0x2318) non-zero AND RB_COPY_DEST_BASE (0x2319) set. (destBase alone is often a
         // stale register value, so require ctl != 0.) The title reads pixel results back to system memory.
@@ -2255,6 +2270,7 @@ PPC_FUNC(__imp__VdSwap) {
             uint32_t slot0Before = GLD32(0xA2000000u);
             uint64_t drBefore = g_drawCount.load();
             int descsFound = 0, segs = 0;
+            tl_execsegs = true;   // T2b-step-1: let DRAW_INDX capture each executed draw's live fetch slot-0
             for (uint32_t a = base; a + 8 <= wptr; a += 4) {
                 uint32_t d = GLD32(a);
                 if ((d >> 24) != 0x81u) continue;                       // census parse: 0x81LLLLLL descriptor tag
@@ -2266,6 +2282,7 @@ PPC_FUNC(__imp__VdSwap) {
                 ExecutePM4(guest, len, 1);                              // depth 1 = IB body (skips the cpdump path)
                 segs++;
             }
+            tl_execsegs = false;
             uint32_t slot0After = GLD32(0xA2000000u);
             // Read the LIVE fetch slot-0 constant the executed draws actually set (reg file 0x7FC80000+0x4800*4),
             // resolve it (NOT a hardcoded 0xA2000000), and gauge BOTH it and 0xA2000000 for real screen-coord
