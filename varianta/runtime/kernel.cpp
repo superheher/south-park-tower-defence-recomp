@@ -2281,6 +2281,8 @@ PPC_FUNC(__imp__VdSwap) {
             // effects (unlike running ExecutePM4 on the segments, which would fire interrupts/fences).
             uint32_t st[0x340] = {0}, fetch[0x180] = {0}; int drawDumps = 0;   // fetch[] = vertex/texture fetch consts 0x4800-0x497F
             uint32_t menuPoolBase = 0;   // Layer 2: the content draws' kVertex pool base, captured during the walk
+            int opHist[128] = {0};       // type-3 opcode histogram (find constant-load packets the shadow misses)
+            uint32_t loadOps[6] = {0};   // first few LOAD_ALU_CONSTANT (0x2F) raw d0/d1 to decode its dest reg
             auto stset = [&](uint32_t r, uint32_t v){ if (r >= 0x2000 && r < 0x2340) st[r-0x2000] = v;
                                                       else if (r >= 0x4800 && r < 0x4980) fetch[r-0x4800] = v; };
             auto stget = [&](uint32_t r){ return (r >= 0x2000 && r < 0x2340) ? st[r-0x2000] : (r >= 0x4800 && r < 0x4980 ? fetch[r-0x4800] : 0u); };
@@ -2306,6 +2308,8 @@ PPC_FUNC(__imp__VdSwap) {
                     else {                                                     // type-3: opcode packet
                         uint32_t op=(pkt>>8)&0x7F, cnt=((pkt>>16)&0x3FFF)+1;
                         if (a + cnt*4 > end) { desync=true; break; }           // count overruns segment => not clean PM4
+                        if (op<128) opHist[op]++;
+                        if (op==0x2F && !loadOps[0]) { loadOps[0]=GLD32(a); loadOps[1]=GLD32(a+4); loadOps[2]=GLD32(a+8); loadOps[3]=cnt; }   // LOAD_ALU_CONSTANT
                         if (op==0x22||op==0x36){ uint32_t init=(op==0x22)?GLD32(a+4):GLD32(a);   // 0x22: initiator is data[1]
                             bool clear=(init==0x30088u); if(clear)dRect++; else {dReal++; if(!firstReal)firstReal=init?init:0xFFFFFFFFu;}
                             // Piece-3b increment 1: dump the pipeline state each non-clear (content) draw binds.
@@ -2399,6 +2403,14 @@ PPC_FUNC(__imp__VdSwap) {
                     fprintf(stderr,"[segdump] (end; %d packets shown)\n", pk<120?pk:120);
                 }
             }
+            { char hb[512]; size_t ho=0; ho+=snprintf(hb+ho,sizeof(hb)-ho,"[ophist]");
+              for (int op=0; op<128; op++) if (opHist[op]) {
+                  const char* nm = op==0x22?"DRAW":op==0x36?"DRAW2":op==0x2D?"SETCONST":op==0x55?"SETCONST2":op==0x56?"SETSHCONST":
+                      op==0x2F?"LOAD_ALU":op==0x2E?"LOAD_CTX":op==0x27?"IM_LOAD":op==0x2B?"IM_LOAD_IMM":op==0x3C?"WAITREG":
+                      op==0x46?"EVTWRITE":op==0x5B?"EVT_ZPD":op==0x23?"VIZQ":op==0x10?"NOP":op==0x3F?"IB":op==0x54?"INT":"";
+                  ho+=snprintf(hb+ho,sizeof(hb)-ho," 0x%02X%s%s=%d", op, *nm?":":"", nm, opHist[op]); }
+              fprintf(stderr, "%s\n", hb);
+              if (loadOps[0]||loadOps[1]) fprintf(stderr,"[ophist] first LOAD_ALU_CONSTANT(0x2F): d0=0x%X d1=0x%X d2=0x%X cnt=%u\n", loadOps[0],loadOps[1],loadOps[2],loadOps[3]); }
             // Piece-3b Layer 2: extract the menu geometry from the vertex pool + submit to the render thread
             // (auto-fit to clip). The vertex stream is fetch slot 1 (RE'd). Collect contiguous screen-coord
             // float2 verts from the pool's dense region, treat as quad-list (groups of 4 -> 2 tris), map the
