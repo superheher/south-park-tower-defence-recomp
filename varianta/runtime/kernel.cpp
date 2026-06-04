@@ -1359,6 +1359,25 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                         vslot=s; vbase=0xA0000000u|((f0&0xFFFFFFFCu)&0x1FFFFFFFu); vwords=(f1>>2)&0xFFFFFFu; break; } }
                 fprintf(stderr, "[esdraw] #%d op=0x%X numI=%u prim=%u | slot0 fc=%08X type=%u | vtxSlot=%d base=0x%X words=%u\n",
                         k, op, numInd, prim, fc0, fc0&3, vslot, vbase, vwords);
+                // For the op-0x22 sprite/text draws: src_select (init[7:6]: 0=DMA/indexed, 2=auto-index),
+                // index fmt (init[11]: 0=u16,1=u32), index buffer (data[2]=base, data[3]=size). If indexed,
+                // read the first indices + the slot-1 verts they point at — tells us how to carve these draws
+                // (and whether the verts are screen coords like the backdrop, or need $worldviewProj).
+                if (op == 0x22 && vslot >= 0) {
+                    uint32_t initw = GLD32(addr + 4);   // op-0x22 initiator = data[1]
+                    uint32_t srcSel = (initw >> 6) & 3, idxFmt = (initw >> 11) & 1;
+                    uint32_t ibRaw = GLD32(addr + 8), ibSz = GLD32(addr + 12);
+                    uint32_t ig = 0xA0000000u | (ibRaw & 0x1FFFFFFFu);
+                    uint32_t i01 = GLD32(ig), i23 = GLD32(ig + 4);                 // u16 BE indices: hi/lo per dword
+                    uint32_t idx[4] = { i01 >> 16, i01 & 0xFFFF, i23 >> 16, i23 & 0xFFFF };
+                    char vb[160]; size_t vo = 0; vb[0] = 0;
+                    for (int j = 0; j < 3; j++) { uint32_t ix = idxFmt ? GLD32(ig + j*4) : idx[j];
+                        uint32_t ux = GLD32(vbase + ix*8), uy = GLD32(vbase + ix*8 + 4); float fx, fy;
+                        memcpy(&fx,&ux,4); memcpy(&fy,&uy,4);
+                        vo += snprintf(vb+vo, sizeof(vb)-vo, " v[%u]=(%.1f,%.1f)", ix, fx, fy); }
+                    fprintf(stderr, "[esidx] #%d prim=%u src=%u fmt=%s idxBase=0x%X sz=0x%X idx=[%u %u %u %u]%s\n",
+                            k, prim, srcSel, idxFmt?"u32":"u16", ig, ibSz, idx[0],idx[1],idx[2],idx[3], vb);
+                }
             }
             // Task #4: which PRIMS does execsegs actually execute? Log each distinct prim once (across the whole
             // run, past the [esdraw] cap) — confirms whether the rich UI (prim 5 sprites / prim 13 text the census
