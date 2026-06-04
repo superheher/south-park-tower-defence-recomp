@@ -1246,6 +1246,9 @@ std::atomic<uint32_t> g_gpuCounter{0};   // GPU swap counter — EVENT_WRITE_SHD
 // T2b-step-1: set true while REX_EXECSEGS executes the deferred segments, so DRAW_INDX can capture EACH
 // draw's LIVE fetch slot-0 (resolving the census-vs-execution open sub-Q + confirming per-draw verts).
 thread_local bool tl_execsegs = false;
+// T2b-step-2: per-draw carved geometry accumulated during a REX_EXECSEGS frame (clip-space XY, interleaved),
+// submitted to the render bridge after the exec loop. Touched ONLY on the VdSwap thread under tl_execsegs.
+thread_local std::vector<float> tl_esVerts;
 std::atomic<uint64_t> g_drawCount{0}, g_swapCount{0};
 const bool g_cptrace = (getenv("REX_CPTRACE") != nullptr);
 
@@ -1345,6 +1348,26 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                 float v[4]; for (int i=0;i<4;i++){ uint32_t u=GLD32(g+i*4); memcpy(&v[i],&u,4); }
                 fprintf(stderr, "[esdraw] #%d numI=%u prim=%u fc0=%08X type=%u base=0x%X words=%u v0=(%.1f,%.1f) v1=(%.1f,%.1f)\n",
                         k, numInd, prim, fc0, fc0&3, g, (d1>>2)&0xFFFFFFu, v[0],v[1],v[2],v[3]);
+            }
+            // T2b-step-2: carve THIS draw's geometry into clip-space triangles for the render bridge.
+            // Content draws = prim 8 (kRectangleList) numI 3, fetch type-3 kVertex, float2 (stride 2dw) screen
+            // coords. kRectangleList: v0,v1,v2 given + v3 = v1+v2-v0 (the parallelogram's 4th corner) → 2 tris.
+            // Screen→Vulkan-NDC: clip=(x/640-1, y/360-1) for the 1280×720 fb (NDC y-down matches screen y-down).
+            uint32_t fc0 = GLD32(0x7FC80000u + 0x4800u*4u);
+            if ((fc0 & 3u) == 3u && prim == 8 && numInd >= 3) {
+                uint32_t base = fc0 & 0xFFFFFFFCu, gv = 0xA0000000u | (base & 0x1FFFFFFFu);
+                float x[3], y[3];
+                for (int i = 0; i < 3; i++) { uint32_t ux = GLD32(gv + i*8), uy = GLD32(gv + i*8 + 4);
+                                              memcpy(&x[i], &ux, 4); memcpy(&y[i], &uy, 4); }
+                // Xenos kRectangleList: v0,v1,v2 are 3 corners; the implied 4th is v3 = v0 + v2 - v1 (verified
+                // from the RAW dump v0=(640,360) v1=(1280,360) v2=(1280,720) → v3=(640,720)=clean BR quadrant).
+                // Two triangles: (v0,v1,v2) + (v0,v2,v3). (v3=v1+v2-v0 sheared the rects into parallelograms.)
+                float x3 = x[0] + x[2] - x[1], y3 = y[0] + y[2] - y[1];
+                auto cx = [](float v){ return v / 640.0f - 1.0f; };
+                auto cy = [](float v){ return v / 360.0f - 1.0f; };
+                const float tri[12] = { cx(x[0]),cy(y[0]), cx(x[1]),cy(y[1]), cx(x[2]),cy(y[2]),
+                                        cx(x[0]),cy(y[0]), cx(x[2]),cy(y[2]), cx(x3),  cy(y3)   };
+                if (tl_esVerts.size() < 60000) tl_esVerts.insert(tl_esVerts.end(), tri, tri + 12);
             }
         }
         // step (a) result-gate: a resolve (EDRAM->texture readback) is a draw with an active copy command —
@@ -2271,6 +2294,7 @@ PPC_FUNC(__imp__VdSwap) {
             uint64_t drBefore = g_drawCount.load();
             int descsFound = 0, segs = 0;
             tl_execsegs = true;   // T2b-step-1: let DRAW_INDX capture each executed draw's live fetch slot-0
+            tl_esVerts.clear();   // T2b-step-2: fresh per-frame geometry accumulator
             for (uint32_t a = base; a + 8 <= wptr; a += 4) {
                 uint32_t d = GLD32(a);
                 if ((d >> 24) != 0x81u) continue;                       // census parse: 0x81LLLLLL descriptor tag
@@ -2283,6 +2307,10 @@ PPC_FUNC(__imp__VdSwap) {
                 segs++;
             }
             tl_execsegs = false;
+            // T2b-step-2: hand this frame's carved content geometry to the render thread (drawn by PresentOnce
+            // under REX_MENUTEST via the menu-quad float2 pipeline). Gated by rex_render::Enabled (REX_RENDER).
+            if (rex_render::Enabled() && !tl_esVerts.empty())
+                rex_render::SubmitMenuGeometry(tl_esVerts.data(), (int)(tl_esVerts.size() / 2));
             uint32_t slot0After = GLD32(0xA2000000u);
             // Read the LIVE fetch slot-0 constant the executed draws actually set (reg file 0x7FC80000+0x4800*4),
             // resolve it (NOT a hardcoded 0xA2000000), and gauge BOTH it and 0xA2000000 for real screen-coord
