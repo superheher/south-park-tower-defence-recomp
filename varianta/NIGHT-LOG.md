@@ -3031,3 +3031,18 @@ points all localized: sub_8211BE68 / sub_82247E70 / sub_822490D0 (done-vs-requeu
 retained: REX_ADVGATE / REX_FORCEBE68 / REX_ITEMSPIN / REX_LOADERLATCH / REX_CPDRAIN / REX_TEXWATCH / REX_TEXBIND.
 Default boot unregressed throughout. ⭐TO RESUME: re-issue /loop (or a focused session) to start the deep
 GPU-create build; entry = model the per-item create-completion sub_822490D0 checks, or build texture-decode first.
+
+**cont.25 — ⚠ RIGOR CORRECTION + texture-decode BLOCKED.** Extended REX_TEXBIND to log the bound textures' full
+fetch constant (dims from d2, format from d1[5:0], type/tiled from d0). MEASURED: the "populated" bound textures
+have **IMPLAUSIBLE fetch constants** — dims like 6277×2033 / 41×6129 / 4093×2166, type bits=1 (not 2 for a 2D
+texture), random d0/d2. ⇒ INFERRED (rigor): either R1's "14/35 populated textures, bind path works" was a
+MEASUREMENT ARTIFACT (noise in the 0x4800 fetch region whose d1 coincidentally masks to a 0x04-0x06 base + the
+block happens to hold data), OR my fetch-constant decode layout is wrong — EITHER WAY I cannot extract a clean
+real texture (valid dims/format) to decode. ⚠ So R1's "bind path works / texture DATA partly exists" claim is in
+DOUBT (only the EDRAM bind 0xB0000000=0x10000000 base was clean). This BLOCKS the texture-decode-first approach
+(no clean texture to decode) and reconfirms the textures genuinely aren't created. ⇒ the foundation must be the
+CREATE (produce real textures), not the decode — and the create is the inlined-D3D/CPU-tile that doesn't run
+(intractable via interception). I've now hit a wall on EVERY foundational sub-piece (completion-proxy, loop-cap,
+force-skip-render, texture-decode) — the deep build genuinely needs a sustained from-scratch GPU-subsystem
+implementation, not incremental probing. The breakthrough (force-skip advances the title's LOADING; sub_8211BE68
+is the gate) stands. New: REX_TEXBIND logs full fetch constant. Default boot unregressed. Commits NOT pushed.

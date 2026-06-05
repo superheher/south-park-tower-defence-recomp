@@ -1348,8 +1348,14 @@ inline void WriteGpuReg(uint32_t index, uint32_t value) {
                 // R1 decisive: is the BOUND texture populated? sample 64 dwords for non-zero/varied content.
                 uint32_t ga = 0xA0000000u | b, nz = 0, vr = 0, prev = 0;
                 for (int i = 0; i < 64; i++) { uint32_t w = GLD32(ga + i*4); if (w) nz++; if (i && w != prev) vr++; prev = w; }
-                fprintf(stderr, "[texbind] %s slot %u d1=0x%08X -> texBase=0x%08X (%s) DATA nz=%u/64 varied=%u/63 first=%08X %08X\n",
-                        tl_execsegs ? "SEG " : "RING", (index - 0x4800u) / 6u, value, ga, edram ? "EDRAM-RT" : "texture", nz, vr, GLD32(ga), GLD32(ga+4));
+                // Texture-decode prep: the Xenos 2D texture fetch constant — d0 holds type(1:0)+endian+tiled(bit?),
+                // d1 holds base[31:12]+data_format(5:0), d2 holds (width-1)[12:0]+(height-1)[25:13]. Capture the
+                // FULL constant for POPULATED textures so I can decode them (format+dims+tiled → untile → RGBA).
+                uint32_t d0 = GLD32(0x7FC80000u + (index-1u)*4u), d2 = GLD32(0x7FC80000u + (index+1u)*4u);
+                uint32_t fmt = value & 0x3Fu, w_ = (d2 & 0x1FFFu)+1u, h_ = ((d2>>13)&0x1FFFu)+1u, tiled = (d0>>2)&1u;
+                fprintf(stderr, "[texbind] %s slot %u d1=0x%08X -> texBase=0x%08X (%s) %ux%u fmt=0x%X tiled=%u d0=%08X d2=%08X | DATA nz=%u/64 varied=%u/63 first=%08X %08X\n",
+                        tl_execsegs ? "SEG " : "RING", (index - 0x4800u) / 6u, value, ga, edram ? "EDRAM-RT" : "texture",
+                        w_, h_, fmt, tiled, d0, d2, nz, vr, GLD32(ga), GLD32(ga+4));
             }
         }
     }
