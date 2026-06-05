@@ -1409,6 +1409,22 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
             { static std::atomic<uint32_t> primSeen{0}; uint32_t bit = 1u << (prim & 31);
               if (!(primSeen.load() & bit)) { primSeen.fetch_or(bit);
                   fprintf(stderr, "[esprim] NEW prim=%u numI=%u fetchType=%u\n", prim, numInd, GLD32(0x7FC80000u+0x4800u*4u)&3); } }
+            // T2b-step-6 (REX_UITX): the prim-13 text / prim-5 sprite UI draws read LOCAL-space verts from slot-1
+            // (0xA01FE0FC, the memcpy-filled buffer, x~16..74) — the VS's slot-0 binding was lost in the stubbed
+            // resource-create. To place them on screen they need the per-draw transform held in the ALU consts
+            // (reg 0x4000). One-shot dump the const block + the actual slot-1 verts for the first text draw to
+            // recover the local->clip matrix (the one missing piece for screen-correct UI).
+            if (prim == 13) { static std::atomic<bool> ad{false}; bool e=false;
+              if (ad.compare_exchange_strong(e,true)) {
+                fprintf(stderr, "[esalu] prim-13 text draw numI=%u — ALU consts c0..c19 (reg 0x4000):\n", numInd);
+                for (int c=0;c<20;c++){ float f[4]; for(int j=0;j<4;j++){ uint32_t u=GLD32(0x7FC80000u+(0x4000u+c*4+j)*4u); memcpy(&f[j],&u,4);}
+                  fprintf(stderr, "  c%-2d = %11.4f %11.4f %11.4f %11.4f\n", c, f[0],f[1],f[2],f[3]); }
+                uint32_t vb = 0xA01FE0FCu;   // slot-1 text VB the [esdraw] scan found (stride-16: pos.xy + uv.xy)
+                fprintf(stderr, "  slot-1 text verts @0x%X (first 6, stride-16):\n", vb);
+                for (int i=0;i<6;i++){ float p[4]; for(int j=0;j<4;j++){uint32_t u=GLD32(vb+i*16+j*4); memcpy(&p[j],&u,4);}
+                  fprintf(stderr, "    v%d pos=(%9.2f,%9.2f) uv=(%.3f,%.3f)\n", i, p[0],p[1],p[2],p[3]); }
+              }
+            }
             // T2b-step-2: carve THIS draw's geometry into clip-space triangles for the render bridge.
             // Content draws = prim 8 (kRectangleList) numI 3, fetch type-3 kVertex, float2 (stride 2dw) screen
             // coords. kRectangleList: v0,v1,v2 given + v3 = v1+v2-v0 (the parallelogram's 4th corner) → 2 tris.
@@ -1740,6 +1756,16 @@ PPC_FUNC(sub_8242BF10)
         uint32_t d = ctx.r3.u32, s = ctx.r4.u32, sz = ctx.r5.u32;
         if (d >= 0xA01F0000u && d < 0xA0300000u && sz >= 16 && sz < 0x20000 && (sz % 8) == 0) {
             uint32_t nv = sz / 8;
+            if (nv > 100) { static std::atomic<bool> td{false}; bool e=false;   // one-shot: dump a TEXT fill's verts
+              if (td.compare_exchange_strong(e,true)) { fprintf(stderr,"[text] nv=%u DEST=0x%X src=0x%X first 32 verts:\n ", nv, d, s);
+                for(int i=0;i<32;i++){ float x,y; uint32_t a=GLD32(s+i*8),b=GLD32(s+i*8+4); memcpy(&x,&a,4);memcpy(&y,&b,4); fprintf(stderr,"(%.1f,%.1f) ",x,y); }
+                fprintf(stderr,"\n");
+                // Is the per-draw transform LIVE in the register file at memcpy (fill) time? If c0/c4 hold a real
+                // World+Proj here, I can render text correctly RIGHT HERE (local verts + live transform, no
+                // exec-time correlation). If identity/stale, the transform is only set later (in the segment).
+                fprintf(stderr,"[text-xform@fill] reg0x4000 c0..c5:\n");
+                for(int c=0;c<6;c++){ float f[4]; for(int j=0;j<4;j++){uint32_t w=GLD32(0x7FC80000u+(0x4000u+c*4+j)*4u); memcpy(&f[j],&w,4);}
+                  fprintf(stderr,"  c%d = %11.4f %11.4f %11.4f %11.4f\n", c, f[0],f[1],f[2],f[3]); } } }
             float vx0,vy0,vx1; uint32_t u; u=GLD32(s);memcpy(&vx0,&u,4); u=GLD32(s+4);memcpy(&vy0,&u,4); u=GLD32(s+8);memcpy(&vx1,&u,4);
             bool frameStart = (vx0==0.f && vy0==0.f && nv>=4 && vx1>1700.f && vx1<1800.f);   // the full-screen quad
             auto cx=[](float v){return v/884.0f-1.0f;}; auto cy=[](float v){return v/521.5f-1.0f;};
@@ -1766,6 +1792,12 @@ PPC_FUNC(sub_8242BF10)
                 }
                 if (!g_vbVerts.empty()) rex_render::SubmitMenuGeometry(g_vbVerts.data(), (int)(g_vbVerts.size()/2));
             }
+            // TEXT fills are stride-16 (pos.xy + uv.xy) glyph quads in LOCAL text-box space (x~16..74, y~0..38,
+            // marching right). They CANNOT be placed at memcpy time: cont.23 measured reg0x4000 = all zeros here
+            // (the per-draw World+screen-ortho transform is set later, when the segment executes — by which time
+            // this VB is recycled to zeros). Rendering them needs the transform, which only coexists with the
+            // verts if the stubbed vertex-stream binding is restored (the deep build). Left as the [text] dump
+            // (measurement only); no submit — a local-space quad render lands off-screen in the top-left corner.
         }
     }
     __imp__sub_8242BF10(ctx, base);
