@@ -2939,3 +2939,21 @@ byte → state machine advances PREMATURELY → INDIRECT-NULL crash at sub_8215D
 65). NEXT (R2 cont.): gdb single-step sub_8211B740 from 0x8211B804 to find the exact divert, OR prod-oracle
 compare (why prod reaches sub_8210AF90 — a return value / global state that differs). cont.21 "A↔B" root; the
 proper fix makes the title advance naturally. New gated diag `REX_ADVGATE` ([advgate]). Commits pending (NOT pushed).
+
+**cont.25 /loop R2 cont. — the advance gate UNIFIES with the loader/GPU-create wall.** Drilled the divert in
+sub_8211B740 (REX_ADVGATE, hooks logging ENTER/RET of each middle call, filtered to the sub_8211B740 call-site):
+the linear chain sub_82131758→sub_8213E7E8→sub_82132918→sub_8212BE48→sub_8211BD60(0x8211B888) all ENTER+RET
+cleanly, then **sub_8211BE68 (0x8211B894) ENTERs but NEVER RETURNs** (4/4 runs, 38s). ⇒ the dispatch at
+0x8211B91C (→ sub_8210AF90, the transitions-enable byte 0x828E82A6 setter) is never reached → the title never
+advances. **WHY sub_8211BE68 blocks:** the 18s all-thread bt shows its thread is deep in the LOADER —
+`sub_82250420[tid10]→sub_8211B740→sub_8211BE68→sub_822487C8→sub_82448158→sub_8244FE80→sub_8242BF10(memcpy)`.
+sub_8211BE68 (91-line fn: an indirect call, then if(r11!=0) calls sub_8224F890/sub_82250110/sub_82110728/
+sub_822501C8) drives a resource load via sub_822487C8 that DOESN'T COMPLETE. Deterministic: across 4 runs
+sub_8210AF90_RAN=0, dispatch_REACHED=0, sub_8211BE68_RET=0 (the earlier "returned by 28s" was a buggy awk
+filter, not a real return). ⇒ **UNIFIES the wall**: advance-gate (no transitions) ← sub_8211BE68's load blocks ←
+loader doesn't complete ← GPU resource-create (textures) incomplete = the cont.21 A↔B root, now reached from the
+advance-gate angle. The title can't enable screen transitions until sub_8211BE68's load finishes, which needs the
+loader to complete, which needs the GPU resource created. NEXT (R2 cont.): trace what sub_8211BE68→sub_822487C8
+is loading + what its completion waits on (the specific resource + its GPU-create / fence dependency) — the same
+loader/GPU-create wall, now with a concrete entry point (sub_8211BE68/sub_822487C8). New hooks under REX_ADVGATE.
+Default boot unaffected. Commits pending (NOT pushed).

@@ -2319,6 +2319,43 @@ PPC_FUNC(sub_82167248)
     if (g_fair) { kernel::UnlockGuestExecution(); kernel::LockGuestExecution(); }   // per-frame cooperative yield
     __imp__sub_82167248(ctx, base);
 }
+// REX_ADVGATE (cont.25 R2 cont.): pin the exact divert in sub_8211B740 that skips the sub_8210AF90 dispatch
+// (0x8211B91C). Its loc_8211B81C→dispatch path is a LINEAR run of these direct calls; log ENTER+RET for each
+// (filtered to the sub_8211B740 call-site return-lr) — the LAST one that ENTERs but never RETs is the divert
+// (a non-returning call / longjmp-SEH unwind to the tail 0x8211BE60). Gated, default-off.
+namespace { std::atomic<int> g_advN{0};
+inline void AdvLog(uint32_t lr, uint32_t site, const char* nm, const char* ph) {
+    static const bool on = getenv("REX_ADVGATE") != nullptr;
+    if (on && lr == site && g_advN.fetch_add(1) < 60)
+        fprintf(stderr, "[adv] %-12s @0x%08X %s\n", nm, site, ph);
+} }
+#define ADV_HOOK(FN, SITE) extern "C" PPC_FUNC(__imp__##FN); PPC_FUNC(FN) { \
+    uint32_t _lr = ctx.lr; AdvLog(_lr, SITE, #FN, "ENTER"); __imp__##FN(ctx, base); AdvLog(_lr, SITE, #FN, "RET"); }
+ADV_HOOK(sub_82131758, 0x8211B830u)   // 1st middle call (loc_8211B81C)
+ADV_HOOK(sub_8213E7E8, 0x8211B84Cu)
+ADV_HOOK(sub_82132918, 0x8211B854u)
+ADV_HOOK(sub_8212BE48, 0x8211B87Cu)
+ADV_HOOK(sub_82110BE8, 0x8211B8D8u)
+ADV_HOOK(sub_82267630, 0x8211B904u)   // last call before the 0x8211B91C dispatch — prime divert suspect
+#undef ADV_HOOK
+// sub_8211BD60 is called TWICE (0x8211B888 right after sub_8212BE48, and 0x8211B8C8) — the prime divert suspect
+// (execution reached sub_8212BE48 RET then stopped). Hook both sites.
+extern "C" PPC_FUNC(__imp__sub_8211BD60);
+PPC_FUNC(sub_8211BD60) {
+    uint32_t lr = ctx.lr; bool m = (lr == 0x8211B888u || lr == 0x8211B8C8u);
+    if (m) AdvLog(lr, lr, "sub_8211BD60", "ENTER");
+    __imp__sub_8211BD60(ctx, base);
+    if (m) AdvLog(lr, lr, "sub_8211BD60", "RET");
+}
+// The 4 calls between sub_8211BD60 #1 (0x8211B888, RET) and #2 (0x8211B8C8, NOT reached) — the divert is here.
+// All operate on the global *(0x828F2D34). The one that ENTERs but never RETs (longjmps to the tail) is it.
+#define ADV_HOOK(FN, SITE) extern "C" PPC_FUNC(__imp__##FN); PPC_FUNC(FN) { \
+    uint32_t _lr = ctx.lr; AdvLog(_lr, SITE, #FN, "ENTER"); __imp__##FN(ctx, base); AdvLog(_lr, SITE, #FN, "RET"); }
+ADV_HOOK(sub_8211BE68, 0x8211B894u)
+ADV_HOOK(sub_8211D160, 0x8211B8A4u)
+ADV_HOOK(sub_8211DB78, 0x8211B8B0u)
+ADV_HOOK(sub_8211DD18, 0x8211B8BCu)
+#undef ADV_HOOK
 // Diag (gated): confirm the title's own completion poster fires after a forced EOS (sub_82425BF8 EOF branch).
 extern "C" PPC_FUNC(__imp__sub_8222A9F8);
 PPC_FUNC(sub_8222A9F8)
