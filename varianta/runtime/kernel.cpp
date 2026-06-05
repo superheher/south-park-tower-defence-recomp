@@ -1334,11 +1334,28 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                         case 4: regBase=0x2000; break; default: regBase=0xFFFFFFFF; }  // (+0x2000)
         if (regBase != 0xFFFFFFFF)
             for (uint32_t i = 1; i < count; i++) WriteGpuReg(regBase + index + (i-1), GLD32(addr + i*4));
+        // DEEP-BUILD trace (cont.23→24): does the segment EVER set the slot-0 vertex fetch constant (reg 0x4800,
+        // index 0) to a REAL VB base? If [esset] shows index 0 written to 0x02xxxxxx (the stub pool) or never
+        // written, the binding is missing/stubbed at the PM4 level (the resource-create never ran). If it's set to
+        // a 0xA0xxxxxx data base, the binding exists and the bug is downstream (recycle/timing).
+        if (tl_execsegs && type == 1) {
+            static std::atomic<int> setn{0}; int k = setn.fetch_add(1);
+            if (k < 40) fprintf(stderr, "[esset] FETCH write: index=%u count=%u d0=0x%08X d1=0x%08X (slot=%u)\n",
+                                index, count, count>1?GLD32(addr+4):0, count>2?GLD32(addr+8):0, index/2);
+        }
         break;
       }
       case PM4_SET_CONSTANT2: {                 // like SET_CONSTANT but 16-bit index, writes regs directly
         uint32_t index = GLD32(addr) & 0xFFFF;
         for (uint32_t i = 1; i < count; i++) WriteGpuReg(index + (i-1), GLD32(addr + i*4));
+        // DEEP-BUILD trace: reg 0x4800 (slot-0 fetch) demonstrably changes between UI draws, but no type-1
+        // SET_CONSTANT writes it — so SET_CONSTANT2 (or another path) does. Log writes landing in the 0x4800..
+        // 0x48FF fetch window to find who binds the (texture) constants — the same channel that SHOULD bind verts.
+        if (tl_execsegs && index >= 0x4800 && index < 0x4900) {
+            static std::atomic<int> s2n{0}; int k = s2n.fetch_add(1);
+            if (k < 40) fprintf(stderr, "[esset2] SET_CONSTANT2 reg=0x%X count=%u d0=0x%08X d1=0x%08X\n",
+                                index, count, count>1?GLD32(addr+4):0, count>2?GLD32(addr+8):0);
+        }
         break;
       }
       case PM4_DRAW_INDX: case PM4_DRAW_INDX_2: {
