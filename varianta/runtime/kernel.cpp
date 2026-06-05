@@ -2407,9 +2407,110 @@ PPC_FUNC(sub_82249338) {
     }
     __imp__sub_82249338(ctx, base);
     if (on) { static std::atomic<int> n{0}; int k = n.fetch_add(1);
-        if (k < 60) fprintf(stderr, "[itemspin] #%d state(r5)=%u item(r3)=0x%08X r4=0x%08X -> ret=0x%08X\n",
-                            k, r5, r3, r4, ctx.r3.u32); }
+        // VT1 PROBE (cont.26): the spin loop sub_82247E70 (lr=0x82247EFC) calls each item's vtable[1]
+        // (*(*(item)+4)); that method returns a state code (r5 here = the PREVIOUS item's code). Observed
+        // codes are only {0=advance/keep, 3=re-sift/re-queue}, NEVER 2 (=decrement count=remove/DONE). So
+        // an item leaves the queue only when vtable[1] returns 2. To read that gate, log each spin-loop
+        // returned item's vtable[1] guest target + its state field *(item+4). Windows: first 80 + a deep
+        // steady-state slice (to catch the stuck item once the early burst settles).
+        bool spin = (static_cast<uint32_t>(ctx.lr) == 0x82247EFCu);
+        bool win  = (k < 80) || (k >= 300000 && k < 300120);
+        if (win) {
+            uint32_t reti = ctx.r3.u32;
+            if (reti) {
+                uint32_t vtbl = PPC_LOAD_U32(reti + 0);
+                uint32_t vt1  = vtbl ? PPC_LOAD_U32(vtbl + 4) : 0;
+                uint32_t s4   = PPC_LOAD_U32(reti + 4);
+                fprintf(stderr, "[itemspin] #%d %s r5=%u r4=0x%08X ret=0x%08X vtbl=0x%08X vt1=0x%08X *+4=%u\n",
+                        k, spin ? "SPIN" : "    ", r5, r4, reti, vtbl, vt1, s4);
+            } else {
+                fprintf(stderr, "[itemspin] #%d %s r5=%u r4=0x%08X ret=0 (loop-exit signal)\n",
+                        k, spin ? "SPIN" : "    ", r5, r4);
+            }
+        }
+    }
 }
+// REX_LOOPTRACE (cont.26): directly test whether the advance-gate spin loop sub_82247E70 RETURNS or hangs
+// in this exact config. Log ENTER (seq#, args, lr) + RET. An ENTER with no matching RET (run times out) is
+// the confirmed hang; every ENTER paired with a RET means the loop drains and is NOT the wall. Gated/off.
+extern "C" PPC_FUNC(__imp__sub_82247E70);
+PPC_FUNC(sub_82247E70) {
+    static const bool on = getenv("REX_LOOPTRACE") != nullptr;
+    if (!on) { __imp__sub_82247E70(ctx, base); return; }
+    static std::atomic<int> seq{0}; int s = seq.fetch_add(1);
+    uint32_t lr = ctx.lr, a3 = ctx.r3.u32, a4 = ctx.r4.u32;
+    if (s < 50) fprintf(stderr, "[looptrace] #%d ENTER lr=0x%08X r3=0x%08X r4=0x%08X\n", s, lr, a3, a4);
+    __imp__sub_82247E70(ctx, base);
+    if (s < 50) fprintf(stderr, "[looptrace] #%d RET (loop drained)\n", s);
+}
+// REX_BE68INNER (cont.26): sub_8211BE68 (from sub_8211B740) ENTERs but never RETs, yet its inner heap-walk
+// sub_82247E70 always returns. Localize WHICH of sub_8211BE68's calls actually hangs by wrapping each with
+// ENTER/RET + caller lr + r3. The one that shows ENTER without a matching RET is the true wall. Gated/off.
+// Filter to sub_8211BE68's OWN call-sites so we see only its inner calls (the stuck invocation), not the
+// hundreds of unrelated callers. The one with ENTER and no matching RET is the wall. If NONE fire for the
+// final (stuck) invocation, the hang is the indirect vtable poll at 0x8211BE98 (before these named calls).
+#define BE68_INNER_HOOK(FN, SITE) \
+  extern "C" PPC_FUNC(__imp__##FN); \
+  PPC_FUNC(FN) { static const bool on = getenv("REX_BE68INNER") != nullptr; \
+    bool m = on && (static_cast<uint32_t>(ctx.lr) == SITE##u); \
+    if (!m) { __imp__##FN(ctx, base); return; } \
+    static std::atomic<int> k{0}; int n = k.fetch_add(1); uint32_t a3 = ctx.r3.u32, a4 = ctx.r4.u32; \
+    fprintf(stderr, "[be68in] %-14s #%d ENTER @0x%X r3=0x%08X r4=0x%08X\n", #FN, n, SITE, a3, a4); \
+    __imp__##FN(ctx, base); \
+    fprintf(stderr, "[be68in] %-14s #%d RET\n", #FN, n); }
+BE68_INNER_HOOK(sub_8224F890, 0x8211BEB0)   // 1st named call in sub_8211BE68
+BE68_INNER_HOOK(sub_82250110, 0x8211BEC4)
+BE68_INNER_HOOK(sub_82110728, 0x8211BECC)
+BE68_INNER_HOOK(sub_822501C8, 0x8211BED4)   // last named call
+#undef BE68_INNER_HOOK
+// REX_728INNER (cont.26): sub_82110728 is the real hang (ENTER, never RET). It's a counted loop
+//   r28 = sub_8224FDB0(obj); while(r28) { r28--; sub_82110B18; if(==0){sub_821B1310; sub_8212E830;} sub_82250090 }
+// Either r28 is a runaway count (log it once) or one inner work call hangs (ENTER without a matching RET).
+extern "C" PPC_FUNC(__imp__sub_8224FDB0);
+PPC_FUNC(sub_8224FDB0) {
+    static const bool on = getenv("REX_728INNER") != nullptr;
+    static const bool cap = getenv("REX_728CAP") != nullptr;   // surgical advance test (cont.26)
+    bool m = on && (static_cast<uint32_t>(ctx.lr) == 0x8211073Cu);   // the count-establishing call
+    uint32_t obj = ctx.r3.u32;
+    __imp__sub_8224FDB0(ctx, base);
+    // REX_728CAP: sub_82110728 deserializes a loop-count from a null-source stream and gets 0x60606060
+    // filler -> ~1.6B-iter runaway = the real advance-gate hang. Surgically clamp the absurd count to 0 so
+    // the loop runs 0 times and sub_82110728 RETURNS (vs the blunt REX_FORCEBE68 skip of all of sub_8211BE68).
+    // Test whether the title then advances CLEANLY past the gate. Only the count call (lr=0x8211073C).
+    if (cap && static_cast<uint32_t>(ctx.lr) == 0x8211073Cu && ctx.r3.u32 > 0x10000u) {
+        static std::atomic<int> c{0}; if (c.fetch_add(1) < 8)
+            fprintf(stderr, "[728cap] clamping runaway count 0x%X -> 0 (stream=0x%08X)\n", ctx.r3.u32, obj);
+        ctx.r3.u64 = 0;
+    }
+    if (m) { static std::atomic<int> k{0}; if (k.fetch_add(1) < 4) {
+        uint32_t cnt = ctx.r3.u32;
+        fprintf(stderr, "[728in] sub_8224FDB0 stream=0x%08X loop-count=0x%X\n", obj, cnt);
+        // Dump the stream object + chase any guest pointers one level to find the 0x60 source buffer.
+        for (int i = 0; i < 10; i++) {
+            uint32_t w = PPC_LOAD_U32(obj + i*4);
+            fprintf(stderr, "   stream[+%02X]=0x%08X", i*4, w);
+            if (w >= 0x82000000u && w < 0xA0000000u) {   // looks like a guest data/heap pointer — peek
+                fprintf(stderr, "  -> [%08X %08X %08X %08X]",
+                        PPC_LOAD_U32(w), PPC_LOAD_U32(w+4), PPC_LOAD_U32(w+8), PPC_LOAD_U32(w+12));
+            }
+            fprintf(stderr, "\n");
+        }
+    } }
+}
+#define IH728(FN, SITE) \
+  extern "C" PPC_FUNC(__imp__##FN); \
+  PPC_FUNC(FN) { static const bool on = getenv("REX_728INNER") != nullptr; \
+    bool m = on && (static_cast<uint32_t>(ctx.lr) == SITE##u); \
+    if (!m) { __imp__##FN(ctx, base); return; } \
+    static std::atomic<int> k{0}; int n = k.fetch_add(1); uint32_t a3 = ctx.r3.u32, a4 = ctx.r4.u32; \
+    if (n < 8) fprintf(stderr, "[728in] %-14s #%d ENTER r3=0x%08X r4=0x%08X\n", #FN, n, a3, a4); \
+    __imp__##FN(ctx, base); \
+    if (n < 8) fprintf(stderr, "[728in] %-14s #%d RET\n", #FN, n); }
+IH728(sub_82110B18, 0x8211077C)
+IH728(sub_821B1310, 0x821107B0)
+IH728(sub_8212E830, 0x821107D8)
+IH728(sub_82250090, 0x821107F0)
+#undef IH728
 // Diag (gated): confirm the title's own completion poster fires after a forced EOS (sub_82425BF8 EOF branch).
 extern "C" PPC_FUNC(__imp__sub_8222A9F8);
 PPC_FUNC(sub_8222A9F8)

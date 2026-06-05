@@ -3046,3 +3046,59 @@ CREATE (produce real textures), not the decode — and the create is the inlined
 force-skip-render, texture-decode) — the deep build genuinely needs a sustained from-scratch GPU-subsystem
 implementation, not incremental probing. The breakthrough (force-skip advances the title's LOADING; sub_8211BE68
 is the gate) stands. New: REX_TEXBIND logs full fetch constant. Default boot unregressed. Commits NOT pushed.
+
+## cont.26 (2026-06-05, /loop "работай дальше автономно") — ⭐ CORRECTS cont.25: the spin loop sub_82247E70 does NOT hang; the real advance-gate wall is a RUNAWAY null-source deserialize in sub_82110728
+
+Fresh /loop, autonomous. Executed the cont.25-recommended de-risk (decode the advance-gate loop's done-vs-requeue
+gate) via static decode + 4 new gated diags. **Default boot UNREGRESSED — verified:** exit124, 110,815 progress
+lines, only the 2 pre-existing baseline INDIRECT-NULL, 0 leakage of the new tags. Diags: REX_LOOPTRACE,
+REX_BE68INNER, REX_728INNER, REX_728CAP (all getenv-gated, default-off). Commits cont.26 (NOT pushed). Run-base
+`REX_NOTOKEN=1 REX_CSLEAK=1 REX_CPCOMPLETE=1 REX_MOVIE_EOF=30`.
+
+**Static decode (sub_82247E70 / sub_822490D0 / sub_82249338).** sub_82247E70 walks a global heap (0x828F9A78)
+via sub_822490D0 (get-first) + sub_82249338 (per-item heap op; switch on r5 = the PREVIOUS item's vtable[1]
+return). Decoded sub_82249338's switch: **r5=2 decrements the heap count = removes/COMPLETES an item**; r5=0 =
+advance cursor (keep); r5=3 = re-sift (re-queue). The done-vs-requeue decision is the per-item vtable[1] return.
+
+**REX_ITEMSPIN (enriched with vtable[1] target + item state +4).** Item codes are only {0,3}, NEVER 2 — so at
+first this matched cont.25's "re-queued, never complete". BUT at steady state the items' +4 state PROGRESSES
+0→1→2 and the heaps DRAIN (ret=0); the spin-loop heap 0x828F9A78 is mostly EMPTY (ret=0). The one item stuck at
+state 0 (0x828E8430) has vtable[1]=sub_821B4F88 = trivial `return 0` (a sentinel, not the gate).
+
+**⭐ REX_LOOPTRACE — the decisive correction.** Wrapped sub_82247E70 ENTER/RET: ALL 50 calls RETURN (loop drains
+every time, lr=0x8224F93C from sub_8224F918). **sub_82247E70 is NOT the infinite loop.** Yet AdvLog shows
+sub_8211BE68 ENTERs and NEVER RETs. ⇒ cont.25's "sub_8211BE68 never returns BECAUSE sub_82247E70 spins forever"
+is MEASURABLY WRONG. The bt cont.25 cited (sub_8211BE68→sub_8224F890→…→sub_82247E70) was a TRANSIENT snapshot.
+
+**⭐ REX_BE68INNER — localized the real hang.** sub_8211BE68 is LINEAR (no loop): indirect poll → sub_8224F890 →
+sub_82250110 → sub_82110728 → sub_822501C8 → final vtable. Filtered ENTER/RET on its own call-sites:
+sub_8224F890@0x8211BEB0 RET, sub_82250110@0x8211BEC4 RET, **sub_82110728@0x8211BECC ENTER, NO RET = THE WALL.**
+
+**⭐⭐ REX_728INNER — root cause.** sub_82110728 is a counted loop `r28 = sub_8224FDB0(stream); while(r28){ …
+sub_82110B18; if(0){sub_821B1310; sub_8212E830;} sub_82250090 }`. sub_8224FDB0 deserializes a 4-byte count from
+a stream (4× vtable[0] byte-reads). Measured count = **0x60606060** (filler) → ~1.6 BILLION iters = the "hang"
+(reproducible 3/3 runs that reach it; inner calls get garbage args 0xFFFFFFFF/0x60606060). Stream-object dump
+(0x9825F860): vtable=0x820E42D4 ✓, **+20 (source) = 0x00000000 = NULL**, +1C = the job 0x9825F640 (holds
+0x10010001 = SQ_PROGRAM_CNTL ⇒ a SHADER/render resource). sub_82250110 builds the stream with source = r4 =
+*(stack+96) = NULL and a fresh uninit 10240-byte (0x2800) read buffer at +88. Null source ⇒ deserialize reads
+filler ⇒ runaway. (Race: the same path sometimes hits INDIRECT-NULL vtable→0xC0006000 instead of hanging.)
+
+**WHY the source is null (traced).** sub_8224F890→sub_8224F918 sets the output buffer (*(output+16)) ONLY if
+sub_82247E70 returns non-null; it returns 0 (the resource is not in the global heap 0x828F9A78 in a ready state)
+⇒ the buffer stays null ⇒ null-source stream ⇒ runaway. So the shader resource 0x9825F640 genuinely isn't loaded.
+
+**⭐ REX_728CAP — the tractability test (surgical, vs the blunt FORCEBE68 skip-all).** Clamp the absurd count
+(>0x10000)→0 so sub_82110728 runs 0 iters and RETURNS. RESULT: **sub_8211BE68 now RETURNS** (ENTER+RET — the gate
+passes!) — but the title does NOT advance: only 65 assets (vs FORCEBE68's 72; NO Levels/Campaigns/Challenges.xmc),
+transition byte 0x828E82A6 NOT set, +10 downstream INDIRECT-NULL. ⇒ unblocking the gate is NOT enough — the null
+bypass leaves the title resource-less; it needs the REAL resource.
+
+**⇒ DE-RISK VERDICT (corrects + sharpens cont.25).** The advance gate is NOT a GPU-fence wait — it's a runaway
+null-source deserialize (sub_82110728) of an UNLOADED shader/render resource (0x9825F640). The gate CAN be
+surgically passed (clamp) but that does NOT advance the title (resource still missing). Root = sub_8224F890 →
+sub_82247E70 returns null because resource 0x9825F640 isn't ready in the loader heap. **⭐ NEXT (next /loop):** is
+0x9825F640's shader data — the ~19 .xbv shader files ARE read from disk early per the asset map — supposed to be
+wired into this resource's stream source (a **TRACTABLE loader-plumbing bug**), or produced by a GPU op (deep
+build)? This is the FIRST evidence the gate might be tractable. Entry points: sub_8224F890 (resource fetch),
+sub_82247E70 (returns null), the global heap 0x828F9A78, and whatever should populate *(output+16) for shaders.
+Default boot unregressed throughout.
