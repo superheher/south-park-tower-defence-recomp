@@ -1453,6 +1453,23 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
             { static std::atomic<uint32_t> primSeen{0}; uint32_t bit = 1u << (prim & 31);
               if (!(primSeen.load() & bit)) { primSeen.fetch_or(bit);
                   fprintf(stderr, "[esprim] NEW prim=%u numI=%u fetchType=%u\n", prim, numInd, GLD32(0x7FC80000u+0x4800u*4u)&3); } }
+            // REX_SCENE (survey): per draw, the live reg-0x4000 transform (World-translate Tx/Ty + Proj scale
+            // Px/Py) + a bound texture, and whether the element lands ON-SCREEN. Maps the whole executed scene —
+            // which draws are visible, which off-screen, what textures — to decide what's worth rendering.
+            if (getenv("REX_SCENE")) { static std::atomic<int> sc{0}; int sk=sc.fetch_add(1);
+                if (sk < 40) {
+                    auto rg=[&](uint32_t c,int cc){ float f; uint32_t w=GLD32(0x7FC80000u+(0x4000u+c*4+cc)*4u); memcpy(&f,&w,4); return f; };
+                    float Tx=rg(0,3),Ty=rg(1,3),Px=rg(4,0),Pxw=rg(4,3),Py=rg(5,1),Pyw=rg(5,3);
+                    // transform a representative point: the World origin (0,0) → clip, to see where the element sits
+                    float ox=(0+Tx)*Px+Pxw, oy=(0+Ty)*Py+Pyw;
+                    // find a bound texture (physical-window base): scan 32 fetch slots (6dw) for a 0x05xxxxxx base
+                    uint32_t texBase=0; for(uint32_t s=0;s<32;s++){ uint32_t d1=GLD32(0x7FC80000u+(0x4800u+s*6u+1u)*4u);
+                        uint32_t b=d1&0xFFFFF000u; if(b>=0x04000000u && b<0x20000000u){ texBase=0xA0000000u|b; break; } }
+                    bool onScreen = ox>-1.2f && ox<1.2f && oy>-1.2f && oy<1.2f;
+                    fprintf(stderr, "[scene] #%d prim=%u numI=%u World=(%.0f,%.0f) origin→clip=(%.2f,%.2f) %s tex=0x%X\n",
+                            sk, prim, numInd, Tx, Ty, ox, oy, onScreen?"ON":"off", texBase);
+                }
+            }
             // T2b-step-6 (REX_UITX): the prim-13 text / prim-5 sprite UI draws read LOCAL-space verts from slot-1
             // (0xA01FE0FC, the memcpy-filled buffer, x~16..74) — the VS's slot-0 binding was lost in the stubbed
             // resource-create. To place them on screen they need the per-draw transform held in the ALU consts
