@@ -2440,11 +2440,46 @@ PPC_FUNC(__imp__VdSwap) {
                 segs++;
             }
             tl_execsegs = false;
+            // EXPERIMENT (REX_S1RENDER): render slot-1's LARGEST dense vert region as a quad-list — cont.22 found
+            // it holds clean UI quads. Ignores the (missing) per-draw mapping; draws every quad in the main UI
+            // vert buffer. authoring(~1768x1043)→clip (x/884-1, y/521.5-1). A shot at visible UI without the
+            // resource-create build. Likely imperfect (the buffer may mix prims/strides) but decisive.
+            if (getenv("REX_S1RENDER") && descsFound >= 10) {
+                uint32_t s1=0xA01FE0FCu, bStart=0, bLen=0, rStart=0, rLen=0;
+                for (uint32_t o=0;o<0x200000;o+=8){ uint32_t ux=GLD32(s1+o),uy=GLD32(s1+o+4); float fx,fy; memcpy(&fx,&ux,4);memcpy(&fy,&uy,4);
+                    bool v=fx>-16.f&&fx<8192.f&&fy>-16.f&&fy<8192.f&&(ux||uy);
+                    if(v){if(!rLen)rStart=o;rLen++;} else {if(rLen>bLen){bLen=rLen;bStart=rStart;}rLen=0;} }
+                auto cx=[](float v){return v/884.0f-1.0f;}; auto cy=[](float v){return v/521.5f-1.0f;};
+                for(uint32_t i=0;i+4<=bLen;i+=4){ float vv[8]; for(int j=0;j<8;j++){uint32_t u=GLD32(s1+bStart+(i*2+j)*4); memcpy(&vv[j],&u,4);}
+                    float q[12]={cx(vv[0]),cy(vv[1]),cx(vv[2]),cy(vv[3]),cx(vv[4]),cy(vv[5]), cx(vv[0]),cy(vv[1]),cx(vv[4]),cy(vv[5]),cx(vv[6]),cy(vv[7])};
+                    if(tl_esVerts.size()<60000) tl_esVerts.insert(tl_esVerts.end(),q,q+12); }
+            }
             // T2b-step-2: hand this frame's carved content geometry to the render thread (drawn by PresentOnce
             // under REX_MENUTEST via the menu-quad float2 pipeline). Gated by rex_render::Enabled (REX_RENDER).
             if (rex_render::Enabled() && !tl_esVerts.empty())
                 rex_render::SubmitMenuGeometry(tl_esVerts.data(), (int)(tl_esVerts.size() / 2));
             uint32_t slot0After = GLD32(0xA2000000u);
+            // BUILD step (REX_S1SCAN, one-shot): map the slot-1 (0xA01FE0FC) vert layout — the title generated the
+            // sprite/text verts here, but the draws read the (empty) slot 0. Find every dense run of plausible
+            // authoring-coord float2 verts (offset, count, first vert). The draw→region mapping can then be done
+            // by vertex COUNT (a prim-13 numI=252 draw <-> a 252-vert region), the data the missing fetch constant
+            // would carry. This is the path to rendering the sprite/text without the full resource-create build.
+            if (getenv("REX_S1SCAN") && descsFound >= 10) { static std::atomic<bool> sd{false}; bool e=false;
+              if (sd.compare_exchange_strong(e,true)) {
+                uint32_t s1 = 0xA01FE0FCu; int nReg=0; uint32_t runStart=0, runLen=0;
+                fprintf(stderr, "[s1scan] (rich frame swap#%u descs=%d) slot-1 dense vert regions (off: count v0):\n", n, descsFound);
+                for (uint32_t o=0; o<0x200000 && nReg<60; o+=8) {
+                    uint32_t ux=GLD32(s1+o), uy=GLD32(s1+o+4); float fx,fy; memcpy(&fx,&ux,4); memcpy(&fy,&uy,4);
+                    bool valid = fx>-16.f && fx<8192.f && fy>-16.f && fy<8192.f && (ux||uy);
+                    if (valid) { if(!runLen) runStart=o; runLen++; }
+                    else { if (runLen>=4) { uint32_t a=GLD32(s1+runStart),b=GLD32(s1+runStart+4); float v0x,v0y;
+                              memcpy(&v0x,&a,4); memcpy(&v0y,&b,4);
+                              fprintf(stderr,"  +0x%05X: %u verts v0=(%.0f,%.0f)\n", runStart, runLen, v0x,v0y); nReg++; }
+                           runLen=0; }
+                }
+                fprintf(stderr, "[s1scan] %d regions\n", nReg);
+              }
+            }
             // Read the LIVE fetch slot-0 constant the executed draws actually set (reg file 0x7FC80000+0x4800*4),
             // resolve it (NOT a hardcoded 0xA2000000), and gauge BOTH it and 0xA2000000 for real screen-coord
             // floats. Guards the "maybe the verts live where the live fetch points, not 0xA2000000" doubt: if the
