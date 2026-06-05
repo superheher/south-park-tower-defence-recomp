@@ -2754,6 +2754,27 @@ Surveyed the executed scene + probed its textures — and re-grounded the whole 
 - **`[scene-tex]`/`[atlas]` (texture probes):** the backdrop's EDRAM texture `0xB0000000` is **ALL ZEROS** (nz=0/256), AND the STATIC font/sprite atlas `0xA5004800` is **ALL ZEROS** too. ⇒ **EVERY UI texture is empty in variant A** — the texture LOADING/upload never completed.
 - **⭐ RE-GROUNDING (honest, measured):** the geometry render path is **PROVEN** (backdrop quads + panels + text glyph-cells render via the debug menu-quad pipeline) — but it has **no textures to draw**, because the resource loader is stuck (the **cont.22** finding, now RECONFIRMED from the rendering side: textures never load). **The render path is NOT the blocker; the loader/GPU-resource-completion is.** variant A's Vulkan is present-only (no real PM4→Vulkan render-target/texture-decode renderer); a textured, recognizable menu is gated on the deep **cont.22 loader build** (resource-creation/GPU-completion), not on more rendering work. ⇒ **the session's rendering exploration has reached its useful conclusion** (geometry path done; the wall is the loader). The remaining cont.22 levers stand: sub_82248010 state-10→done gate, sub_8214FFD0/sub_8224F918 re-request, + the real GPU resource-creation (texture decode/upload, shader compile) that makes the loader's resources non-null. Default boot UNREGRESSED. Gated diags: REX_SCENE + [scene-tex]/[atlas].
 
+### cont.23 /loop — ⭐ NEW TRACTABLE DIRECTION: bypass the stuck loader via DISK resources (commits 7bb214d, 27169ae)
+After exhaustively confirming the loader wall (below), examined the game files (`private/extracted/media/`)
+and found a path AROUND it — the game ships every resource on disk, so the renderer can load them directly
+instead of waiting for the loader:
+- **PS shaders:** `media/shaders/*.updb` (19, all `ps_3_0`) are **XML carrying the ORIGINAL HLSL source**
+  inline. `Simple.psh` = `tex2D(diffuseTexture, In.Tex) * In.Color` (the textured-sprite PS). Names map to
+  materials (SPBackdropTextured/Untextured, SPTextured, SPHud*, SpMovie, Simple). The matching `.xbv`
+  (Simple.xbv = 612 B = child[0]'s blocked resource) is the compiled microcode.
+- **Head start found:** the HLE spike already ported 5 of these to GLSL (`tools/shaderc/ported/{Simple,
+  SPTextured,SPUntextured,SimpleCol,SpMovie}.frag`) + a `shaderc` toolchain (`build.sh`, libshaderc).
+- **Textures:** 659 `.png` under `media/Assets/{Frontend,hud,Global,Fonts,...}` (the runtime `.xmc` are the
+  tiled versions of the same art). Decode `.png`→RGBA→VkImage.
+- **VS:** not in the `.updb` set (all PS) — wrote `menutex.vert` (pos.xy+uv.xy → reg-0x4000 World+Proj mvp →
+  clip+uv+color). Compiled menutex.vert + SPTextured.frag → SPIR-V (`runtime/menutex_shaders.h`).
+- **⇒ this textures the SPARSE content the stuck title builds** (a textured version of the current menu —
+  backdrop + a few sprites + the 1 text label), NOT the rich menu (which still needs the loader to progress
+  the title) — but it's FAR more tractable than the loader build (avoids the inlined-D3D wall), produces a
+  real textured result, and reuses the proven geometry path. NEXT (task #8): CreateTexturedPipeline
+  (descriptor-set sampler + pos+uv input) + `.png`→VkImage upload + UV-carrying submit → texture the geometry.
+  Plan: `GPU-RESOURCE-BUILD-PLAN.md` "ALTERNATIVE PATH". Risks: draw→png mapping, UV alignment, EDRAM backdrop.
+
 ### cont.23 /loop — loader 20-child survey + the sustained-build conclusion (commit a75d1c6)
 - **`[children]` (REX_POLLDIAG 20-child survey, child[i]=0x82657578+i*216):** at the loader's active poll, **child[0]=state 2 (processing), children[1..19]=state 0 (not started).** ⇒ the loader runs children SEQUENTIALLY; child[0] never completes (cycles 2→3→6→8→10, null resource) → the other 19 never begin. cont.22's child[0] focus was correct; it's the SINGLE sequential blocker.
 - **⇒ CONCLUSION (both sides agree):** rendering-side (textures empty) + loader-side (child[0] stuck on a null resource) both point to ONE wall: **child[0]'s GPU resource-create**, which cont.22 established is inlined XDK-D3D submitting create-PM4 + waiting on a GPU completion variant A's CP never produces — and cont.22 PROVED fakes fail (force-state/latch/fence-forward; the title needs the REAL resource). The full chain: rich/textured menu → real GPU resources → the GPU-resource subsystem (Xenos tiled-texture decode + .xbv→SPIR-V shader translation [ref: Plume / the 19 .updb] + EDRAM render-targets + resolves + real CP completion) modeled in ExecutePM4. **No shortcut exists.** This is a massive, sustained, deliberate build with no quick visible payoff — exactly cont.22's "poor /loop fit" verdict, now re-confirmed exhaustively from every angle this session. ⇒ further fast /loop diagnostics re-tread cont.22; the deep build needs a focused sustained effort (or a debug prod-oracle build to cross-check), per cont.22's standing recommendation. The autonomous /loop has DELIVERED its value: corrected BREAKTHROUGH-2, the text-geometry render, and this complete, two-sided characterization of the wall.
