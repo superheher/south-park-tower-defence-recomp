@@ -1250,6 +1250,7 @@ thread_local bool tl_execsegs = false;
 // T2b-step-2: per-draw carved geometry accumulated during a REX_EXECSEGS frame (clip-space XY, interleaved),
 // submitted to the render bridge after the exec loop. Touched ONLY on the VdSwap thread under tl_execsegs.
 thread_local std::vector<float> tl_esVerts;
+thread_local uint32_t tl_s1cursor = 0;   // REX_SPRITECARVE: byte cursor into the slot-1 vert pool, per frame
 // T2b-step-5: the VS microcode loaded by the most-recent IM_LOAD_IMMEDIATE (op 0x2B) during execution — so a
 // DRAW can decode the VS's OWN vfetch (which fetch slot + dword offset it reads). The sprite/text VS's slot
 // 0 is a texture, so their verts come from a different slot/offset that only the vfetch instruction names.
@@ -1427,6 +1428,32 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                 const float tri[12] = { cx(x[0]),cy(y[0]), cx(x[1]),cy(y[1]), cx(x[2]),cy(y[2]),
                                         cx(x[0]),cy(y[0]), cx(x[2]),cy(y[2]), cx(x3),  cy(y3)   };
                 if (tl_esVerts.size() < 60000) tl_esVerts.insert(tl_esVerts.end(), tri, tri + 12);
+            }
+            // EXPERIMENT (REX_SPRITECARVE): the sprite(prim5)/text(prim13) draws fetch slot 0 (empty); their
+            // verts were GENERATED at slot 1 (0xA01FE0FC, cont.22) in UI-authoring coords (~1768x1043). The VS
+            // authoritatively fetches slot 0, so slot 1 is likely NOT the draws' real source (probably soup) —
+            // but prior carves used the BROKEN init decode (garbage numI); the corrected numI makes one test
+            // worthwhile. Sequential carve from the dense start, authoring→clip, triangulate per prim.
+            static const bool s_spritecarve = getenv("REX_SPRITECARVE") != nullptr;
+            if (s_spritecarve && (prim == 5 || prim == 13) && numInd >= 3) {
+                uint32_t s1 = 0xA01FE0FCu;
+                if (tl_s1cursor == 0)   // find the first dense authoring-coord run once per frame
+                    for (uint32_t o = 8; o < 0x80000; o += 8) { uint32_t u = GLD32(s1 + o); float f; memcpy(&f, &u, 4);
+                        if (f > 16.f && f < 4096.f) { tl_s1cursor = o; break; } }
+                auto cx = [](float v){ return v / 884.0f - 1.0f; };
+                auto cy = [](float v){ return v / 521.5f - 1.0f; };
+                static thread_local float vb[512*2];
+                uint32_t nr = numInd < 512 ? numInd : 512;
+                for (uint32_t i = 0; i < nr; i++) { uint32_t ux = GLD32(s1 + tl_s1cursor + i*8), uy = GLD32(s1 + tl_s1cursor + i*8 + 4);
+                    memcpy(&vb[i*2], &ux, 4); memcpy(&vb[i*2+1], &uy, 4); }
+                tl_s1cursor += numInd * 8;
+                if (prim == 5) { for (uint32_t i = 2; i < nr; i++) {   // tri-strip
+                    float t[6] = { cx(vb[(i-2)*2]),cy(vb[(i-2)*2+1]), cx(vb[(i-1)*2]),cy(vb[(i-1)*2+1]), cx(vb[i*2]),cy(vb[i*2+1]) };
+                    if (tl_esVerts.size() < 60000) tl_esVerts.insert(tl_esVerts.end(), t, t+6); } }
+                else { for (uint32_t i = 0; i + 4 <= nr; i += 4) {     // quad-list -> 2 tris
+                    float q[12] = { cx(vb[i*2]),cy(vb[i*2+1]), cx(vb[(i+1)*2]),cy(vb[(i+1)*2+1]), cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]),
+                                    cx(vb[i*2]),cy(vb[i*2+1]), cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]), cx(vb[(i+3)*2]),cy(vb[(i+3)*2+1]) };
+                    if (tl_esVerts.size() < 60000) tl_esVerts.insert(tl_esVerts.end(), q, q+12); } }
             }
         }
         // step (a) result-gate: a resolve (EDRAM->texture readback) is a draw with an active copy command —
@@ -2400,6 +2427,7 @@ PPC_FUNC(__imp__VdSwap) {
             int descsFound = 0, segs = 0;
             tl_execsegs = true;   // T2b-step-1: let DRAW_INDX capture each executed draw's live fetch slot-0
             tl_esVerts.clear();   // T2b-step-2: fresh per-frame geometry accumulator
+            tl_s1cursor = 0;      // REX_SPRITECARVE: rescan the slot-1 dense start each frame
             for (uint32_t a = base; a + 8 <= wptr; a += 4) {
                 uint32_t d = GLD32(a);
                 if ((d >> 24) != 0x81u) continue;                       // census parse: 0x81LLLLLL descriptor tag
