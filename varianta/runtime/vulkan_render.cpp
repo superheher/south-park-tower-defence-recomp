@@ -9,6 +9,7 @@
 #include "rex_render.h"
 #include "test_shaders.h"   // GPU-build piece 1: embedded SPIR-V for the test-triangle pipeline
 #include "menu_shaders.h"   // GPU-build piece 3b: float2-position menu-quad pipeline (mvp/color push const)
+#include "menutex_shaders.h" // disk-resource path (cont.23): textured UI pipeline (pos.xy+uv.xy + sampler2D)
 #include <vulkan/vulkan.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
@@ -79,6 +80,23 @@ struct MenuPC { float mvp[16]; float color[4]; };   // push constant: 80 bytes (
 std::mutex          g_menuGeomMtx;
 std::vector<float>  g_menuGeom;                      // interleaved clip XY, guarded by g_menuGeomMtx
 std::atomic<int>    g_menuGeomVerts{0};              // vertex count currently submitted
+
+// --- Textured UI pipeline (disk-resource path, cont.23): pos.xy+uv.xy (stride 16) + sampler2D ----------
+// Bypasses the stuck loader: loads shaders (media/shaders/*.updb HLSL -> menutex_shaders.h) + textures
+// (media/Assets/*.png) from disk. REX_TEXTEST validates the pipeline with a procedural checkerboard quad.
+const bool g_textest = (getenv("REX_TEXTEST") != nullptr);
+VkPipelineLayout      g_texLayout    = VK_NULL_HANDLE;
+VkPipeline            g_texPipe      = VK_NULL_HANDLE;
+VkDescriptorSetLayout g_texSetLayout = VK_NULL_HANDLE;
+VkDescriptorPool      g_texDescPool  = VK_NULL_HANDLE;
+VkDescriptorSet       g_texSet       = VK_NULL_HANDLE;
+VkImage               g_texImg       = VK_NULL_HANDLE;
+VkDeviceMemory        g_texImgMem    = VK_NULL_HANDLE;
+VkImageView           g_texView      = VK_NULL_HANDLE;
+VkSampler             g_texSampler   = VK_NULL_HANDLE;
+VkBuffer              g_texVB        = VK_NULL_HANDLE;   // pos.xy+uv.xy, host-visible, persistently mapped
+VkDeviceMemory        g_texVBMem     = VK_NULL_HANDLE;
+void*                 g_texVBMap     = nullptr;
 
 // In-engine screenshot (REX_RENDER_SHOT=<frame> -> capture that present to /tmp/varianta_shot.ppm).
 // Self-contained: external Wayland capture tools (spectacle/grim/import) don't work here.
@@ -387,6 +405,70 @@ bool CreateMenuPipeline() {
     return true;
 }
 
+// Textured UI pipeline (disk-resource path): pos.xy+uv.xy (stride 16) + a sampler2D (set0/binding0) +
+// {mvp,color} push const. Shaders = menutex.vert / SPTextured.frag (texture(diffuse,uv)*color).
+bool CreateTexturedPipeline() {
+    if (g_texPipe) return true;
+    if (!g_renderPass) return false;
+    VkDescriptorSetLayoutBinding dsb{};
+    dsb.binding = 0; dsb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    dsb.descriptorCount = 1; dsb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo dsli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dsli.bindingCount = 1; dsli.pBindings = &dsb;
+    VKCHECK(vkCreateDescriptorSetLayout(g_device, &dsli, nullptr, &g_texSetLayout));
+    auto mk = [](const uint32_t* code, size_t bytes) -> VkShaderModule {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = bytes; mi.pCode = code; VkShaderModule m = VK_NULL_HANDLE;
+        vkCreateShaderModule(g_device, &mi, nullptr, &m); return m; };
+    VkShaderModule vs = mk(kMenuTexVertSpv, sizeof(kMenuTexVertSpv));
+    VkShaderModule fs = mk(kMenuTexFragSpv, sizeof(kMenuTexFragSpv));
+    if (!vs || !fs) { fprintf(stderr, "[render] tex shader module create failed\n"); return false; }
+    VkPipelineShaderStageCreateInfo st[2]{};
+    st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = vs; st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
+    VkVertexInputBindingDescription vb{0, 16, VK_VERTEX_INPUT_RATE_VERTEX};   // pos.xy + uv.xy = 16-byte stride
+    VkVertexInputAttributeDescription va[2] = {
+        {0, 0, VK_FORMAT_R32G32_SFLOAT, 0},      // pos at offset 0
+        {1, 0, VK_FORMAT_R32G32_SFLOAT, 8} };    // uv  at offset 8
+    VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vin.vertexBindingDescriptionCount = 1; vin.pVertexBindingDescriptions = &vb;
+    vin.vertexAttributeDescriptionCount = 2; vin.pVertexAttributeDescriptions = va;
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vps.viewportCount = 1; vps.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA; cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE; cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO; cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT|VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dst{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dst.dynamicStateCount = 2; dst.pDynamicStates = dyn;
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(MenuPC)};
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.setLayoutCount = 1; pl.pSetLayouts = &g_texSetLayout;
+    pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pcr;
+    vkCreatePipelineLayout(g_device, &pl, nullptr, &g_texLayout);
+    VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pci.stageCount = 2; pci.pStages = st;
+    pci.pVertexInputState = &vin; pci.pInputAssemblyState = &ia; pci.pViewportState = &vps;
+    pci.pRasterizationState = &rs; pci.pMultisampleState = &ms; pci.pColorBlendState = &cb;
+    pci.pDynamicState = &dst; pci.layout = g_texLayout; pci.renderPass = g_renderPass; pci.subpass = 0;
+    VkResult r = vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &pci, nullptr, &g_texPipe);
+    vkDestroyShaderModule(g_device, vs, nullptr); vkDestroyShaderModule(g_device, fs, nullptr);
+    if (r != VK_SUCCESS) { fprintf(stderr, "[render] tex pipeline create = %d\n", (int)r); return false; }
+    fprintf(stderr, "[render] disk-resource: textured pipeline created (pos+uv + sampler2D, alpha blend)\n");
+    return true;
+}
+
 // Host-visible vertex buffer for the menu quads, persistently mapped (grows on demand).
 bool EnsureMenuVB(VkDeviceSize bytes) {
     if (g_menuVB && g_menuVBCap >= bytes) return true;
@@ -514,6 +596,7 @@ bool Init() {
     if (!CreateSwapchain()) return false;
     if (g_drawtest) CreateGraphicsPipeline();   // GPU build (piece 1): render pass already made in CreateSwapchain
     if (g_menutest) CreateMenuPipeline();       // GPU build (piece 3b): the menu-quad pipeline
+    if (g_textest)  CreateTexturedPipeline();   // disk-resource path: the textured UI pipeline
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -544,6 +627,82 @@ void ImageBarrier(VkCommandBuffer cmd, VkImage img, VkImageLayout from, VkImageL
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     b.srcAccessMask = srcAccess; b.dstAccessMask = dstAccess;
     vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+// Upload an RGBA8 image to a device-local VkImage + view + sampler + descriptor set (one-time, blocking).
+// The disk-resource path: media/Assets/*.png decoded -> here. (REX_TEXTEST uses a procedural checker.)
+bool UploadTexture(const uint8_t* rgba, uint32_t W, uint32_t H) {
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ii.extent = {W, H, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VKCHECK(vkCreateImage(g_device, &ii, nullptr, &g_texImg));
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_device, g_texImg, &mr);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = mr.size; mai.memoryTypeIndex = FindMemoryType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VKCHECK(vkAllocateMemory(g_device, &mai, nullptr, &g_texImgMem));
+    vkBindImageMemory(g_device, g_texImg, g_texImgMem, 0);
+    VkDeviceSize sz = (VkDeviceSize)W * H * 4;
+    VkBuffer stg = VK_NULL_HANDLE; VkDeviceMemory stgMem = VK_NULL_HANDLE;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = sz; bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VKCHECK(vkCreateBuffer(g_device, &bi, nullptr, &stg));
+    VkMemoryRequirements smr; vkGetBufferMemoryRequirements(g_device, stg, &smr);
+    VkMemoryAllocateInfo smai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    smai.allocationSize = smr.size; smai.memoryTypeIndex = FindMemoryType(smr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VKCHECK(vkAllocateMemory(g_device, &smai, nullptr, &stgMem));
+    vkBindBufferMemory(g_device, stg, stgMem, 0);
+    void* map = nullptr; vkMapMemory(g_device, stgMem, 0, sz, 0, &map); memcpy(map, rgba, sz); vkUnmapMemory(g_device, stgMem);
+    VkCommandBuffer cmd = VK_NULL_HANDLE; VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool = g_cmdPool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
+    vkAllocateCommandBuffers(g_device, &cbai, &cmd);
+    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &cbbi);
+    ImageBarrier(cmd, g_texImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy rgn{}; rgn.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; rgn.imageExtent = {W, H, 1};
+    vkCmdCopyBufferToImage(cmd, stg, g_texImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rgn);
+    ImageBarrier(cmd, g_texImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+    vkQueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE); vkQueueWaitIdle(g_queue);
+    vkFreeCommandBuffers(g_device, g_cmdPool, 1, &cmd);
+    vkDestroyBuffer(g_device, stg, nullptr); vkFreeMemory(g_device, stgMem, nullptr);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = g_texImg; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VKCHECK(vkCreateImageView(g_device, &vi, nullptr, &g_texView));
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VKCHECK(vkCreateSampler(g_device, &sci, nullptr, &g_texSampler));
+    VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &dps;
+    VKCHECK(vkCreateDescriptorPool(g_device, &dpci, nullptr, &g_texDescPool));
+    VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsai.descriptorPool = g_texDescPool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &g_texSetLayout;
+    VKCHECK(vkAllocateDescriptorSets(g_device, &dsai, &g_texSet));
+    VkDescriptorImageInfo dii{g_texSampler, g_texView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet wds{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    wds.dstSet = g_texSet; wds.dstBinding = 0; wds.descriptorCount = 1;
+    wds.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wds.pImageInfo = &dii;
+    vkUpdateDescriptorSets(g_device, 1, &wds, 0, nullptr);
+    fprintf(stderr, "[render] disk-resource: texture %ux%u uploaded + descriptor set ready\n", W, H);
+    return true;
+}
+
+bool CreateTestTexture() {   // REX_TEXTEST: a 64x64 magenta/cyan checker to validate the textured pipeline
+    if (g_texImg) return true;
+    if (!g_texSetLayout) return false;
+    const uint32_t W = 64, H = 64; static uint8_t px[W*H*4];
+    for (uint32_t y = 0; y < H; y++) for (uint32_t x = 0; x < W; x++) {
+        bool c = ((x >> 3) ^ (y >> 3)) & 1; uint8_t* p = &px[(y*W + x)*4];
+        p[0] = c ? 230 : 40; p[1] = c ? 80 : 180; p[2] = c ? 40 : 230; p[3] = 255; }
+    return UploadTexture(px, W, H);
 }
 
 void PumpEvents() {
@@ -584,6 +743,26 @@ bool PresentOnce() {
             EnsureMenuVB(g_menuGeom.size()*sizeof(float));
             if (g_menuVBMap) memcpy(g_menuVBMap, g_menuGeom.data(), g_menuGeom.size()*sizeof(float));
         } else { EnsureMenuVB(sizeof(quads)); if (g_menuVBMap) memcpy(g_menuVBMap, quads, sizeof(quads)); }
+        // disk-resource path (REX_TEXTEST): one-time texture upload + textured-quad VB, BEFORE the render pass
+        // (the upload uses its own command buffer + a blocking wait, which must not be nested in g_cmd's pass).
+        if (g_textest && g_texPipe && !g_texVB) {
+            if (CreateTestTexture()) {
+                static const float tq[] = {                          // pos.xy + uv.xy, 2 tris, clip-space quad
+                    0.1f,0.1f, 0.0f,0.0f,  0.9f,0.1f, 1.0f,0.0f,  0.9f,0.9f, 1.0f,1.0f,
+                    0.1f,0.1f, 0.0f,0.0f,  0.9f,0.9f, 1.0f,1.0f,  0.1f,0.9f, 0.0f,1.0f };
+                VkBufferCreateInfo bvi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                bvi.size = sizeof(tq); bvi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT; bvi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                if (vkCreateBuffer(g_device, &bvi, nullptr, &g_texVB) == VK_SUCCESS) {
+                    VkMemoryRequirements vmr; vkGetBufferMemoryRequirements(g_device, g_texVB, &vmr);
+                    VkMemoryAllocateInfo vai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                    vai.allocationSize = vmr.size; vai.memoryTypeIndex = FindMemoryType(vmr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                    vkAllocateMemory(g_device, &vai, nullptr, &g_texVBMem);
+                    vkBindBufferMemory(g_device, g_texVB, g_texVBMem, 0);
+                    vkMapMemory(g_device, g_texVBMem, 0, sizeof(tq), 0, &g_texVBMap);
+                    memcpy(g_texVBMap, tq, sizeof(tq));
+                }
+            }
+        }
         VkClearValue cv{}; cv.color.float32[0]=0.06f; cv.color.float32[1]=0.06f; cv.color.float32[2]=0.10f; cv.color.float32[3]=1.0f;
         VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         rp.renderPass = g_renderPass; rp.framebuffer = g_framebuffers[idx];
@@ -610,6 +789,17 @@ bool PresentOnce() {
             for (int q = 0; q < 3; q++) { memcpy(pc.color, cols[q], 16);
                 vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
                 vkCmdDraw(g_cmd, 6, 1, q * 6, 0); }
+        }
+        // disk-resource path (REX_TEXTEST): draw the textured quad — validates the textured pipeline end to end
+        // (pos+uv vertex input + the sampler2D descriptor set + the SPTextured FS = texture(diffuse,uv)*color).
+        if (g_textest && g_texPipe && g_texSet && g_texVB) {
+            vkCmdBindPipeline(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_texPipe);
+            VkDeviceSize to = 0; vkCmdBindVertexBuffers(g_cmd, 0, 1, &g_texVB, &to);
+            vkCmdBindDescriptorSets(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_texLayout, 0, 1, &g_texSet, 0, nullptr);
+            MenuPC tpc{}; for (int i = 0; i < 16; i++) tpc.mvp[i] = (i % 5 == 0) ? 1.0f : 0.0f;   // identity (clip-space verts)
+            tpc.color[0] = tpc.color[1] = tpc.color[2] = tpc.color[3] = 1.0f;                     // white tint
+            vkCmdPushConstants(g_cmd, g_texLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(tpc), &tpc);
+            vkCmdDraw(g_cmd, 6, 1, 0, 0);
         }
         vkCmdEndRenderPass(g_cmd);
         static int s_maxCap = 0;   // capture the RICHEST frame seen (most submitted verts) — steady-state menu
