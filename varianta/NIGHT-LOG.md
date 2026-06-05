@@ -2754,6 +2754,18 @@ Surveyed the executed scene + probed its textures — and re-grounded the whole 
 - **`[scene-tex]`/`[atlas]` (texture probes):** the backdrop's EDRAM texture `0xB0000000` is **ALL ZEROS** (nz=0/256), AND the STATIC font/sprite atlas `0xA5004800` is **ALL ZEROS** too. ⇒ **EVERY UI texture is empty in variant A** — the texture LOADING/upload never completed.
 - **⭐ RE-GROUNDING (honest, measured):** the geometry render path is **PROVEN** (backdrop quads + panels + text glyph-cells render via the debug menu-quad pipeline) — but it has **no textures to draw**, because the resource loader is stuck (the **cont.22** finding, now RECONFIRMED from the rendering side: textures never load). **The render path is NOT the blocker; the loader/GPU-resource-completion is.** variant A's Vulkan is present-only (no real PM4→Vulkan render-target/texture-decode renderer); a textured, recognizable menu is gated on the deep **cont.22 loader build** (resource-creation/GPU-completion), not on more rendering work. ⇒ **the session's rendering exploration has reached its useful conclusion** (geometry path done; the wall is the loader). The remaining cont.22 levers stand: sub_82248010 state-10→done gate, sub_8214FFD0/sub_8224F918 re-request, + the real GPU resource-creation (texture decode/upload, shader compile) that makes the loader's resources non-null. Default boot UNREGRESSED. Gated diags: REX_SCENE + [scene-tex]/[atlas].
 
+### cont.23 /loop — ⭐ TEXTURED PIPELINE WORKS (real .updb shader, UV-correct) — disk-resource path core proven (commit 634e013)
+Built + validated the textured UI Vulkan pipeline (task #8). `CreateTexturedPipeline`: descriptor-set layout
+(combined image sampler, set0/binding0) + pos.xy+uv.xy vertex input (stride 16) + {mvp,color} push const +
+alpha blend; shaders = `menutex.vert` / `SPTextured.frag` (the real ported `.updb` HLSL = `texture(diffuse,
+uv)*color`). `UploadTexture`: RGBA8 → device-local VkImage (staging + one-time copy + layout barriers) + view
++ sampler + descriptor pool/set. **RESULT (REX_TEXTEST): a clean UV-correct orange/cyan CHECKERBOARD rendered
+by the real SPTextured FS**, alongside the menu-quad rects (PPM verified, 0 Vulkan errors, image sent). The
+full textured path is proven end-to-end (pos+uv input + sampler descriptor + device-local upload + the
+`.updb`-derived shader + blending). All gated (REX_TEXTEST); default boot UNREGRESSED. ⭐NEXT: PNG decode
+(stb_image) → load a real `.png` (the font atlas `media/Assets/Fonts/` / Frontend art) + plumb the REX_UITEXT
+snapshots' captured per-vertex UVs through this pipeline → texture the actual menu geometry (readable text).
+
 ### cont.23 /loop — ⭐ NEW TRACTABLE DIRECTION: bypass the stuck loader via DISK resources (commits 7bb214d, 27169ae)
 After exhaustively confirming the loader wall (below), examined the game files (`private/extracted/media/`)
 and found a path AROUND it — the game ships every resource on disk, so the renderer can load them directly
