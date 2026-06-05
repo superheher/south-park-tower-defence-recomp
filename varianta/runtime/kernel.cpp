@@ -2386,6 +2386,19 @@ extern "C" PPC_FUNC(__imp__sub_82249338);
 PPC_FUNC(sub_82249338) {
     static const bool on = getenv("REX_ITEMSPIN") != nullptr;
     uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
+    // REX_LOOPCAP=N (cont.25): the loader work-loop sub_82247E70 spins forever calling this from lr=0x82247EFC
+    // (loop continues while r3!=0). Cap it: after N calls from that site, return 0 so the loop EXITS — letting
+    // sub_82247E70 process the real burst then return, so sub_8211BE68 returns having done MOST of its work
+    // (cleaner than the blunt REX_FORCEBE68 skip-all). Test whether this advances the title with fewer nulls.
+    static const char* s_cap = getenv("REX_LOOPCAP");
+    if (s_cap && static_cast<uint32_t>(ctx.lr) == 0x82247EFCu) {
+        static std::atomic<int> lc{0}; int n = lc.fetch_add(1);
+        if (n >= atoi(s_cap)) {
+            static std::atomic<bool> once{false}; bool e=false;
+            if (once.compare_exchange_strong(e,true)) fprintf(stderr, "[loopcap] breaking sub_82247E70 loop after %d iters\n", n);
+            ctx.r3.u64 = 0; return;
+        }
+    }
     __imp__sub_82249338(ctx, base);
     if (on) { static std::atomic<int> n{0}; int k = n.fetch_add(1);
         if (k < 60) fprintf(stderr, "[itemspin] #%d state(r5)=%u item(r3)=0x%08X r4=0x%08X -> ret=0x%08X\n",
