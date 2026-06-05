@@ -1744,10 +1744,6 @@ PPC_FUNC(sub_8242BF10)
             bool frameStart = (vx0==0.f && vy0==0.f && nv>=4 && vx1>1700.f && vx1<1800.f);   // the full-screen quad
             auto cx=[](float v){return v/884.0f-1.0f;}; auto cy=[](float v){return v/521.5f-1.0f;};
             std::lock_guard<std::mutex> lk(g_vbMtx);
-            if (frameStart && !g_vbVerts.empty()) {
-                rex_render::SubmitMenuGeometry(g_vbVerts.data(), (int)(g_vbVerts.size()/2));
-                g_vbVerts.clear();
-            }
             auto ins=[&](const float* p,int n){ if(g_vbVerts.size()<100000u) g_vbVerts.insert(g_vbVerts.end(),p,p+n); };
             auto rd=[&](uint32_t i){ float f; uint32_t w=GLD32(s+i*4); memcpy(&f,&w,4); return f; };
             // skip the full-screen backdrop quad (frame marker) + non-screen-space fills (verts outside the
@@ -1755,12 +1751,20 @@ PPC_FUNC(sub_8242BF10)
             bool sane = !frameStart && nv >= 4 && nv <= 16;   // panels/small UI; skip 504-vert local-space text + huge fills
             for (uint32_t i=0; i<nv*2 && sane; i++){ float f=rd(i); if (f<-32.f || f>2600.f) sane=false; }
             { float mn=1e9f,mx=-1e9f; for(uint32_t i=0;i<nv*2;i++){ float f=rd(i); if(f<mn)mn=f; if(f>mx)mx=f; } if (mx-mn < 40.f) sane=false; }  // skip tiny local-space spans
+            // fill-level dedup: the menu's panels repeat every frame — keep each distinct panel (by its vert0) once.
+            if (sane) { static std::vector<std::pair<float,float>> seen;
+                bool dup=false; for (auto& pr:seen) if (pr.first==rd(0) && pr.second==rd(1)) { dup=true; break; }
+                if (dup) sane=false; else if (seen.size()<512) seen.push_back({rd(0),rd(1)}); }
             if (sane) {
+                { static std::atomic<int> sl{0}; int kk=sl.fetch_add(1);
+                  if (kk < 60) fprintf(stderr, "[panel] #%d nv=%u v=(%.0f,%.0f)(%.0f,%.0f)(%.0f,%.0f) %s\n",
+                        kk, nv, rd(0),rd(1),rd(2),rd(3),rd(4),rd(5), frameStart?"FS":""); }
                 if (nv == 4) {   // prim-5 tri-strip quad -> 2 tris (v0,v1,v2)+(v0,v2,v3)
                     float q[12]={cx(rd(0)),cy(rd(1)),cx(rd(2)),cy(rd(3)),cx(rd(4)),cy(rd(5)), cx(rd(0)),cy(rd(1)),cx(rd(4)),cy(rd(5)),cx(rd(6)),cy(rd(7))}; ins(q,12);
                 } else {         // tri-list (groups of 3) — handles the 6/13/... vert UI fills
                     for (uint32_t i=0;i+3<=nv;i+=3) { float t[6]={cx(rd(i*2)),cy(rd(i*2+1)),cx(rd(i*2+2)),cy(rd(i*2+3)),cx(rd(i*2+4)),cy(rd(i*2+5))}; ins(t,6); }
                 }
+                if (!g_vbVerts.empty()) rex_render::SubmitMenuGeometry(g_vbVerts.data(), (int)(g_vbVerts.size()/2));
             }
         }
     }
