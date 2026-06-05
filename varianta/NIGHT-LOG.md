@@ -2974,3 +2974,22 @@ PROPER fix is to make sub_8211BE68's load COMPLETE (the loader/GPU-create comple
 skip is a powerful DIAGNOSTIC proving the gate + that the title can advance. NEXT: push past sub_82292D08 (is it
 another handleable null?) to see how far the title gets / whether it renders the menu; and/or make sub_8211BE68's
 load terminate properly. New gated diag `REX_FORCEBE68`. Default boot unaffected. Commits pending (NOT pushed).
+
+**cont.25 /loop R2 — the advance gate's non-terminating loop PINPOINTED.** Clean full backtrace of the stuck
+thread (tid=10): `GuestThreadRun→CallGuest(sub_82450FD0)→sub_82250420[work-loop]→sub_8211B740[transitions
+handler]→sub_8211BE68→sub_8224F890→sub_8224F918[the loader RE-QUEUER]→sub_82247E70→sub_822490D0→sub_82249338`.
+**The non-terminating loop is sub_82247E70** (94-line fn): `loc_82247ECC: …sub_822490D0…sub_82249338…
+if(r3!=0) goto loc_82247ECC` — it loops processing the loader work-queue (sub_822490D0 + the 279-line item
+state-machine sub_82249338, switch on item-state r5∈{1,3,5,…}) while sub_82249338 returns non-zero (more/pending
+items). It NEVER exits because the items never COMPLETE — they're re-queued via **sub_8224F918** (the re-queuer,
+matching the earlier loader finding) since they need a GPU resource-create that variant A never does. ⇒ the
+advance gate (sub_8211BE68 won't return → sub_8210AF90 transitions-enable never fires) IS the loader work-loop
+sub_82247E70 spinning forever on GPU-pending items. This UNIFIES with R0/R1 (loader file-read works; the GPU
+texture create/completion is the wall) — the advance is gated on the same GPU-create, now with the EXACT spin
+loop (sub_82247E70) + per-item state machine (sub_82249338) + re-queuer (sub_8224F918) localized. CLEAN-FIX
+options (vs the blunt REX_FORCEBE68 skip that leaves nulls): (a) make items complete (model the GPU-create
+completion sub_82249338's states wait on) → loop drains naturally; (b) break the infinite RE-QUEUE (limit
+sub_8224F918 once the real burst is processed) so the work-loop drains the current queue + exits, letting
+sub_8211BE68 do its real work then return cleanly (cleaner than skipping it). NEXT: test (b) — cap the loop /
+limit re-queue, run + REX_EXECSEGS, check for a STABLE advance (no nulls/crash) + whether new render content
+appears. No code change this iter (RE + bt only). Commits pending (NOT pushed).
