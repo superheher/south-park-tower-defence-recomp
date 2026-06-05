@@ -1,5 +1,13 @@
 # Variant A — Menu Renderer: implementation design (from the cont.13–19 RE)
 
+> ⚠ **PARTIALLY SUPERSEDED — see `GPU-RESOURCE-BUILD-PLAN.md` (cont.23) for the current plan.**
+> cont.21 measured that the producer/consumer below is per-submission *bookkeeping*, NOT the
+> per-draw path (real draws are PM4 `DRAW_INDX` in the kicked IBs / `device+13568` segments), and
+> cont.22–23 localized the real wall to the resource loader's GPU resource-create (child[0]). The
+> "execute the commands so completion happens naturally" thrust (steps 1–2 below) still holds; the
+> "*(item+16) = the real textured draw" detail is wrong. Read the build plan first.
+
+
 This consolidates the night-of-2026-06-04 reverse-engineering (NIGHT-LOG cont.13–19) into a
 concrete implementation plan for the remaining multi-session work: a **faithful CP / GPU-completion
 model** so the title's render submission completes and builds real, complete render work.
