@@ -2368,9 +2368,15 @@ PPC_FUNC(sub_8211BD60) {
 // called from sub_8211B740, so sub_8211B740 continues to the sub_8210AF90 dispatch → transitions enable. Then
 // watch (REX_INITDIAG/REX_LOADERPROBE) whether the title ADVANCES (sub_8210AF90 runs, new menu assets requested)
 // or hits the next blocker. Tests whether the advance machinery works downstream of this load.
+// cont.28: r31 (the resource path) is corrupted across the vtable[11] poll (sub_822487C8) inside sub_8211BE68,
+// so the subsequent sub_8224F890 gets 0xFFFFFFFF instead of the path -> resource not found -> sub_82110728
+// runaway. Stash the real path here so REX_FIXPATH can restore it at the sub_8224F890 call (tractability test).
+static std::atomic<uint32_t> g_be68Path{0};
 extern "C" PPC_FUNC(__imp__sub_8211BE68);
 PPC_FUNC(sub_8211BE68) {
     uint32_t _lr = ctx.lr;
+    if (_lr == 0x8211B894u && ctx.r3.u32 >= 0x82000000u && ctx.r3.u32 < 0x82600000u)
+        g_be68Path.store(ctx.r3.u32);   // the path arg, before the poll corrupts r31
     static const bool force = getenv("REX_FORCEBE68") != nullptr;
     if (force && _lr == 0x8211B894u) {
         static std::atomic<bool> once{false}; bool e=false;
@@ -2400,6 +2406,25 @@ PPC_FUNC(sub_8211BE68) {
             uint32_t k0 = PPC_LOAD_U32(0x820DA30Cu);
             if (k0 >= 0x82000000u && k0 < 0x83000000u) dumpr("  typekey[0]->", k0);
             if (job >= 0x82000000u && job < 0xA0000000u) dumpr("job->", job);
+        }
+    }
+    // RIGOR (cont.28): log EVERY sub_8211BE68 call's (caller lr, r3 arg) at ENTER + a RET marker, for ALL
+    // callers — so the call that ENTERs without a RET is the true hang, and its r3 tells whether it's the
+    // Meshes path (0x820D2844) or a sentinel (0xFFFFFFFF). Resolves whether cont.27's resource ID is right.
+    if (resid) { static std::atomic<int> ec{0}; int e = ec.fetch_add(1);
+        if (e < 24) {
+            uint32_t r3 = ctx.r3.u32; char pb[48]; pb[0]=0;
+            if (r3 >= 0x82000000u && r3 < 0x82600000u) { int i=0; for(;i<47;i++){uint8_t c=PPC_LOAD_U8(r3+i); if(c<32||c>=127)break; pb[i]=(char)c;} pb[i]=0; }
+            // The vtable[11] poll at 0x8211BE98 = *(*(*(0x828EEEC4))+44). Suspected of corrupting r31 (the path)
+            // -> sub_8224F890 gets 0xFFFFFFFF. Capture the poll target so it can be read for r31 preservation.
+            uint32_t pobj = PPC_LOAD_U32(0x828EEEC4u);
+            uint32_t pvt  = (pobj >= 0x82000000u && pobj < 0xA0000000u) ? PPC_LOAD_U32(pobj) : 0;
+            uint32_t poll = (pvt  >= 0x82000000u && pvt  < 0xA0000000u) ? PPC_LOAD_U32(pvt + 44) : 0;
+            fprintf(stderr, "[be68call] #%d ENTER lr=0x%08X r3=0x%08X '%s' | pollobj=0x%08X vt=0x%08X poll[11]=0x%08X\n",
+                    e, _lr, r3, pb, pobj, pvt, poll);
+            __imp__sub_8211BE68(ctx, base);
+            fprintf(stderr, "[be68call] #%d RET (lr=0x%08X)\n", e, _lr);
+            return;
         }
     }
     AdvLog(_lr, 0x8211B894u, "sub_8211BE68", "ENTER"); __imp__sub_8211BE68(ctx, base); AdvLog(_lr, 0x8211B894u, "sub_8211BE68", "RET");
@@ -2463,8 +2488,16 @@ PPC_FUNC(sub_82247E70) {
     if (!on) { __imp__sub_82247E70(ctx, base); return; }
     static std::atomic<int> seq{0}; int s = seq.fetch_add(1);
     uint32_t lr = ctx.lr, a3 = ctx.r3.u32, a4 = ctx.r4.u32;
+    // PATH-LOAD probe (cont.28): for a path-based fetch (sub_8211BD60/sub_8211BE68 -> sub_8224F890 -> sub_8224F918
+    // -> sub_82247E70 with r3 = the path string in .rdata), capture the path + the return. Textures\Global.bin
+    // (works) should return FOUND; Meshes\Global.bin (hangs) should return NULL — pinpointing the divergence.
+    bool isPath = (a3 >= 0x82000000u && a3 < 0x82600000u && (PPC_LOAD_U8(a3) >= 32 && PPC_LOAD_U8(a3) < 127));
+    char pbuf[72]; pbuf[0]=0;
+    if (isPath) { int i=0; for (; i<71; i++){ uint8_t c=PPC_LOAD_U8(a3+i); if(c<32||c>=127) break; pbuf[i]=(char)c; } pbuf[i]=0; }
     if (s < 50) fprintf(stderr, "[looptrace] #%d ENTER lr=0x%08X r3=0x%08X r4=0x%08X\n", s, lr, a3, a4);
     __imp__sub_82247E70(ctx, base);
+    if (isPath) { static std::atomic<int> p{0}; if (p.fetch_add(1) < 400)
+        fprintf(stderr, "[loadpath] sub_82247E70('%s') -> ret=0x%08X %s\n", pbuf, ctx.r3.u32, ctx.r3.u32 ? "FOUND" : "NULL=hang-root"); }
     if (s < 50) fprintf(stderr, "[looptrace] #%d RET (loop drained)\n", s);
 }
 // REX_BE68INNER (cont.26): sub_8211BE68 (from sub_8211B740) ENTERs but never RETs, yet its inner heap-walk
@@ -2482,11 +2515,33 @@ PPC_FUNC(sub_82247E70) {
     fprintf(stderr, "[be68in] %-14s #%d ENTER @0x%X r3=0x%08X r4=0x%08X\n", #FN, n, SITE, a3, a4); \
     __imp__##FN(ctx, base); \
     fprintf(stderr, "[be68in] %-14s #%d RET\n", #FN, n); }
-BE68_INNER_HOOK(sub_8224F890, 0x8211BEB0)   // 1st named call in sub_8211BE68
 BE68_INNER_HOOK(sub_82250110, 0x8211BEC4)
 BE68_INNER_HOOK(sub_82110728, 0x8211BECC)
 BE68_INNER_HOOK(sub_822501C8, 0x8211BED4)   // last named call
 #undef BE68_INNER_HOOK
+// sub_8224F890 standalone hook: REX_BE68INNER logging + REX_FIXPATH (cont.28). When called from sub_8211BE68
+// @0x8211BEB0 with the corrupted r4=0xFFFFFFFF, restore r4 to the real path (stashed in g_be68Path). If this
+// makes Meshes\Global.bin load and the title advance, the r31-corruption diagnosis is confirmed end-to-end.
+extern "C" PPC_FUNC(__imp__sub_8224F890);
+PPC_FUNC(sub_8224F890) {
+    static const bool fixpath = getenv("REX_FIXPATH") != nullptr;
+    static const bool be68in  = getenv("REX_BE68INNER") != nullptr;
+    bool site = (static_cast<uint32_t>(ctx.lr) == 0x8211BEB0u);
+    if (fixpath && site && ctx.r4.u32 == 0xFFFFFFFFu) {
+        uint32_t p = g_be68Path.load();
+        if (p) { static std::atomic<int> fc{0}; if (fc.fetch_add(1) < 4)
+                     fprintf(stderr, "[fixpath] restoring sub_8224F890 r4 0xFFFFFFFF -> 0x%08X (the real path)\n", p);
+                 ctx.r4.u64 = p; }
+    }
+    if (be68in && site) { static std::atomic<int> k{0}; int n = k.fetch_add(1);
+        uint32_t a3 = ctx.r3.u32, a4 = ctx.r4.u32;
+        fprintf(stderr, "[be68in] sub_8224F890     #%d ENTER @0x8211BEB0 r3=0x%08X r4=0x%08X\n", n, a3, a4);
+        __imp__sub_8224F890(ctx, base);
+        fprintf(stderr, "[be68in] sub_8224F890     #%d RET\n", n);
+        return;
+    }
+    __imp__sub_8224F890(ctx, base);
+}
 // REX_728INNER (cont.26): sub_82110728 is the real hang (ENTER, never RET). It's a counted loop
 //   r28 = sub_8224FDB0(obj); while(r28) { r28--; sub_82110B18; if(==0){sub_821B1310; sub_8212E830;} sub_82250090 }
 // Either r28 is a runaway count (log it once) or one inner work call hangs (ENTER without a matching RET).
@@ -2535,6 +2590,22 @@ IH728(sub_821B1310, 0x821107B0)
 IH728(sub_8212E830, 0x821107D8)
 IH728(sub_82250090, 0x821107F0)
 #undef IH728
+// REX_SKIPPOLL (cont.28): the vtable[11] poll sub_822487C8 (called from sub_8211BE68@0x8211BE98) corrupts
+// sub_8211BE68's frame (r31/path -> 0xFFFFFFFF, and broader — restoring r4 alone doesn't propagate). Test the
+// corruption hypothesis: when called from that site, return success (1) WITHOUT running the corrupting body, so
+// sub_8211BE68 proceeds with an intact frame. If the Meshes fetch then reaches sub_82247E70(path) / the title
+// advances, the poll's corruption is the blocker. Filtered to the one site (sub_822487C8 is a hot vtable method).
+extern "C" PPC_FUNC(__imp__sub_822487C8);
+PPC_FUNC(sub_822487C8) {
+    static const bool skip = getenv("REX_SKIPPOLL") != nullptr;
+    if (skip && static_cast<uint32_t>(ctx.lr) == 0x8211BE98u) {
+        static std::atomic<int> sc{0}; if (sc.fetch_add(1) < 4)
+            fprintf(stderr, "[skippoll] skipping sub_822487C8 @0x8211BE98 (returning 1, no body) — frame-corruption test\n");
+        ctx.r3.u64 = 1;
+        return;
+    }
+    __imp__sub_822487C8(ctx, base);
+}
 // Diag (gated): confirm the title's own completion poster fires after a forced EOS (sub_82425BF8 EOF branch).
 extern "C" PPC_FUNC(__imp__sub_8222A9F8);
 PPC_FUNC(sub_8222A9F8)
@@ -3651,6 +3722,24 @@ PPC_FUNC(__imp__NtCreateFile)
     if (getenv("REX_LOADERPROBE") && !path.empty()) {
         static std::atomic<int> fn{0}; int k = fn.fetch_add(1);
         if (k < 400) fprintf(stderr, "[asset] #%d vbc=%u %s '%s'\n", k, g_vblankCount.load(), f ? "OK" : "MISS", path.c_str());
+    }
+    // REX_OPENER (cont.28): identify the global-asset LOADER. Log the guest caller (ctx.lr = the return addr in
+    // the function that called NtCreateFile) for the global .bin assets around the variant-A stop point
+    // (Textures/Global.bin is the last opened; Meshes/Global.bin never opens). Walk a couple guest stack frames
+    // via the recomp linkage (mflr r12; stw r12,-8(r1); stwu r1,-N) -> a frame's saved LR is at *(backchain)-8.
+    if (getenv("REX_OPENER") && (path.find("Global.bin") != std::string::npos ||
+                                 path.find("Meshes") != std::string::npos ||
+                                 path.find("global.bin") != std::string::npos)) {
+        uint32_t lr = ctx.lr, sp = ctx.r1.u32;
+        fprintf(stderr, "[opener] '%s' caller-lr=0x%08X", path.c_str(), lr);
+        for (int i = 0; i < 6 && sp >= 0x1000u && sp < 0xC0000000u; i++) {
+            uint32_t bc = PPC_LOAD_U32(sp);                       // back-chain -> caller frame
+            if (bc <= sp || bc >= 0xC0000000u) break;
+            uint32_t slr = PPC_LOAD_U32(bc - 8);                  // that frame's saved LR
+            fprintf(stderr, " <-0x%08X", slr);
+            sp = bc;
+        }
+        fprintf(stderr, "\n");
     }
     if (!f) {
         if (pHandle) PPC_STORE_U32(pHandle, 0);

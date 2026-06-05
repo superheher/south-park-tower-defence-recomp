@@ -3138,3 +3138,51 @@ Textures\Global.bin? Could be a loader bug/ordering (tractable) or a real sub-ga
 global-asset loader (what opens Textures\Global.bin and should continue to Meshes\Global.bin) and its stop
 condition — instrument the NtCreateFile caller chain / find the manifest-driven loader; the prod strace
 (/tmp/prod_strace.log) gives the exact asset order to match. Default boot unregressed. New tool: REX_RESID.
+
+## cont.28 (2026-06-05, /loop) — ⭐⭐⭐ BREAKTHROUGH: the advance-gate wall is a TRACTABLE frame-corruption bug in the recompiled poll sub_822487C8; skipping it ADVANCES the title (65→94 assets: level-select + gameplay + attract movie)
+
+Continued cont.27. **CRACKED the wall.** New gated diags (default boot UNREGRESSED — exit124, 110.7k lines, 65
+assets, 2 baseline crashes, 0 leakage): REX_OPENER, REX_FIXPATH, REX_SKIPPOLL + extended REX_RESID/REX_LOOPTRACE.
+Commit cont.28 (NOT pushed).
+
+**The loader IS the work-loop (REX_OPENER — guest caller chain at NtCreateFile).** Textures/Global.bin's open
+chain = NtCreateFile ← 0x82447FFC ← sub_822483xx ← sub_82247F10 ← **sub_82247E70's vtable[1] @0x82247EE8** ←
+sub_8224F918 ← sub_8224F890. So the file open happens INSIDE sub_82247E70's per-item vtable[1] — the work-loop
+opens a file when it finds a matching registry item. For Textures an item exists (opens); for Meshes sub_82247E70
+returns null (no item → no open → hang).
+
+**Asset diff (prod strace vs variant A): variant A loads frontend assets but NONE of the gameplay/mesh/level
+assets** (all Meshes/*, gameplay .bin, Levels/Campaigns/Challenges.xmc, gameplay textures) = the menu→gameplay
+boundary, gated by the transition hang.
+
+**RIGOR — CONFIRMED the hang = the Meshes load (be68call logs every sub_8211BE68 (lr,r3)).** Exactly ONE call:
+#0 lr=0x8211B894 (sub_8211B740) r3=0x820D2844 'Assets\Global\Meshes\Global.bin', ENTER no RET. (cont.26's
+0xFFFFFFFF was r31 AFTER corruption, not the arg — cont.27's resource ID stands.)
+
+**⭐ ROOT CAUSE: r31 (the path) is CORRUPTED to 0xFFFFFFFF across the vtable[11] poll sub_822487C8.** The recomp
+(ppc_recomp.3.cpp:12119-12141) sets r31=r3=path at entry; the only thing before `r4=r31; sub_8224F890` is the
+poll bctrl @0x8211BE98. Measured (SAME invocation): sub_8211BE68 r3=path, sub_8224F890 r4=0xFFFFFFFF. Poll target
+= sub_822487C8 (pollobj 0x826574E8, vt 0x820DAE34). sub_822487C8 itself doesn't touch r31 (it calls vtable[10] +
+sub_82448158 → the memcpy chain sub_8244FE80/sub_8242BF10 per cont.25 bt), so a CALLEE corrupts the frame.
+
+**The corruption is BROADER than r31.** REX_FIXPATH (restore sub_8224F890's r4 to the real path) did NOT unblock —
+sub_82247E70 still never gets the Meshes path. So sub_8224F890 diverges before sub_8224F918 on other corrupted
+frame state, not just r31.
+
+**⭐⭐⭐ REX_SKIPPOLL (skip sub_822487C8's body only from the 0x8211BE98 site, return 1 = the same nonzero it
+returned anyway) → THE TITLE ADVANCES.** sub_8211BE68 #0 RETURNS; Meshes\Global.bin OPENS (asset #65);
+sub_82247E70('...Meshes\Global.bin') → FOUND; the loader CONTINUES: StructureGeom/WallsGeom/CharacterGeom/
+EnemyGeom, **Levels/Campaigns/Challenges.xmc (level-select!)**, Projectiles/Structures/characterDefs/EnemyTypes/
+pickups/MeshEntities/Rat (.spm mesh + .dds texture), hudimages, and the **attract movie
+towerDefense_attract_movie.wmv** — **65→94 assets, exit124 (full 35s), only 1 INDIRECT-NULL (< baseline's 2)**.
+sub_8211BE68 #1–#4 also load meshes and RET. ⇒ the poll returned the right value (nonzero) but its SIDE EFFECT
+(frame corruption) was the blocker; removing the side effect fixes it.
+
+**⇒ CRACKS cont.25's "deep multi-session GPU build".** The advance-gate wall was a TRACTABLE recompiled-code
+frame-corruption bug in sub_822487C8's callee chain (a CPU mesh-resource poll), NOT a GPU dependency — the FIRST
+TARGETED (non-blunt-FORCEBE68) advance past the menu→gameplay boundary. ⭐ NEXT: (1) the PROPER fix — pin the
+exact corrupting callee (vtable[10] of 0x826574E8 / sub_82448158 / sub_8244FE80 / the memcpy sub_8242BF10 — likely
+an oversized memcpy; cont.25 noted size=numI*16, cont.26 saw 0x60606060 garbage counts) and fix the recomp/runtime
+to replace the REX_SKIPPOLL workaround; (2) push the advance further toward a rendered menu (combine with the
+renderer/REX_EXECSEGS). REX_SKIPPOLL is a clean gated workaround that demonstrably advances the title. Default
+boot unregressed.
