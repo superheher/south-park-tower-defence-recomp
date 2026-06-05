@@ -206,15 +206,25 @@ the title must advance too. This REINFORCES cont.22-24's "massive sustained buil
 corrected target (renderer, not loader). Each of the 3 paths is multi-step; the rich menu needs ≥1 + the advance.
 
 **Recommended sequencing (de-risk the keystone first):**
-- **R0 (keystone investigation): PARTLY ANSWERED (cont.25).** GPU texture MEMORY *is* allocated — `MmAllocate
-  PhysicalMemoryEx` (g_physNext from 0xA0000000) makes 442 blocks incl. texture-sized ones (`sz=0xE1000`≈900KB,
-  `0x44000`≈272KB) in the 0xA4–0xA5xxxxxx range where the atlas (0xA5004800) lives. So the create RUNS (allocates)
-  but the **POPULATE/decode** (loaded bytes → the allocated mem) is stubbed: the atlas is zeros, and the pre-menu
-  sprite draws bind tex=0x0 (no fetch constant) — those off-screen draws may legitimately precede the real
-  textured menu draws (which need the title to ADVANCE). NEXT in R0: hook MmAllocatePhysicalMemoryEx to tag the
-  texture allocations, then find who SHOULD write them (the decode/upload, or the TTF raster for the atlas) — set
-  a write-watchpoint on an allocated texture block to catch the populate path (or confirm it never fires =
-  stubbed). THIS decides "model the upload" (cheap) vs "implement decode" (heavy).
+- **R0 (keystone investigation): ANSWERED (cont.25, `REX_TEXWATCH`).** GPU texture MEMORY *is* allocated —
+  `MmAllocatePhysicalMemoryEx` (g_physNext from 0xA0000000) makes 442 blocks incl. texture-sized ones (5×
+  `sz=0xE1000`≈924KB, 11× `0x44000`≈272KB) in the 0xA4–0xA5xxxxxx range where the atlas (0xA5004800) lives.
+  Flagged the first 924KB block and (a) gdb hardware-watchpointed its first dword over ~85s = **never written**,
+  (b) headless-sampled it 3 offsets (0 / 64KB / 900KB) over the run = **offset 0 gets a tiny header (`0x01000000`)
+  but the BULK (64KB, 900KB) stays ZERO**. The atlas stays zero too. ⇒ **the texture create ALLOCATES + writes a
+  struct header, but the DATA POPULATE (decode/upload of the loaded file into the allocated pixels) DOES NOT
+  EXECUTE.** Not "model the upload" (no upload happens at all) — it's "the populate path is never reached/run."
+  **R0 DEFINITIVE (REX_TEXWATCH +[texread] filename trace):** big asset reads split cleanly by destination —
+  **audio** (`MainWaveBank.xwb` 22MB, `MainSoundBank*.xsb`) is read DIRECTLY into the physical/GPU window
+  (0xA0000000+, works), but **every texture/UI file** (`UI.xzp` 23MB, `lipsynctextures.bin`, fonts, the movie)
+  is read into **SYSTEM memory**. NO texture file is ever read into a GPU texture block. ⇒ the missing step is
+  the **decode + upload (system-mem texture data → the allocated guest GPU texture mem, with Xenos untiling) +
+  the fetch-constant setup** — it simply never runs. That is THE keystone, isolated. Two sub-questions left for
+  R1: is that upload (a) a stubbed/no-op inlined-D3D path that just needs implementing (decode+copy+fetch-const),
+  or (b) gated behind the A↔B GPU-completion (deferred until the title sees real results)? The font atlas
+  (0xA5004800) is a SEPARATE path (TTF raster of the loaded `.ttf` — also never runs). R1 starts by implementing
+  the decode+upload for ONE texture (the format is in the Xenos fetch-constant; ref Xenia texture_conversion) and
+  wiring SetTexture's fetch constant, then checking whether the title-advance still gates the visible draw.
 - **R1:** model the create for ONE texture → REX_SCENE shows a non-null `tex=` for a sprite draw → wire the
   executed draw to sample it via the existing textured pipeline (g_texPipe + UploadTexture from cont.24, which
   already decode-and-sample a guest RGBA buffer). First real textured UI draw.

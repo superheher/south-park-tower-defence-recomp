@@ -2886,3 +2886,27 @@ the title or it needs real pixels — cont.21 says the latter (build A+B togethe
 rigorous re-grounding that redirects the effort from a phantom "loader unblock" to the real renderer build, with
 a complete asset map + the exact frontend stall chain. Diag retained (gated, default-safe): `REX_LOADERPROBE`
 ([ldprobe]/[ldsummary]/[ldframe]/[asset]/[bf298]) + the sub_821BF298 hook. Commit pending (NOT pushed).
+
+### cont.25 — RENDERER BUILD started (user chose it): wall characterization + R0 keystone isolated
+
+User chose "start the renderer build". I characterized the target, then isolated the keystone (commits d636ec0,
+e9a1fb9 + pending).
+
+**Scene characterization (REX_SCENE, REX_EXECSEGS=3):** per-frame executed menu scene = sprite(prim5)/tri(prim4)/
+text(prim13) draws all **tex=0x0** (no texture bound) + 4× backdrop(prim8) sampling EDRAM **0xB0000000 (1×1,
+zeros)** + content mostly OFF-SCREEN (only the prim-4 at (64,36) on-screen). Font atlas 0xA5004800/0xA5004000 =
+all zeros. ⇒ THREE distinct stubbed texture sources (sprite-create, EDRAM-RT, TTF-atlas), and the scene is a
+pre-menu/loading state — **no incremental visible payoff** without the title advancing (cont.21 A↔B). Reinforces
+cont.22-24 "massive sustained build", corrected target = renderer.
+
+**R0 keystone (REX_TEXWATCH):** GPU texture memory IS allocated — MmAllocatePhysicalMemoryEx (g_physNext from
+0xA0000000) = 442 blocks incl. 5×`0xE1000`(924KB) + 11×`0x44000`(272KB). Flagged the first 924KB block: (a) gdb
+hardware-watchpoint on its first dword = never written over ~85s; (b) headless 3-offset sample (0/64KB/900KB) =
+off0 gets a tiny header `0x01000000`, the BULK stays ZERO all run. Atlas stays zero. **[texread] filename trace
+(decisive):** audio (MainWaveBank.xwb 22MB, MainSoundBank*.xsb) reads DIRECTLY into the GPU window (0xA0000000+),
+but EVERY texture/UI file (UI.xzp 23MB, lipsynctextures.bin, fonts, movie) reads into **SYSTEM memory** — none
+into a GPU texture block. ⇒ **THE missing step = the decode+upload (system-mem texture → guest GPU texture mem +
+Xenos untile + fetch-constant setup) NEVER RUNS.** Keystone isolated. R1 open Q: stubbed no-op (just implement
+decode+copy+fetch-const, ref Xenia texture_conversion) vs A↔B-gated. Plan §R0/R1/R2 (GPU-RESOURCE-BUILD-PLAN.md).
+New gated diag: `REX_TEXWATCH` (+[texwatch]/[texread], +the [ldframe] texture-block population sample), `REX_TEXTRAP`
+(gdb-only SIGTRAP). Default boot unregressed (12s smoke clean). Commits pending (NOT pushed).

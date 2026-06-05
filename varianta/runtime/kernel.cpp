@@ -22,6 +22,7 @@
 #include <string>
 #include <dirent.h>      // case-insensitive VFS path resolution (Xbox FS is case-insensitive)
 #include <strings.h>     // strcasecmp
+#include <csignal>       // raise(SIGTRAP) for the REX_TEXWATCH gdb hand-off (R0 keystone)
 #include <sys/stat.h>
 
 // Lightweight import trace (set REX_KTRACE=0 to silence).
@@ -812,6 +813,9 @@ PPC_FUNC(__imp__VdQueryVideoMode)
 // ---- physical memory (GPU buffers) -----------------------------------------------------------------
 namespace { uint32_t g_physNext = 0xA0000000; }  // Xbox physical-address window (all lazily mmap'd)
 
+// R0 keystone (REX_TEXWATCH): non-static so an attached gdb can read it by name after the SIGTRAP, to set a
+// hardware write-watchpoint on g_base + g_texWatchAddr and catch the texture-populate writer (or confirm none).
+uint32_t g_texWatchAddr = 0;
 // PVOID MmAllocatePhysicalMemoryEx(flags r3, size r4, protect r5, min r6, max r7, align r8)
 PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
 {
@@ -825,6 +829,18 @@ PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
     uint32_t addr = g_physNext;
     g_physNext += size ? size : pageSize;
     KTRACE("MmAllocatePhysicalMemoryEx(sz=0x%X prot=0x%X) -> 0x%X\n", size, protect, addr);
+    // R0 keystone (REX_TEXWATCH): GPU texture memory IS allocated but never populated (atlas zeros). Flag the
+    // FIRST big-texture block (0xE1000 ≈ 924KB) so an attached gdb can hardware-watchpoint it and catch WHO
+    // writes it (the decode/upload = "model the upload" territory) — or confirm NOTHING does (decode stubbed =
+    // "implement decode"). raise(SIGTRAP) hands control to gdb with g_texWatchAddr set (default-off, gdb-only).
+    static const bool s_texwatch = getenv("REX_TEXWATCH") != nullptr;
+    static const bool s_textrap = getenv("REX_TEXTRAP") != nullptr;   // separate: raise SIGTRAP (gdb-only)
+    if (s_texwatch && size == 0xE1000u && g_texWatchAddr == 0) {
+        g_texWatchAddr = addr;
+        fprintf(stderr, "[texwatch] flagged big-texture alloc 0x%X (sz=0x%X)%s\n", addr, size,
+                s_textrap ? " — trapping for gdb watchpoint" : " — will sample for population");
+        if (s_textrap) raise(SIGTRAP);
+    }
     ctx.r3.u64 = addr;
 }
 
@@ -1788,9 +1804,12 @@ void VblankPump() {
             for (int i = 0; i < 20; i++) { uint32_t c = 0x82657578u + i*216u, cs = rd(c+136), cr = rd(c+208);
                 if (cs || cr) started++;
                 o += snprintf(buf+o, sizeof(buf)-o, " [%d]s%u/r%u", i, cs, cr); }
-            fprintf(stderr, "[ldframe] vbc=%u childrenStarted=%d/20 ch0(+136)=%u ch0(+152)=0x%X ch0(+160)=0x%X | atlasA5004800=%08X edramB0000000=%08X |%s\n",
+            // R0: is the flagged big-texture block EVER populated? sample 3 offsets (0 / 64KB / 900KB) — if all
+            // stay 0 across the run, the decode/upload never writes it (the populate is stubbed).
+            uint32_t tw = g_texWatchAddr, t0 = tw?rd(tw):0, t1 = tw?rd(tw+0x10000):0, t2 = tw?rd(tw+0xE0000):0;
+            fprintf(stderr, "[ldframe] vbc=%u childrenStarted=%d/20 ch0(+136)=%u ch0(+152)=0x%X ch0(+160)=0x%X | atlasA5004800=%08X edramB0000000=%08X | tex0x%X[0/64k/900k]=%08X %08X %08X |%s\n",
                     vbc, started, rd(0x82657578u+136), rd(0x82657578u+152), rd(0x82657578u+160),
-                    rd(0xA5004800u), rd(0xB0000000u), buf);
+                    rd(0xA5004800u), rd(0xB0000000u), tw, t0, t1, t2, buf);
         }
         uint32_t cb = g_interruptCallback;
         if (!cb) continue;
@@ -3305,6 +3324,7 @@ PPC_FUNC(__imp__XamUserReadProfileSettings)
 namespace kernel { std::string g_gameDir; }
 namespace {
 std::unordered_map<uint32_t, FILE*> g_files;
+std::unordered_map<uint32_t, std::string> g_fileNames;   // R0 (REX_TEXWATCH): handle->path, to label big reads
 uint32_t g_nextFileHandle = 0xF2000000;   // file handle space (distinct from threads at 0xF1xxxxxx)
 std::mutex g_fileMutex;
 
@@ -3379,7 +3399,8 @@ PPC_FUNC(__imp__NtCreateFile)
         return;
     }
     uint32_t h;
-    { std::lock_guard<std::mutex> lk(g_fileMutex); h = g_nextFileHandle++; g_files[h] = f; }
+    { std::lock_guard<std::mutex> lk(g_fileMutex); h = g_nextFileHandle++; g_files[h] = f;
+      if (getenv("REX_TEXWATCH")) g_fileNames[h] = path; }
     if (pHandle) PPC_STORE_U32(pHandle, h);
     if (ioStatus) { PPC_STORE_U32(ioStatus + 0, 0); PPC_STORE_U32(ioStatus + 4, 1); } // SUCCESS, FILE_OPENED
     ctx.r3.u64 = 0;
@@ -3411,6 +3432,15 @@ PPC_FUNC(__imp__NtReadFile)
     size_t n = length ? fread(g_base + buffer, 1, length, f) : 0;
     if (ioStatus) { PPC_STORE_U32(ioStatus + 0, n ? 0 : 0xC0000011u); PPC_STORE_U32(ioStatus + 4, static_cast<uint32_t>(n)); }
     KTRACE("NtReadFile(h=0x%X len=%u off=%s) -> %zu\n", handle, length, pOffset ? "set" : "cur", n);
+    // R0: where does asset data land? Big reads (textures/meshes) into the GPU window (0xA0000000+) mean the
+    // title reads directly into GPU mem; reads into low/system memory mean a separate copy-to-GPU must follow
+    // (which REX_TEXWATCH shows never happens). Log dest+len for big reads to map the texture data path.
+    if (getenv("REX_TEXWATCH") && length >= 0x10000) {
+        static std::atomic<int> rn{0}; int k = rn.fetch_add(1);
+        std::string nm; { std::lock_guard<std::mutex> lk(g_fileMutex); auto it=g_fileNames.find(handle); if(it!=g_fileNames.end()) nm=it->second; }
+        if (k < 40) fprintf(stderr, "[texread] dest=0x%08X len=0x%X %s '%s'\n", buffer, length,
+                            buffer >= 0xA0000000u ? "GPU-WINDOW" : "system-mem", nm.c_str());
+    }
     ctx.r3.u64 = (n || length == 0) ? 0 : 0xC0000011u; // STATUS_END_OF_FILE
 }
 
