@@ -233,10 +233,19 @@ corrected target (renderer, not loader). Each of the 3 paths is multi-step; the 
   DECODE/POPULATE path WORKS for many textures; real texture data EXISTS in guest GPU mem. The remaining gap is
   NARROW: connect the populated textures to the executed draws. ⚠ Note: [texbind] sees binds in slots 0..42 but
   REX_SCENE only scanned slots 0..31 — its "tex=0x0" was partly a too-small slot scan; some menu draws may bind
-  populated textures in higher slots. NEXT (R1 cont.): widen the per-draw texture scan to 0..42, correlate which
-  EXECUTED draw binds which populated texture, then sample it via the existing textured pipeline (g_texPipe +
-  UploadTexture from cont.24) → first real textured UI draw. The empty 22 (incl. EDRAM backdrop) are the
-  render-target / deferred subset (pieces 4 + the A↔B advance).
+  populated textures in higher slots. DONE (R1 cont.): widened the per-draw texture scan to slots 0..42 (was 0..31) AND added a populated-check —
+  the EXECUTED menu draws STILL bind NO texture (sprite/text/tri = slot −1; backdrop = empty EDRAM). So the 14
+  populated textures are bound by OTHER draws (not the executed device+13568 menu segments). ⚠ AND the texture
+  binds are RUN-TO-RUN VARIABLE: one run caught 36 binds (14 populated), but 4 subsequent identical runs caught
+  only 1 — consistent with the cont.12 NOTOKEN render-path race (pooled render objects, stale callbacks). ⇒ two
+  walls converge: (i) the executed menu draws are textureless placeholders (the real textured draws live in the
+  unreached interactive-menu state — the A↔B advance), and (ii) even the binds that do happen are race-gated.
+  ⇒ **R2 pivots to the ROOT: the A↔B title-advance gate** — what specifically keeps the frontend (sub_82150970,
+  stable loop, completion-drain sub_821BF298 running fine) from advancing from the loading/attract state to the
+  interactive menu (where the textured draws + their populated textures are used). cont.21 framed it as "won't
+  submit content draws until it sees real GPU results" — pin the exact gated condition (a resource-ready count?
+  a fence? a frame counter?). The texture data largely EXISTS (14 populated); the wall is the advance + reliable
+  (race-free) execution, not the texture decode.
 - **R2:** generalize (texture decode for the Xenos tiled formats — ref Xenia texture_conversion), then the font
   atlas + the title-advance (A↔B) for the positioned menu.
 - Each step committable + REX_SCENE-verifiable; keep default boot unregressed.

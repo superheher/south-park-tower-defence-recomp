@@ -1337,8 +1337,8 @@ inline void WriteGpuReg(uint32_t index, uint32_t value) {
                 // R1 decisive: is the BOUND texture populated? sample 64 dwords for non-zero/varied content.
                 uint32_t ga = 0xA0000000u | b, nz = 0, vr = 0, prev = 0;
                 for (int i = 0; i < 64; i++) { uint32_t w = GLD32(ga + i*4); if (w) nz++; if (i && w != prev) vr++; prev = w; }
-                fprintf(stderr, "[texbind] slot %u d1=0x%08X -> texBase=0x%08X (%s) DATA nz=%u/64 varied=%u/63 first=%08X %08X\n",
-                        (index - 0x4800u) / 6u, value, ga, edram ? "EDRAM-RT" : "texture", nz, vr, GLD32(ga), GLD32(ga+4));
+                fprintf(stderr, "[texbind] %s slot %u d1=0x%08X -> texBase=0x%08X (%s) DATA nz=%u/64 varied=%u/63 first=%08X %08X\n",
+                        tl_execsegs ? "SEG " : "RING", (index - 0x4800u) / 6u, value, ga, edram ? "EDRAM-RT" : "texture", nz, vr, GLD32(ga), GLD32(ga+4));
             }
         }
     }
@@ -1523,14 +1523,21 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                     // Task #8 cont. (cont.25): ALSO decode the texture DIMENSIONS — the Xenos 2D texture fetch
                     // constant stores width-1 in d2[12:0], height-1 in d2[25:13], data_format in d1[5:0]. The dims
                     // are the key to mapping a UI sprite draw to a disk .png (match by size) for disk-texturing.
-                    uint32_t texBase=0, texW=0, texH=0, texFmt=0;
-                    for(uint32_t s=0;s<32;s++){ uint32_t d1=GLD32(0x7FC80000u+(0x4800u+s*6u+1u)*4u);
-                        uint32_t b=d1&0xFFFFF000u; if(b>=0x04000000u && b<0x20000000u){ texBase=0xA0000000u|b;
-                            uint32_t d2=GLD32(0x7FC80000u+(0x4800u+s*6u+2u)*4u);
-                            texW=(d2&0x1FFFu)+1u; texH=((d2>>13)&0x1FFFu)+1u; texFmt=d1&0x3Fu; break; } }
+                    // cont.25 R1: scan ALL fetch slots 0..42 (the fetch region is 0x4800..0x48FF; texture slots are
+                    // 6dw → up to 42), and PREFER a POPULATED texture (real pixel data) over an empty one — the
+                    // executed draw may bind its texture in a high slot (REX_SCENE used to scan only 0..31). Report
+                    // the chosen texture + its populated status + which slot, to find a draw I can render textured.
+                    uint32_t texBase=0, texW=0, texH=0, texFmt=0; int texSlot=-1; bool texPop=false;
+                    for(uint32_t s=0;s<43 && !texPop;s++){ uint32_t d1=GLD32(0x7FC80000u+(0x4800u+s*6u+1u)*4u);
+                        uint32_t b=d1&0xFFFFF000u; if(b>=0x04000000u && b<0x20000000u){
+                            uint32_t ga=0xA0000000u|b, nz=0; for(int i=0;i<32;i++) if(GLD32(ga+i*4)) nz++;
+                            // keep the first bound texture as a fallback, but prefer the first POPULATED one
+                            if(texSlot<0 || nz){ uint32_t d2=GLD32(0x7FC80000u+(0x4800u+s*6u+2u)*4u);
+                                texBase=ga; texW=(d2&0x1FFFu)+1u; texH=((d2>>13)&0x1FFFu)+1u; texFmt=d1&0x3Fu;
+                                texSlot=(int)s; texPop=(nz>0); } } }
                     bool onScreen = ox>-1.2f && ox<1.2f && oy>-1.2f && oy<1.2f;
-                    fprintf(stderr, "[scene] #%d prim=%u numI=%u World=(%.0f,%.0f) origin→clip=(%.2f,%.2f) %s tex=0x%X %ux%u fmt=0x%X\n",
-                            sk, prim, numInd, Tx, Ty, ox, oy, onScreen?"ON":"off", texBase, texW, texH, texFmt);
+                    fprintf(stderr, "[scene] #%d prim=%u numI=%u World=(%.0f,%.0f) origin→clip=(%.2f,%.2f) %s tex=0x%X slot=%d %s %ux%u fmt=0x%X\n",
+                            sk, prim, numInd, Tx, Ty, ox, oy, onScreen?"ON":"off", texBase, texSlot, texPop?"POPULATED":"empty", texW, texH, texFmt);
                     // one-shot: does the bound texture hold real pixel data (non-zero/varied)? decides whether
                     // texturing the backdrop/sprites shows real art, or the render-to-texture never ran.
                     if (texBase) { static std::atomic<bool> tdmp{false}; bool e=false;
