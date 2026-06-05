@@ -1278,6 +1278,10 @@ thread_local bool tl_execsegs = false;
 // T2b-step-2: per-draw carved geometry accumulated during a REX_EXECSEGS frame (clip-space XY, interleaved),
 // submitted to the render bridge after the exec loop. Touched ONLY on the VdSwap thread under tl_execsegs.
 thread_local std::vector<float> tl_esVerts;
+// Task #8 (REX_MENUTEX): the backdrop quadrants carved as TEXTURED geometry — interleaved pos.xy (clip) +
+// uv.xy (synthetic screen→[0,1]) — submitted to the textured pipeline (disk-loaded background .png) so the
+// backdrop renders as real art instead of debug-colored rects. Same per-frame lifetime as tl_esVerts.
+thread_local std::vector<float> tl_esTexVerts;
 thread_local uint32_t tl_s1cursor = 0;   // REX_SPRITECARVE: byte cursor into the slot-1 vert pool, per frame
 // T2b-step-5: the VS microcode loaded by the most-recent IM_LOAD_IMMEDIATE (op 0x2B) during execution — so a
 // DRAW can decode the VS's OWN vfetch (which fetch slot + dword offset it reads). The sprite/text VS's slot
@@ -1563,9 +1567,22 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                 float x3 = x[0] + x[2] - x[1], y3 = y[0] + y[2] - y[1];
                 auto cx = [](float v){ return v / 640.0f - 1.0f; };
                 auto cy = [](float v){ return v / 360.0f - 1.0f; };
-                const float tri[12] = { cx(x[0]),cy(y[0]), cx(x[1]),cy(y[1]), cx(x[2]),cy(y[2]),
-                                        cx(x[0]),cy(y[0]), cx(x[2]),cy(y[2]), cx(x3),  cy(y3)   };
-                if (tl_esVerts.size() < 60000) tl_esVerts.insert(tl_esVerts.end(), tri, tri + 12);
+                static const bool s_menutex = getenv("REX_MENUTEX") != nullptr;   // Task #8: texture the backdrop
+                if (s_menutex) {
+                    // Emit pos.xy (clip) + uv.xy (synthetic screen→[0,1]: u=x/1280, v=y/720) per vertex. Each
+                    // quadrant samples its own region of the 1280×720 background .png ⇒ the 4 quadrants
+                    // reassemble the full background image. Drawn by PresentOnce via the textured pipeline.
+                    auto u = [](float v){ return v / 1280.0f; };
+                    auto w = [](float v){ return v / 720.0f; };
+                    const float t[24] = {
+                        cx(x[0]),cy(y[0]),u(x[0]),w(y[0]),  cx(x[1]),cy(y[1]),u(x[1]),w(y[1]),  cx(x[2]),cy(y[2]),u(x[2]),w(y[2]),
+                        cx(x[0]),cy(y[0]),u(x[0]),w(y[0]),  cx(x[2]),cy(y[2]),u(x[2]),w(y[2]),  cx(x3),  cy(y3),  u(x3),  w(y3)  };
+                    if (tl_esTexVerts.size() < 120000) tl_esTexVerts.insert(tl_esTexVerts.end(), t, t + 24);
+                } else {
+                    const float tri[12] = { cx(x[0]),cy(y[0]), cx(x[1]),cy(y[1]), cx(x[2]),cy(y[2]),
+                                            cx(x[0]),cy(y[0]), cx(x[2]),cy(y[2]), cx(x3),  cy(y3)   };
+                    if (tl_esVerts.size() < 60000) tl_esVerts.insert(tl_esVerts.end(), tri, tri + 12);
+                }
             }
             // EXPERIMENT (REX_SPRITECARVE): the sprite(prim5)/text(prim13) draws fetch slot 0 (empty); their
             // verts were GENERATED at slot 1 (0xA01FE0FC, cont.22) in UI-authoring coords (~1768x1043). The VS
@@ -2649,6 +2666,7 @@ PPC_FUNC(__imp__VdSwap) {
             int descsFound = 0, segs = 0;
             tl_execsegs = true;   // T2b-step-1: let DRAW_INDX capture each executed draw's live fetch slot-0
             tl_esVerts.clear();   // T2b-step-2: fresh per-frame geometry accumulator
+            tl_esTexVerts.clear();// Task #8: fresh per-frame textured-backdrop accumulator
             tl_s1cursor = 0;      // REX_SPRITECARVE: rescan the slot-1 dense start each frame
             // REX_UITEXT: take this frame's accumulated text snapshots (drain the guest-thread buffer); the
             // prim-13 DRAW handler consumes them by matching count, applying the live reg-0x4000 transform.
@@ -2689,6 +2707,9 @@ PPC_FUNC(__imp__VdSwap) {
             // under REX_MENUTEST via the menu-quad float2 pipeline). Gated by rex_render::Enabled (REX_RENDER).
             if (rex_render::Enabled() && !tl_esVerts.empty())
                 rex_render::SubmitMenuGeometry(tl_esVerts.data(), (int)(tl_esVerts.size() / 2));
+            // Task #8: hand the textured backdrop (pos.xy+uv.xy quadrants) to the textured pipeline.
+            if (rex_render::Enabled() && !tl_esTexVerts.empty())
+                rex_render::SubmitTexturedGeometry(tl_esTexVerts.data(), (int)(tl_esTexVerts.size() / 4));
             uint32_t slot0After = GLD32(0xA2000000u);
             // BUILD step (REX_S1SCAN, one-shot): map the slot-1 (0xA01FE0FC) vert layout — the title generated the
             // sprite/text verts here, but the draws read the (empty) slot 0. Find every dense run of plausible

@@ -22,4 +22,11 @@ void PublishVideo(const uint32_t* guestBufAddrs, const uint32_t* guestBufSizes, 
 // them as a TRIANGLE_LIST via the menu-quad pipeline on the next present. Replaces the REX_MENUTEST
 // hardcoded quads once real geometry arrives. One-shot from the CP at a menu frame for now.
 void SubmitMenuGeometry(const float* clipXY, int vertCount);
+
+// Task #8 (disk-resource path, cont.23): submit TEXTURED menu geometry. `posUV` is `vertCount`
+// interleaved (pos.x, pos.y, u, v) tuples (clip-space position + [0,1] UVs); the render thread draws
+// them as a TRIANGLE_LIST via the textured pipeline, sampling the disk-loaded background .png. Used
+// for the backdrop quadrants — synthetic screen→[0,1] UVs reassemble the full background across them.
+// Gated behind REX_MENUTEX (the renderer must also be in REX_MENUTEST mode for the present path).
+void SubmitTexturedGeometry(const float* posUV, int vertCount);
 }

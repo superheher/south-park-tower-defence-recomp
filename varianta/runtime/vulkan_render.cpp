@@ -99,6 +99,21 @@ VkBuffer              g_texVB        = VK_NULL_HANDLE;   // pos.xy+uv.xy, host-v
 VkDeviceMemory        g_texVBMem     = VK_NULL_HANDLE;
 void*                 g_texVBMap     = nullptr;
 
+// --- Task #8 (disk-resource path): texture the SUBMITTED menu geometry (the backdrop quadrants) -------
+// REX_MENUTEX draws the CP's carved backdrop through the textured pipeline + a disk-loaded background
+// .png (REX_BGTEX=<path>, default media/Assets/Frontend/Graphics/LevelSelectBG.png — 1280x720). The
+// submitted verts carry synthetic screen→[0,1] UVs, so the 4 quadrants reassemble the full background.
+// Requires REX_MENUTEST (shares its present path); the debug menu-quads then draw panels/text on top.
+const bool g_menutex = (getenv("REX_MENUTEX") != nullptr);
+bool                  g_bgLoaded     = false;            // background texture uploaded into g_tex* (once)
+std::mutex            g_texGeomMtx;
+std::vector<float>    g_texGeom;                          // interleaved pos.xy+uv.xy, guarded by g_texGeomMtx
+std::atomic<int>      g_texGeomVerts{0};                  // submitted textured-geometry vertex count
+VkBuffer              g_texGeoVB     = VK_NULL_HANDLE;    // host-visible pos.xy+uv.xy, persistently mapped
+VkDeviceMemory        g_texGeoVBMem  = VK_NULL_HANDLE;
+void*                 g_texGeoVBMap  = nullptr;
+VkDeviceSize          g_texGeoVBCap  = 0;
+
 // In-engine screenshot (REX_RENDER_SHOT=<frame> -> capture that present to /tmp/varianta_shot.ppm).
 // Self-contained: external Wayland capture tools (spectacle/grim/import) don't work here.
 const uint32_t   g_shotTarget = []{ const char* s = getenv("REX_RENDER_SHOT"); return s ? (uint32_t)atoi(s) : 0u; }();
@@ -489,6 +504,25 @@ bool EnsureMenuVB(VkDeviceSize bytes) {
     return true;
 }
 
+// Task #8: host-visible pos.xy+uv.xy vertex buffer for the submitted textured geometry (grows on demand).
+bool EnsureTexGeoVB(VkDeviceSize bytes) {
+    if (g_texGeoVB && g_texGeoVBCap >= bytes) return true;
+    if (g_texGeoVB) { vkDeviceWaitIdle(g_device); vkDestroyBuffer(g_device, g_texGeoVB, nullptr); vkFreeMemory(g_device, g_texGeoVBMem, nullptr); g_texGeoVB = VK_NULL_HANDLE; }
+    VkDeviceSize cap = bytes < 0x10000 ? 0x10000 : bytes;   // min 64 KiB
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = cap; bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VKCHECK(vkCreateBuffer(g_device, &bi, nullptr, &g_texGeoVB));
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_device, g_texGeoVB, &mr);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = FindMemoryType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VKCHECK(vkAllocateMemory(g_device, &ai, nullptr, &g_texGeoVBMem));
+    vkBindBufferMemory(g_device, g_texGeoVB, g_texGeoVBMem, 0);
+    vkMapMemory(g_device, g_texGeoVBMem, 0, cap, 0, &g_texGeoVBMap);
+    g_texGeoVBCap = cap;
+    return true;
+}
+
 bool CreateSwapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     VKCHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_phys, g_surface, &caps));
@@ -534,6 +568,8 @@ bool CreateSwapchain() {
     if (g_drawtest || g_menutest) { CreateRenderPass(); CreateFramebuffers(); }   // GPU build (piece 1 / 3b)
     return true;
 }
+
+bool LoadBackgroundOnce();   // Task #8: defined below (with the PNG loaders); called at the end of Init.
 
 bool Init() {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "[render] SDL_Init: %s\n", SDL_GetError()); return false; }
@@ -597,7 +633,7 @@ bool Init() {
     if (!CreateSwapchain()) return false;
     if (g_drawtest) CreateGraphicsPipeline();   // GPU build (piece 1): render pass already made in CreateSwapchain
     if (g_menutest) CreateMenuPipeline();       // GPU build (piece 3b): the menu-quad pipeline
-    if (g_textest)  CreateTexturedPipeline();   // disk-resource path: the textured UI pipeline
+    if (g_textest || g_menutex) CreateTexturedPipeline();   // disk-resource path: the textured UI pipeline
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -613,6 +649,8 @@ bool Init() {
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     VKCHECK(vkCreateFence(g_device, &fci, nullptr, &g_fence));
+
+    if (g_menutex) LoadBackgroundOnce();   // Task #8: upload the menu background .png (uses g_cmdPool, made above)
 
     fprintf(stderr, "[render] initialised — window + Vulkan up.\n");
     return true;
@@ -721,6 +759,17 @@ bool LoadPNGToTexture(const char* path) {
     return UploadTexture(buf.data(), W, H);
 }
 
+// Task #8: load the menu BACKGROUND .png once (into g_tex* — the textured pipeline's sampled image).
+// REX_BGTEX=<path> overrides; the default is the title's 1280x720 frontend background (cwd = varianta/).
+bool LoadBackgroundOnce() {
+    if (g_bgLoaded) return true;
+    const char* p = getenv("REX_BGTEX");
+    const char* path = p ? p : "../private/extracted/media/Assets/Frontend/Graphics/LevelSelectBG.png";
+    g_bgLoaded = LoadPNGToTexture(path);
+    if (!g_bgLoaded) fprintf(stderr, "[render] disk-resource: background load FAILED (%s) — set REX_BGTEX\n", path);
+    return g_bgLoaded;
+}
+
 void PumpEvents() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -759,6 +808,12 @@ bool PresentOnce() {
             EnsureMenuVB(g_menuGeom.size()*sizeof(float));
             if (g_menuVBMap) memcpy(g_menuVBMap, g_menuGeom.data(), g_menuGeom.size()*sizeof(float));
         } else { EnsureMenuVB(sizeof(quads)); if (g_menuVBMap) memcpy(g_menuVBMap, quads, sizeof(quads)); }
+        // Task #8: upload the submitted TEXTURED geometry (backdrop quadrants, pos.xy+uv.xy) BEFORE the
+        // render pass — EnsureTexGeoVB may recreate the buffer (vkDeviceWaitIdle), unsafe inside a pass.
+        int texVerts = g_menutex ? g_texGeomVerts.load() : 0;
+        if (texVerts >= 3) { std::lock_guard<std::mutex> lk(g_texGeomMtx);
+            EnsureTexGeoVB(g_texGeom.size()*sizeof(float));
+            if (g_texGeoVBMap) memcpy(g_texGeoVBMap, g_texGeom.data(), g_texGeom.size()*sizeof(float)); }
         // disk-resource path (REX_TEXTEST): one-time texture upload + textured-quad VB, BEFORE the render pass
         // (the upload uses its own command buffer + a blocking wait, which must not be nested in g_cmd's pass).
         if (g_textest && g_texPipe && !g_texVB) {
@@ -785,10 +840,22 @@ bool PresentOnce() {
         rp.renderPass = g_renderPass; rp.framebuffer = g_framebuffers[idx];
         rp.renderArea.extent = g_extent; rp.clearValueCount = 1; rp.pClearValues = &cv;
         vkCmdBeginRenderPass(g_cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdBindPipeline(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_menuPipe);
         VkViewport vp{0.0f, 0.0f, (float)g_extent.width, (float)g_extent.height, 0.0f, 1.0f};
         VkRect2D scs{{0, 0}, g_extent};
-        vkCmdSetViewport(g_cmd, 0, 1, &vp); vkCmdSetScissor(g_cmd, 0, 1, &scs);
+        vkCmdSetViewport(g_cmd, 0, 1, &vp); vkCmdSetScissor(g_cmd, 0, 1, &scs);   // dynamic state persists across pipeline binds
+        // Task #8 (disk-resource path): draw the TEXTURED backdrop FIRST (under the UI). The submitted
+        // backdrop quadrants go through the textured pipeline + the disk-loaded background .png; their
+        // synthetic screen→[0,1] UVs reassemble the full 1280×720 background across the 4 quadrants.
+        if (g_menutex && g_texPipe && g_texSet && g_bgLoaded && texVerts >= 3 && g_texGeoVB) {
+            vkCmdBindPipeline(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_texPipe);
+            VkDeviceSize gto = 0; vkCmdBindVertexBuffers(g_cmd, 0, 1, &g_texGeoVB, &gto);
+            vkCmdBindDescriptorSets(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_texLayout, 0, 1, &g_texSet, 0, nullptr);
+            MenuPC gpc{}; for (int i = 0; i < 16; i++) gpc.mvp[i] = (i % 5 == 0) ? 1.0f : 0.0f;   // identity (clip-space verts)
+            gpc.color[0]=gpc.color[1]=gpc.color[2]=gpc.color[3]=1.0f;                              // white tint (texture as-is)
+            vkCmdPushConstants(g_cmd, g_texLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(gpc), &gpc);
+            vkCmdDraw(g_cmd, texVerts, 1, 0, 0);
+        }
+        vkCmdBindPipeline(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_menuPipe);
         VkDeviceSize voff = 0; vkCmdBindVertexBuffers(g_cmd, 0, 1, &g_menuVB, &voff);
         MenuPC pc{}; for (int i = 0; i < 16; i++) pc.mvp[i] = (i % 5 == 0) ? 1.0f : 0.0f;   // identity (verts already clip-space)
         if (subVerts > 0) {                                      // Layer 2: draw the real menu geometry, per-quad colors
@@ -820,9 +887,9 @@ bool PresentOnce() {
         }
         vkCmdEndRenderPass(g_cmd);
         static int s_maxCap = 0;   // capture the RICHEST frame seen (most submitted verts) — steady-state menu
-        bool richer = subVerts > s_maxCap;                       // frames carry 12-30 rects vs the first frame's 4
+        bool richer = (subVerts + texVerts) > s_maxCap;          // incl. Task #8 textured backdrop verts
         bool cap = (g_shotTarget && g_frame == g_shotTarget) || richer;
-        if (richer) s_maxCap = subVerts;
+        if (richer) s_maxCap = subVerts + texVerts;
         if (cap) { EnsureCaptureBuffer();
             if (g_capBuf) {
                 ImageBarrier(g_cmd, g_images[idx], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -1023,6 +1090,15 @@ void SubmitMenuGeometry(const float* clipXY, int vertCount) {
     g_menuGeom.assign(clipXY, clipXY + (size_t)vertCount * 2);
     g_menuGeomVerts.store(vertCount);
     fprintf(stderr, "[render] GPU-build: menu geometry submitted (%d verts)\n", vertCount);
+}
+
+void SubmitTexturedGeometry(const float* posUV, int vertCount) {
+    if (!g_enabled || vertCount <= 0) return;
+    std::lock_guard<std::mutex> lk(g_texGeomMtx);
+    g_texGeom.assign(posUV, posUV + (size_t)vertCount * 4);   // pos.xy + uv.xy per vertex
+    g_texGeomVerts.store(vertCount);
+    static int s_logged = 0;
+    if (s_logged++ < 3) fprintf(stderr, "[render] disk-resource: textured geometry submitted (%d verts)\n", vertCount);
 }
 
 } // namespace rex_render
