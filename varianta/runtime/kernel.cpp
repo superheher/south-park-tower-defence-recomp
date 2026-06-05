@@ -1696,6 +1696,37 @@ PPC_FUNC(sub_821B9270)
     __imp__sub_821B9270(ctx, base);
 }
 
+// DEEP-BUILD experiment (REX_LOADERTRACE): trace the resource-loader per-child state machine sub_82248010.
+// Each call processes ONE state transition (entry *(child+136) -> next). The done-check (loc_8224818C) sets
+// state=DONE (1/12) iff vtable[9]() = *(child+208) is NOT in {2,3}; measured *(child+208)=1, so IF the child
+// reaches the done-check it completes. Logging state-in->out + *(child+208) shows whether it advances to the
+// done-check (state 11) or is reset (->2) by the external re-submitter first. Gated; default boot unchanged.
+extern "C" PPC_FUNC(__imp__sub_82248010);
+PPC_FUNC(sub_82248010)
+{
+    static const bool s_trace = getenv("REX_LOADERTRACE") != nullptr;
+    static const bool s_latch = getenv("REX_LOADERLATCH") != nullptr;
+    uint32_t child = ctx.r3.u32;
+    // REX_LOADERLATCH (decisive test): the child reaches DONE (state 1) but is re-init'd to 2 forever. HOLD it
+    // at done (override the external re-init) — stronger than cont.22's one-shot force-past. If the worker's
+    // poll then exits → loader drains / menu loads, the re-init was spurious; if it still fails, the resource
+    // is genuinely null (deep build). Only the menu loader's child[0] (0x82657578).
+    static std::atomic<uint32_t> g_latched{0};
+    if (s_latch && g_latched.load() == child && child) {
+        if (GLD32(child + 136) != 1) GST32(child + 136, 1);
+    }
+    if (!s_trace && !s_latch) { __imp__sub_82248010(ctx, base); return; }
+    uint32_t stIn = GLD32(child + 136), c208 = GLD32(child + 208);
+    __imp__sub_82248010(ctx, base);
+    uint32_t stOut = GLD32(child + 136);
+    if (s_latch && stOut == 1 && c208 == 1 && child) g_latched.store(child);   // latch on first genuine completion
+    static std::atomic<int> n{0};
+    int k = n.fetch_add(1);
+    if (k < 120 && stIn != stOut)
+        fprintf(stderr, "[ldtrace] #%d child=0x%X state %u->%u c208=%u%s\n", k, child, stIn, stOut, c208,
+                (s_latch && g_latched.load() == child) ? " [latched]" : "");
+}
+
 // ---- Ring-kick instrumentation (sub_821C6600): log the segment descriptor it consumes + the ring delta.
 // The kick reads a 2-dword descriptor at r4 ({d0: low-24 used, d1: segment addr}) and emits an IB packet to
 // the ring (advancing CP_RB_WPTR). Renderer route B needs the per-frame segment [addr,len] list; logging the
