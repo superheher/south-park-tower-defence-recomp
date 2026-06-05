@@ -166,4 +166,58 @@ background `.png` chosen by name, not the EDRAM contents.
 `REX_EXECSEGS` (+[esdraw/esvf/esidx/esprim/esalu/esset/esset2]), `REX_VBFILL` (+[text]),
 `REX_UITEXT`/`REX_UITEXT_FIT` (text geometry), `REX_UITRACE` (VB Lock/Unlock), `REX_SCENE`
 (+[scene-tex]/[atlas] — the texture-empty probe), `REX_POLLDIAG` (+[children] — the loader survey),
-`REX_CHUNKDUMP` census, `REX_CPCOMPLETE`, `REX_DRAWLOG`/`REX_DRAWDECODE`.
+`REX_CHUNKDUMP` census, `REX_CPCOMPLETE`, `REX_DRAWLOG`/`REX_DRAWDECODE`,
+`REX_LOADERPROBE` (cont.25: +[ldprobe/ldsummary/ldframe/asset/bf298] — loader/completion/asset-progression).
+
+---
+
+# cont.25 — RENDERER WALL: complete scene characterization + build sequencing (2026-06-05)
+
+User chose "start the renderer build". The `REX_SCENE` survey of the per-frame executed menu scene
+(`REX_EXECSEGS=3`) gives the authoritative target. **Per frame ~7-8 draws, ALL texture sources empty:**
+
+| draw | prim | numI | World pos | on-screen? | texture |
+|------|------|------|-----------|-----------|---------|
+| sprite | 5 | 4 | (-253,-226) | **off** | `tex=0x0` (none bound) |
+| tri-list | 4 | 6 | (64,36) | **ON** | `tex=0x0` |
+| text | 13 | 252 | (334,866) | **off** | `tex=0x0` |
+| backdrop ×4 | 8 | 3 | (334,866) | off | `tex=0xB0000000` EDRAM **1×1 zeros** |
+
+Font atlas `0xA5004800`/`0xA5004000` = all zeros. ⇒ **THREE distinct stubbed texture-create paths**, none work:
+
+1. **Sprite/UI textures (`tex=0x0`)** — the title binds a NULL texture handle: the inlined-XDK-D3D texture-
+   create (decode a loaded file e.g. `global.bin`/`.xmc` → guest texture mem + a Xenos fetch constant) is
+   stubbed. *Keystone for the rich menu.* Build: find the create (it consumes the loader's read bytes — NOT in
+   the loader state machine sub_82248010, which is pure file I/O; it's in the D3D asset-upload path), model it:
+   allocate guest texture mem, untile/copy the source, write the fetch constant (reg 0x4800+slot*6) so SetTexture
+   binds real data; then the executed draw's fetch constant is non-null → REX_SCENE shows `tex=0x05xxxxxx`.
+2. **Backdrop (EDRAM `0xB0000000`)** — a render-to-EDRAM-target + resolve→texture that never ran (piece 4).
+   cont.24 SIDESTEPPED this with a disk `.png` (LevelSelectBG) — "done" heuristically; real EDRAM RT is its own
+   piece, lower priority (the disk stand-in works).
+3. **Font atlas (`0xA5004800`)** — TTF rasterization (fonts loaded vbc26: southpark/ariblk/Comic.ttf) never
+   populated it. Either the raster uses a stubbed import, or it's gated like the textures. Readable text needs
+   this populated AT THE TITLE'S atlas layout (the prim-13 UVs index it — a host-rasterized atlas won't match
+   unless the layout is replicated). Medium; the glyph→UV mapping is the sub-keystone.
+
+**⚠ NO INCREMENTAL VISIBLE PAYOFF (honest):** the scene is mostly OFF-SCREEN (a pre-menu/loading state, only
+the prim-4 at (64,36) on-screen). Elements position on-screen + menu art loads only when the title ADVANCES,
+which (cont.21 A↔B) needs REAL rendered results. So texturing the current draws alone won't show a "rich menu";
+the title must advance too. This REINFORCES cont.22-24's "massive sustained build, poor /loop fit" — now with a
+corrected target (renderer, not loader). Each of the 3 paths is multi-step; the rich menu needs ≥1 + the advance.
+
+**Recommended sequencing (de-risk the keystone first):**
+- **R0 (keystone investigation): PARTLY ANSWERED (cont.25).** GPU texture MEMORY *is* allocated — `MmAllocate
+  PhysicalMemoryEx` (g_physNext from 0xA0000000) makes 442 blocks incl. texture-sized ones (`sz=0xE1000`≈900KB,
+  `0x44000`≈272KB) in the 0xA4–0xA5xxxxxx range where the atlas (0xA5004800) lives. So the create RUNS (allocates)
+  but the **POPULATE/decode** (loaded bytes → the allocated mem) is stubbed: the atlas is zeros, and the pre-menu
+  sprite draws bind tex=0x0 (no fetch constant) — those off-screen draws may legitimately precede the real
+  textured menu draws (which need the title to ADVANCE). NEXT in R0: hook MmAllocatePhysicalMemoryEx to tag the
+  texture allocations, then find who SHOULD write them (the decode/upload, or the TTF raster for the atlas) — set
+  a write-watchpoint on an allocated texture block to catch the populate path (or confirm it never fires =
+  stubbed). THIS decides "model the upload" (cheap) vs "implement decode" (heavy).
+- **R1:** model the create for ONE texture → REX_SCENE shows a non-null `tex=` for a sprite draw → wire the
+  executed draw to sample it via the existing textured pipeline (g_texPipe + UploadTexture from cont.24, which
+  already decode-and-sample a guest RGBA buffer). First real textured UI draw.
+- **R2:** generalize (texture decode for the Xenos tiled formats — ref Xenia texture_conversion), then the font
+  atlas + the title-advance (A↔B) for the positioned menu.
+- Each step committable + REX_SCENE-verifiable; keep default boot unregressed.
