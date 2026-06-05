@@ -1716,6 +1716,16 @@ PPC_FUNC(sub_82248010)
         if (GLD32(child + 136) != 1) GST32(child + 136, 1);
     }
     if (!s_trace && !s_latch) { __imp__sub_82248010(ctx, base); return; }
+    // One-shot: dump the loader object's vtable — the methods at +8/+20/+24/+32 are the resource sub-ops the
+    // state handlers call (the ones that should CREATE the GPU resource but stub to null); +36 = sub_82105948.
+    static std::atomic<bool> s_vtDumped{false}; bool ev = false;
+    if (s_trace && child && s_vtDumped.compare_exchange_strong(ev, true)) {
+        uint32_t vt = GLD32(child);
+        fprintf(stderr, "[ldvt] child=0x%X vtable=0x%X methods:\n", child, vt);
+        for (int i = 0; i < 20; i++) { uint32_t m = GLD32(vt + i*4);
+            const char* tag = (i*4==8||i*4==20||i*4==24||i*4==32) ? " <-RESOURCE sub-op" : (i*4==36 ? " <-done-check(*(child+208))" : "");
+            fprintf(stderr, "  vtable[%2d] (+%2d) = sub_%08X%s\n", i, i*4, m, tag); }
+    }
     uint32_t stIn = GLD32(child + 136), c208 = GLD32(child + 208);
     __imp__sub_82248010(ctx, base);
     uint32_t stOut = GLD32(child + 136);
