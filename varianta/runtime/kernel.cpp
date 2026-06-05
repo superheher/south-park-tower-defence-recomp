@@ -1468,6 +1468,14 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                     bool onScreen = ox>-1.2f && ox<1.2f && oy>-1.2f && oy<1.2f;
                     fprintf(stderr, "[scene] #%d prim=%u numI=%u World=(%.0f,%.0f) origin→clip=(%.2f,%.2f) %s tex=0x%X\n",
                             sk, prim, numInd, Tx, Ty, ox, oy, onScreen?"ON":"off", texBase);
+                    // one-shot: does the bound texture hold real pixel data (non-zero/varied)? decides whether
+                    // texturing the backdrop/sprites shows real art, or the render-to-texture never ran.
+                    if (texBase) { static std::atomic<bool> tdmp{false}; bool e=false;
+                      if (tdmp.compare_exchange_strong(e,true)) {
+                        uint32_t nz=0,prev=0,varied=0; for(int i=0;i<256;i++){ uint32_t w=GLD32(texBase+i*4); if(w)nz++; if(i&&w!=prev)varied++; prev=w; }
+                        fprintf(stderr,"[scene-tex] base=0x%X first8dw=%08X %08X %08X %08X %08X %08X %08X %08X | nz=%u/256 varied=%u/255\n",
+                                texBase, GLD32(texBase),GLD32(texBase+4),GLD32(texBase+8),GLD32(texBase+12),GLD32(texBase+16),GLD32(texBase+20),GLD32(texBase+24),GLD32(texBase+28), nz, varied); }
+                    }
                 }
             }
             // T2b-step-6 (REX_UITX): the prim-13 text / prim-5 sprite UI draws read LOCAL-space verts from slot-1
