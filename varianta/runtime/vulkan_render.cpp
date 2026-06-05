@@ -10,6 +10,7 @@
 #include "test_shaders.h"   // GPU-build piece 1: embedded SPIR-V for the test-triangle pipeline
 #include "menu_shaders.h"   // GPU-build piece 3b: float2-position menu-quad pipeline (mvp/color push const)
 #include "menutex_shaders.h" // disk-resource path (cont.23): textured UI pipeline (pos.xy+uv.xy + sampler2D)
+#include <png.h>            // disk-resource path: decode media/Assets/*.png menu art (libpng simplified API)
 #include <vulkan/vulkan.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
@@ -705,6 +706,21 @@ bool CreateTestTexture() {   // REX_TEXTEST: a 64x64 magenta/cyan checker to val
     return UploadTexture(px, W, H);
 }
 
+// Disk-resource path: decode a real .png (media/Assets/*.png) -> RGBA -> texture, via libpng's simplified API.
+bool LoadPNGToTexture(const char* path) {
+    if (g_texImg) return true;
+    if (!g_texSetLayout) return false;
+    png_image img; memset(&img, 0, sizeof(img)); img.version = PNG_IMAGE_VERSION;
+    if (!png_image_begin_read_from_file(&img, path)) { fprintf(stderr, "[render] PNG open failed: %s\n", path); return false; }
+    img.format = PNG_FORMAT_RGBA;
+    std::vector<uint8_t> buf(PNG_IMAGE_SIZE(img));
+    if (!png_image_finish_read(&img, nullptr, buf.data(), 0, nullptr)) {
+        fprintf(stderr, "[render] PNG decode failed: %s\n", path); png_image_free(&img); return false; }
+    uint32_t W = img.width, H = img.height; png_image_free(&img);
+    fprintf(stderr, "[render] disk-resource: loaded PNG %s (%ux%u)\n", path, W, H);
+    return UploadTexture(buf.data(), W, H);
+}
+
 void PumpEvents() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -746,7 +762,8 @@ bool PresentOnce() {
         // disk-resource path (REX_TEXTEST): one-time texture upload + textured-quad VB, BEFORE the render pass
         // (the upload uses its own command buffer + a blocking wait, which must not be nested in g_cmd's pass).
         if (g_textest && g_texPipe && !g_texVB) {
-            if (CreateTestTexture()) {
+            const char* texfile = getenv("REX_TEXFILE");   // a real .png to load; else the procedural checker
+            if (texfile ? LoadPNGToTexture(texfile) : CreateTestTexture()) {
                 static const float tq[] = {                          // pos.xy + uv.xy, 2 tris, clip-space quad
                     0.1f,0.1f, 0.0f,0.0f,  0.9f,0.1f, 1.0f,0.0f,  0.9f,0.9f, 1.0f,1.0f,
                     0.1f,0.1f, 0.0f,0.0f,  0.9f,0.9f, 1.0f,1.0f,  0.1f,0.9f, 0.0f,1.0f };

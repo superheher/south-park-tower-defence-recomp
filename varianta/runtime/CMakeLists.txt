@@ -46,4 +46,5 @@ target_link_libraries(sp_td_varianta PRIVATE
     "${XR_BUILD}/thirdparty/fmt/libfmt.a"
     Threads::Threads
     Vulkan::Vulkan
-    ${SDL2_LIBRARIES})
+    ${SDL2_LIBRARIES}
+    png)   # disk-resource path (cont.23): decode media/Assets/*.png menu art -> textures
