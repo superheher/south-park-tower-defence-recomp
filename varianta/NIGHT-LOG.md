@@ -2993,3 +2993,20 @@ sub_8224F918 once the real burst is processed) so the work-loop drains the curre
 sub_8211BE68 do its real work then return cleanly (cleaner than skipping it). NEXT: test (b) — cap the loop /
 limit re-queue, run + REX_EXECSEGS, check for a STABLE advance (no nulls/crash) + whether new render content
 appears. No code change this iter (RE + bt only). Commits pending (NOT pushed).
+
+**cont.25 /loop R2 — NO SHORTCUT to a clean advance (definitive).** sub_8224F918 (the loader driver) sets up a
+child (stores state+136/src+160/size+168) + calls sub_82247E70 (the spin loop) and sub_822481E0 (the R0 worker
+poll `while(*(child+136)∉{1,12})`). Tested two completion PROXIES to drain the loop without the blunt skip:
+(1) **REX_LOADERLATCH** (hold child[0] at state 1) — latch FIRES (`[ldtrace] state 3->1 [latched]`) but the title
+does NOT advance (65 assets) ⇒ the work-loop's re-queue isn't gated on child[0]'s state. (2) **REX_CPDRAIN**
+(drain the pending-GPU-work counter device+0x2b04 FULLY to 0 each vblank, vs CPCOMPLETE's −1) — also does NOT
+advance (65 assets) ⇒ not gated on that counter either (note: atlas 0xA5004800 got a tiny 0x00000002 header under
+CPDRAIN, still no pixels). ⇒ **the loop's re-queue is gated on a REAL resource-completion that no simple proxy
+(state-latch, counter-drain, and per cont.22 fence-forward/force-state) satisfies — only the actual GPU resource-
+create.** DEFINITIVE (every shortcut exhausted): the clean advance needs the deep GPU-resource-create build; only
+the BLUNT REX_FORCEBE68 skip "advances" (skipping the loop, leaving nulls). ⇒ /loop has reached the structural
+limit the plan predicted ("poor /loop fit"): breakthrough ACHIEVED (title CAN advance; sub_8211BE68 is the gate)
++ the wall EXHAUSTIVELY mapped (textures R0/R1 + advance gate all converge on the GPU-resource-create completion).
+Remaining = that deep multi-session build (model the per-item create-completion the loader checks — RE
+sub_822490D0's done-vs-requeue condition + the GPU resource it represents). New gated diags REX_CPDRAIN,
+REX_ITEMSPIN, REX_LOADERLATCH. Default boot unaffected. Commits pending (NOT pushed).

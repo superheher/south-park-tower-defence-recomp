@@ -1888,10 +1888,16 @@ void VblankPump() {
         static const bool s_cpcomplete = getenv("REX_CPCOMPLETE") != nullptr;
         if (s_cpcomplete && g_interruptData) {
             uint32_t c = GLD32(g_interruptData + 0x2b04);
+            // REX_CPDRAIN (cont.25): drain the pending-GPU-work counter FULLY (to 0) each vblank instead of −1.
+            // The counter climbs ~7-8/vblank but CPCOMPLETE drains 1/vblank → it never reaches 0, so the loader
+            // work-loop (sub_82247E70) keeps seeing "GPU work pending" and re-queues forever (the advance gate).
+            // Test: does modeling "GPU caught up" (counter=0) drain the loop + advance the title CLEANLY?
+            static const bool s_cpdrain = getenv("REX_CPDRAIN") != nullptr;
             if (c > 0) {
-                GST32(g_interruptData + 0x2b04, c - 1);
+                uint32_t nc = s_cpdrain ? 0 : c - 1;
+                GST32(g_interruptData + 0x2b04, nc);
                 if (g_ktrace) { static int dn = 0; if (dn++ < 40)
-                    fprintf(stderr, "[cpcomplete] device+0x2b04 %u->%u (modeled GPU completion)\n", c, c - 1); }
+                    fprintf(stderr, "[cpcomplete] device+0x2b04 %u->%u (modeled GPU completion)\n", c, nc); }
             }
         }
         // REX_PUMPCB (cont.17 fix attempt): drive the render producer/consumer from the PUMP context (its
