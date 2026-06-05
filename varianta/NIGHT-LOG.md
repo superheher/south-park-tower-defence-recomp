@@ -2754,6 +2754,21 @@ Surveyed the executed scene + probed its textures — and re-grounded the whole 
 - **`[scene-tex]`/`[atlas]` (texture probes):** the backdrop's EDRAM texture `0xB0000000` is **ALL ZEROS** (nz=0/256), AND the STATIC font/sprite atlas `0xA5004800` is **ALL ZEROS** too. ⇒ **EVERY UI texture is empty in variant A** — the texture LOADING/upload never completed.
 - **⭐ RE-GROUNDING (honest, measured):** the geometry render path is **PROVEN** (backdrop quads + panels + text glyph-cells render via the debug menu-quad pipeline) — but it has **no textures to draw**, because the resource loader is stuck (the **cont.22** finding, now RECONFIRMED from the rendering side: textures never load). **The render path is NOT the blocker; the loader/GPU-resource-completion is.** variant A's Vulkan is present-only (no real PM4→Vulkan render-target/texture-decode renderer); a textured, recognizable menu is gated on the deep **cont.22 loader build** (resource-creation/GPU-completion), not on more rendering work. ⇒ **the session's rendering exploration has reached its useful conclusion** (geometry path done; the wall is the loader). The remaining cont.22 levers stand: sub_82248010 state-10→done gate, sub_8214FFD0/sub_8224F918 re-request, + the real GPU resource-creation (texture decode/upload, shader compile) that makes the loader's resources non-null. Default boot UNREGRESSED. Gated diags: REX_SCENE + [scene-tex]/[atlas].
 
+### cont.23 /loop — ⭐ REAL GAME ART RENDERS from disk (.png via libpng) — disk-resource path validated end-to-end (commit 5aedc7c)
+Added PNG decode (libpng simplified API, linked via CMakeLists) → `LoadPNGToTexture`: a `media/Assets/*.png`
+→ RGBA → `UploadTexture`. `REX_TEXFILE=<path>` selects a real `.png` (else the checker). **RESULT: REX_TEXTEST
++ REX_TEXFILE=.../SouthParkBanner.png renders the ACTUAL game banner** ("SOUTH PARK — LET'S GO TOWER DEFENSE
+PLAY!", Cartman/logo) on the textured quad, via the real `.updb`-derived SPTextured shader (PPM verified, image
+sent). ⇒ **the disk-resource path is fully validated: `.png` → libpng → VkImage → textured pipeline → present =
+variant A renders the game's real art assets, bypassing the stuck loader.** Default boot UNREGRESSED.
+- ⚠ **Text is blocked on this path:** the Fonts dir has TTFs (ariblk/comic/southpark.ttf), NOT a font-atlas
+  `.png` — the title runtime-rasterizes the atlas (0xA5004800, empty due to the loader), so the captured glyph
+  UVs have no disk equivalent (can't align a self-rasterized font to the title's atlas layout).
+- ⭐NEXT (task #8): texture the actual menu GEOMETRY — UV plumbing (a `SubmitTexturedGeometry(clipXY,uv)` bridge
+  + the textured pipeline for submitted geometry) + map draws→art: backdrop quadrants → a background `.png` with
+  synthetic per-quadrant UVs (screen-pos→[0,1]); sprites → UI atlas `.png`. This is the path to a recognizable
+  textured backdrop. (Mapping has uncertainty — runtime-composed EDRAM backdrop, runtime sprite atlases.)
+
 ### cont.23 /loop — ⭐ TEXTURED PIPELINE WORKS (real .updb shader, UV-correct) — disk-resource path core proven (commit 634e013)
 Built + validated the textured UI Vulkan pipeline (task #8). `CreateTexturedPipeline`: descriptor-set layout
 (combined image sampler, set0/binding0) + pos.xy+uv.xy vertex input (stride 16) + {mvp,color} push const +
