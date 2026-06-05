@@ -2822,3 +2822,67 @@ instead of waiting for the loader:
 ### cont.23 /loop — loader 20-child survey + the sustained-build conclusion (commit a75d1c6)
 - **`[children]` (REX_POLLDIAG 20-child survey, child[i]=0x82657578+i*216):** at the loader's active poll, **child[0]=state 2 (processing), children[1..19]=state 0 (not started).** ⇒ the loader runs children SEQUENTIALLY; child[0] never completes (cycles 2→3→6→8→10, null resource) → the other 19 never begin. cont.22's child[0] focus was correct; it's the SINGLE sequential blocker.
 - **⇒ CONCLUSION (both sides agree):** rendering-side (textures empty) + loader-side (child[0] stuck on a null resource) both point to ONE wall: **child[0]'s GPU resource-create**, which cont.22 established is inlined XDK-D3D submitting create-PM4 + waiting on a GPU completion variant A's CP never produces — and cont.22 PROVED fakes fail (force-state/latch/fence-forward; the title needs the REAL resource). The full chain: rich/textured menu → real GPU resources → the GPU-resource subsystem (Xenos tiled-texture decode + .xbv→SPIR-V shader translation [ref: Plume / the 19 .updb] + EDRAM render-targets + resolves + real CP completion) modeled in ExecutePM4. **No shortcut exists.** This is a massive, sustained, deliberate build with no quick visible payoff — exactly cont.22's "poor /loop fit" verdict, now re-confirmed exhaustively from every angle this session. ⇒ further fast /loop diagnostics re-tread cont.22; the deep build needs a focused sustained effort (or a debug prod-oracle build to cross-check), per cont.22's standing recommendation. The autonomous /loop has DELIVERED its value: corrected BREAKTHROUGH-2, the text-geometry render, and this complete, two-sided characterization of the wall.
+
+---
+
+## cont.25 (2026-06-05, /loop "Deep loader/GPU-resource-creation build") — RE-GROUNDING: the loader is NOT the wall; the renderer is
+
+User chose option (1) from the cont.24 pause (the deep build). Before building, I measured the loader/completion
+machinery from scratch (the project's rigor rule). The measurement **corrects the cont.23-24 "child[0] stuck
+looping, produces a null resource" framing.** New gated diag `REX_LOADERPROBE` (kernel.cpp), run-base
+`REX_NOTOKEN=1 REX_CSLEAK=1 REX_CPCOMPLETE=1 REX_MOVIE_EOF=30`, default boot unregressed (18s clean, exit124).
+
+**1. Loader state machine sub_82248010 (ppc_recomp.29:1231) FULLY DECODED.** state @child+136; dispatch
+`switch(state-2)`: 2→vtable[5]=sub_822484D0; 4/5/6→vtable[6]=sub_822484E0; **8→vtable[2]=sub_822485A0 (FILE
+READ:** reads src=*(child+160), size=*(child+168), calls *(child+0)→vtable[3], sets ready *(child+208)=1);
+9→vtable[8]=sub_822485E8; 3/6/7/10/11→done-check vtable[9]. **The done-check sub_82105948 is TRIVIAL:
+`return *(child+208)`** (the ready flag) — returns 2⇒pending(stay), 3⇒state12, else⇒state1 + finalize
+(`*(child+152) += *(child+168)`, the dest cursor).
+
+**2. child[0]=0x82657578 is an IDLE on-demand loader, NOT a stuck loop.** [ldprobe] (per-completion dump):
+child[0] reads DISTINCT resources into scratch 0x02E94610 — sizes 0x23DA, 0x506ED, **0x264=612=Simple.xbv**,
+0x174, 0x1427, 0x15C7, 0x62, … — each completing ready=1. [ldframe] (time-based survey on the vblank pump):
+child[0] sits at **state 0 / ready=1 most frames**, occasional state-8 loads; an early BURST of ~50+ completions
+(~0-14s) then quiet. children[1..19] never leave state 0 (likely a RED HERRING — for other game states, not the
+menu). ⇒ the cont.23-24 "cycles 2→3→6→8→10 forever / null resource" was the **WORKER-POLL snapshot view**
+(worker sub_822481E0 polls child+136 for {1,12} at KeDelay(10) granularity and rarely catches the transient
+done; the state machine DOES reach state 1 — [ldtrace] "3→1","10→1").
+
+**3. Asset-progression map ([asset] = timestamped NtCreateFile, 65 opens):** boot (default.xex, ArcadeLogo.ptc,
+audio xgs, UI.xzp) → StringsId.lua/strings.bin → 3 fonts → **ALL ~19 shaders** (Simple, SpTextured,
+SPBackdrop{,Un}Textured, SpMovie, SPHud*, SpDropShadow, SimpleCol, …) → **intro movie sp_xbox_0_intro.wmv**
+(vbc538) + audio banks + Lua scripts → global assets (lipsynctextures, phonemes, lipsyncanims, subtitles,
+moviesubtitles, AnimTags, Animblock) → **Scrapbook Stickers.xmc + global/textures/global.bin** (vbc~864 ≈14s) →
+**STOPS** (no further opens for the rest of a 44s run). **NO menu-screen art is EVER requested by the title**
+(LevelSelectBG etc. — cont.24's textured backdrop loaded that png from DISK directly, not via the title).
+
+**4. Title is NOT deadlocked — stable frontend render loop.** Main-thread gdb bt at steady state (~20s):
+`main→_xstart→sub_82249638→sub_82249678→sub_82249970→sub_82249AD0→sub_82150970(FRONTEND, per cont.22)
+→sub_821BF298→sub_821C2388`; also caught in `sub_82200180→sub_822050B8→sub_821C48B0(dyn-VB alloc→0xA022FFF0)
+→sub_821D6AC8→sub_821D66E8→sub_8242BF10(memcpy)` = actively filling UI vertex buffers each frame.
+**sub_821BF298 (ppc_recomp.16:10344) = the GPU-completion/work-queue drain:** reads completion obj
+device+10896(0x2A90); if arg2 r4≠0 AND count *(dev+12924)>0, iterates `count` work items at dev+12928 (stride
+16) calling handler vtable[9] of *(dev+12900). [bf298] probe: **count=4 items/frame, r4≠0, item0=`[0,0,0x280,
+0x168]` (0x280×0x168 = 640×360 = the EDRAM tile), IDENTICAL frame #0 → #16000.** ⇒ the completion drain RUNS
+FINE (not empty, not blocked) — the title renders a stable untextured state and simply never advances.
+
+**5. Input RULED OUT.** REX_SKIPINTRO (injects START+A via XamInputGetState) → SAME 65 assets (just faster,
+global.bin vbc560 vs 864) → same stall. Not waiting for a controller.
+
+**6. Secondary bug (NOT the wall):** at ~vbc1530 (~24s) child[0]'s array (0x82657578) is overwritten with path
+strings ("game"/"Glob(al)"/"\Meshes\…") — the known string-write class (lr=0x82204D08). The asset-stop is at
+~14s, BEFORE this ⇒ the corruption doesn't cause the no-advance; likely the 45-50s SIGSEGV precursor (FOUND, not
+root-caused — a stability-pass item, watchpoint the store).
+
+**⇒ MEASURED CONCLUSION (supersedes the cont.23-24 loader framing).** Loader file-read AND the frontend
+completion-drain both WORK. The wall to the rich menu is the **missing RENDERER**: variant A has NO Xenos
+texture-decode/create, NO real draw-state→VkPipeline, and the inlined XDK-D3D bind+draw+texture-create was
+**stubbed by the recomp** (the cont.24 "tex=0x0 / no per-draw binding" is recomp-stubbed, NOT loader-gated). The
+title gates its advance on SEEING real rendered results (cont.21's "A↔B coupling"), which variant A can't
+produce. **The build = GPU-RESOURCE-BUILD-PLAN pieces 2–5 / cont.21 PILLAR B (Xenos texture decode + .xbv→SPIR-V
++ real draw translation + reconstruct the D3D render path), NOT the loader "STEP 0"** — STEP 0 was mis-aimed at
+child[0], which completes fine. ⚠ Honest open Q (NOT asserting): whether faithful GPU completion ALONE advances
+the title or it needs real pixels — cont.21 says the latter (build A+B together). This /loop's value: a fresh,
+rigorous re-grounding that redirects the effort from a phantom "loader unblock" to the real renderer build, with
+a complete asset map + the exact frontend stall chain. Diag retained (gated, default-safe): `REX_LOADERPROBE`
+([ldprobe]/[ldsummary]/[ldframe]/[asset]/[bf298]) + the sub_821BF298 hook. Commit pending (NOT pushed).

@@ -1,3 +1,16 @@
+> ⚠️ **cont.25 CORRECTION (2026-06-05) — read first.** Fresh measurement (REX_LOADERPROBE; NIGHT-LOG "cont.25")
+> shows the loader is **NOT** the wall and **STEP 0 below is mis-aimed.** child[0] (`sub_82248010`) reads files
+> fine and is idle on-demand (done-check `sub_82105948` = `return *(child+208)`=ready; it completes, ready=1, on
+> distinct resources incl. Simple.xbv); the "cycles 2→3→6→8→10 / null resource" was a worker-poll snapshot. The
+> frontend is **not deadlocked** — it runs a stable render loop (`sub_82150970→sub_821BF298`), and that GPU-
+> completion drain processes count=4 items/frame steadily (`device+10896`/`+12924`), not an empty/blocked queue.
+> The title loads 65 assets (ending `global.bin` ~14s) then renders a **stable untextured menu/attract** and
+> never advances; input is ruled out (REX_SKIPINTRO no-op). **⇒ the real build is pieces 2–5 below (texture
+> decode + .xbv→SPIR-V + EDRAM + real draw/bind translation = cont.21 PILLAR B), reconstructing the recomp-
+> stubbed inlined-D3D bind+draw+texture-create — NOT a loader unblock.** Pieces 1/STEP-0 (loader create-
+> completion) are deprioritized: the loader already completes. The "wall" sections below describe the loader as
+> stuck — that is the corrected framing; treat pieces 2–5 + the cont.21 A↔B coupling as the plan.
+
 # Variant A — GPU-Resource Subsystem: build plan (cont.23, 2026-06-05)
 
 The authoritative, current plan for the remaining deep build. **Supersedes** the cont.13–19

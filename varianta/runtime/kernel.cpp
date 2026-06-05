@@ -1776,7 +1776,22 @@ void VblankPump() {
     uint32_t lastWptr = 0;
     while (g_vblankRunning.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(16));   // ~60 Hz
-        g_vblankCount.fetch_add(1);
+        uint32_t vbc = g_vblankCount.fetch_add(1);
+        // REX_LOADERPROBE time-based survey: the loader does an early burst of completions then goes quiet,
+        // so a completion-gated survey misses the steady state. Sample on the pump thread every ~300 frames
+        // (~5 s) — the 20-children states + the UI texture targets — to see whether the loader EVER drains
+        // (children[1..19] start) / the atlas/EDRAM get populated, vs. stays parked at child[0] forever.
+        static const bool s_ldframe = getenv("REX_LOADERPROBE") != nullptr;
+        if (s_ldframe && (vbc % 300) == 30) {
+            auto rd = [&](uint32_t a){ uint32_t b; memcpy(&b, g_base + a, 4); return __builtin_bswap32(b); };
+            char buf[760]; size_t o = 0; int started = 0;
+            for (int i = 0; i < 20; i++) { uint32_t c = 0x82657578u + i*216u, cs = rd(c+136), cr = rd(c+208);
+                if (cs || cr) started++;
+                o += snprintf(buf+o, sizeof(buf)-o, " [%d]s%u/r%u", i, cs, cr); }
+            fprintf(stderr, "[ldframe] vbc=%u childrenStarted=%d/20 ch0(+136)=%u ch0(+152)=0x%X ch0(+160)=0x%X | atlasA5004800=%08X edramB0000000=%08X |%s\n",
+                    vbc, started, rd(0x82657578u+136), rd(0x82657578u+152), rd(0x82657578u+160),
+                    rd(0xA5004800u), rd(0xB0000000u), buf);
+        }
         uint32_t cb = g_interruptCallback;
         if (!cb) continue;
         if (g_fair && getenv("REX_INITDIAG")) { static int d=0; if ((d++ % 30)==0)
@@ -1884,6 +1899,27 @@ PPC_FUNC(sub_821B9270)
     __imp__sub_821B9270(ctx, base);
 }
 
+// DEEP-BUILD (REX_LOADERPROBE): the stalled frontend (sub_82150970) calls sub_821BF298 every frame — it
+// processes *(device+12924) GPU-completion work items at device+12928 (stride 16), calling each item's
+// handler (vtable[9] of *(device+12900)), but ONLY if arg2 r4!=0 AND the count>0; else it no-ops. If the
+// count (or r4) stays 0 at steady state, the frontend's completion drain is EMPTY — confirming the gate is
+// "no real GPU completions enqueued" (the deep build), and giving the exact fields to populate to unblock.
+extern "C" PPC_FUNC(__imp__sub_821BF298);
+PPC_FUNC(sub_821BF298)
+{
+    static const bool s_lp = getenv("REX_LOADERPROBE") != nullptr;
+    if (s_lp) {
+        static std::atomic<int> n{0}; int k = n.fetch_add(1);
+        if (k < 24 || (k % 4000) == 0) {
+            uint32_t dev = ctx.r3.u32, r4 = ctx.r4.u32;
+            fprintf(stderr, "[bf298] #%d dev=0x%08X arg2(r4)=0x%X *(dev+10896)=0x%08X count(dev+12924)=%u item0=[%08X %08X %08X %08X]\n",
+                    k, dev, r4, GLD32(dev+10896), GLD32(dev+12924),
+                    GLD32(dev+12928), GLD32(dev+12932), GLD32(dev+12936), GLD32(dev+12940));
+        }
+    }
+    __imp__sub_821BF298(ctx, base);
+}
+
 // DEEP-BUILD experiment (REX_LOADERTRACE): trace the resource-loader per-child state machine sub_82248010.
 // Each call processes ONE state transition (entry *(child+136) -> next). The done-check (loc_8224818C) sets
 // state=DONE (1/12) iff vtable[9]() = *(child+208) is NOT in {2,3}; measured *(child+208)=1, so IF the child
@@ -1978,6 +2014,13 @@ PPC_FUNC(sub_82248010)
 {
     static const bool s_trace = getenv("REX_LOADERTRACE") != nullptr;
     static const bool s_latch = getenv("REX_LOADERLATCH") != nullptr;
+    // REX_LOADERPROBE (deep build, STEP-0 prep): child[0] (0x82657578) is a STREAMING loader — state-8
+    // sub_822485A0 reads a chunk [src=*(child+160), size=*(child+168)] (calls its vtable[3]) and sets
+    // ready=*(child+208)=1; the state-10/11 finalize advances the DEST cursor *(child+152) += *(child+168).
+    // It reaches state 1 per chunk then is re-driven for the next. DECISIVE: does the dest cursor +152
+    // ADVANCE (real progress — the load will finish, then child[1..19] start) or STICK (re-reading one chunk
+    // forever — the genuine wall)? Dump child[0]'s field window on each fresh completion. Gated, default-off.
+    static const bool s_probe = getenv("REX_LOADERPROBE") != nullptr;
     uint32_t child = ctx.r3.u32;
     // REX_LOADERLATCH (decisive test): the child reaches DONE (state 1) but is re-init'd to 2 forever. HOLD it
     // at done (override the external re-init) — stronger than cont.22's one-shot force-past. If the worker's
@@ -1987,7 +2030,7 @@ PPC_FUNC(sub_82248010)
     if (s_latch && g_latched.load() == child && child) {
         if (GLD32(child + 136) != 1) GST32(child + 136, 1);
     }
-    if (!s_trace && !s_latch) { __imp__sub_82248010(ctx, base); return; }
+    if (!s_trace && !s_latch && !s_probe) { __imp__sub_82248010(ctx, base); return; }
     // One-shot: dump the loader object's vtable — the methods at +8/+20/+24/+32 are the resource sub-ops the
     // state handlers call (the ones that should CREATE the GPU resource but stub to null); +36 = sub_82105948.
     static std::atomic<bool> s_vtDumped{false}; bool ev = false;
@@ -2001,6 +2044,31 @@ PPC_FUNC(sub_82248010)
     uint32_t stIn = GLD32(child + 136), c208 = GLD32(child + 208);
     __imp__sub_82248010(ctx, base);
     uint32_t stOut = GLD32(child + 136);
+    if (s_probe && child == 0x82657578u && stOut == 1 && stIn != 1) {
+        static std::atomic<int> cn{0}; int k = cn.fetch_add(1);
+        static uint64_t prev152 = 0;
+        auto rd64 = [&](uint32_t a){ return ((uint64_t)GLD32(a) << 32) | GLD32(a + 4); };
+        uint64_t c152 = rd64(child + 152), c168 = rd64(child + 168);
+        if (k < 64) fprintf(stderr, "[ldprobe] #%d cmpl via state%u: +144=0x%08X dst+152=0x%llX (Δ=0x%llX) src+160=0x%08X size+168=0x%llX +176=0x%08X +200=0x%08X rdy+208=%u\n",
+            k, stIn, GLD32(child + 144), (unsigned long long)c152, (unsigned long long)(c152 - prev152),
+            GLD32(child + 160), (unsigned long long)c168, GLD32(child + 176), GLD32(child + 200), GLD32(child + 208));
+        prev152 = c152;
+        // Periodic decisive summary: do children[1..19] ever START (loader progressing past child[0]), and do
+        // the UI texture targets (font atlas 0xA5004800 / EDRAM backdrop 0xB0000000) ever get NON-ZERO data
+        // while the loader runs? If children stay at 0 AND the atlas/EDRAM stay zero AND completions keep
+        // climbing, the loader is LOOPING a fixed list whose uploads never reach the GPU targets (the wall).
+        if ((k % 4000) == 50) {
+            static std::mutex sm; std::lock_guard<std::mutex> lk(sm);
+            char buf[760]; size_t o = 0; int started = 0;
+            for (int i = 0; i < 20; i++) { uint32_t c = 0x82657578u + i*216u, cs = GLD32(c+136), cr = GLD32(c+208);
+                if (cs || cr) started++;
+                o += snprintf(buf+o, sizeof(buf)-o, " [%d]s%u/r%u", i, cs, cr); }
+            // sample the texture targets at a few offsets (the upload would write here)
+            uint32_t a0 = GLD32(0xA5004800u), a1 = GLD32(0xA5004804u), e0 = GLD32(0xB0000000u), e1 = GLD32(0xB0001000u);
+            fprintf(stderr, "[ldsummary] cmpls=%d childrenStarted=%d/20 | atlas@A5004800=%08X %08X edram@B0000000=%08X %08X |%s\n",
+                    k, started, a0, a1, e0, e1, buf);
+        }
+    }
     if (s_latch && stOut == 1 && c208 == 1 && child) g_latched.store(child);   // latch on first genuine completion
     static std::atomic<int> n{0};
     int k = n.fetch_add(1);
@@ -3298,6 +3366,12 @@ PPC_FUNC(__imp__NtCreateFile)
     std::string host = TranslatePath(path);
     FILE* f = path.empty() ? nullptr : fopen(host.c_str(), "rb");
     KTRACE("NtCreateFile('%s' -> '%s') %s\n", path.c_str(), host.c_str(), f ? "OK" : "MISS");
+    // REX_LOADERPROBE: timestamped asset-open trace — reveals the title's STATE PROGRESSION over time
+    // (frontend assets early vs gameplay assets later) to distinguish "looping a fixed set" from "advancing".
+    if (getenv("REX_LOADERPROBE") && !path.empty()) {
+        static std::atomic<int> fn{0}; int k = fn.fetch_add(1);
+        if (k < 400) fprintf(stderr, "[asset] #%d vbc=%u %s '%s'\n", k, g_vblankCount.load(), f ? "OK" : "MISS", path.c_str());
+    }
     if (!f) {
         if (pHandle) PPC_STORE_U32(pHandle, 0);
         if (ioStatus) { PPC_STORE_U32(ioStatus + 0, 0xC0000034u); PPC_STORE_U32(ioStatus + 4, 0); }
