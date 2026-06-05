@@ -2351,7 +2351,23 @@ PPC_FUNC(sub_8211BD60) {
 // All operate on the global *(0x828F2D34). The one that ENTERs but never RETs (longjmps to the tail) is it.
 #define ADV_HOOK(FN, SITE) extern "C" PPC_FUNC(__imp__##FN); PPC_FUNC(FN) { \
     uint32_t _lr = ctx.lr; AdvLog(_lr, SITE, #FN, "ENTER"); __imp__##FN(ctx, base); AdvLog(_lr, SITE, #FN, "RET"); }
-ADV_HOOK(sub_8211BE68, 0x8211B894u)
+// sub_8211BE68 manual hook: it's the divert (ENTERs from sub_8211B740@0x8211B894 but never RETurns — stuck in
+// a non-terminating resource-load loop). REX_FORCEBE68 = breakthrough test: skip it (return success) ONLY when
+// called from sub_8211B740, so sub_8211B740 continues to the sub_8210AF90 dispatch → transitions enable. Then
+// watch (REX_INITDIAG/REX_LOADERPROBE) whether the title ADVANCES (sub_8210AF90 runs, new menu assets requested)
+// or hits the next blocker. Tests whether the advance machinery works downstream of this load.
+extern "C" PPC_FUNC(__imp__sub_8211BE68);
+PPC_FUNC(sub_8211BE68) {
+    uint32_t _lr = ctx.lr;
+    static const bool force = getenv("REX_FORCEBE68") != nullptr;
+    if (force && _lr == 0x8211B894u) {
+        static std::atomic<bool> once{false}; bool e=false;
+        if (once.compare_exchange_strong(e,true)) fprintf(stderr, "[forcebe68] SKIPPING sub_8211BE68 @0x8211B894 — testing if the title then advances\n");
+        ctx.r3.u64 = 0;
+        return;
+    }
+    AdvLog(_lr, 0x8211B894u, "sub_8211BE68", "ENTER"); __imp__sub_8211BE68(ctx, base); AdvLog(_lr, 0x8211B894u, "sub_8211BE68", "RET");
+}
 ADV_HOOK(sub_8211D160, 0x8211B8A4u)
 ADV_HOOK(sub_8211DB78, 0x8211B8B0u)
 ADV_HOOK(sub_8211DD18, 0x8211B8BCu)

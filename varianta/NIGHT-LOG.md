@@ -2957,3 +2957,20 @@ loader to complete, which needs the GPU resource created. NEXT (R2 cont.): trace
 is loading + what its completion waits on (the specific resource + its GPU-create / fence dependency) — the same
 loader/GPU-create wall, now with a concrete entry point (sub_8211BE68/sub_822487C8). New hooks under REX_ADVGATE.
 Default boot unaffected. Commits pending (NOT pushed).
+
+**cont.25 /loop R2 — ⭐ BREAKTHROUGH: sub_8211BE68 IS the advance gate; forcing it to skip ADVANCES the title.**
+sub_822487C8/sub_82448158/sub_8244FE80 are short non-looping memcpy-chain fns ⇒ the non-terminating loop is in
+sub_8211BE68's indirect target (a "process-all-resources" driver looping until the loader reports done, which
+never happens). TEST (REX_FORCEBE68: skip sub_8211BE68 only when called from sub_8211B740@0x8211B894, return
+success): the title **ADVANCES from the stuck intro** — loads **72 assets (vs 65)**: NEW = `Levels.xmc`,
+`Campaigns.xmc`, `Challenges.xmc` (the level-select/menu data!), `ParticleTextures.bin`, `SouthPark.par`
+(particles), `Projectiles.bin`, `structuretextures.bin` (gameplay). ⇒ **sub_8211BE68's blocking load was THE
+gate, and the advance machinery WORKS downstream** (the title progresses to menu/level-select + gameplay
+preload). ⚠ but: (a) the EXECUTED render (REX_EXECSEGS device+13568 segments) is UNCHANGED — still the intro-built
+placeholder draws (prim5/13/4 tex=0x0, prim8 empty-EDRAM); the new menu/gameplay render content isn't in those
+segments (it's built later / elsewhere). (b) skipping is too BLUNT — it skips a real resource-load, leaving a
+null ⇒ next blocker = INDIRECT-NULL at **sub_82292D08** (targets 0x0 / 0x8181FFF8), intermittent crash. ⇒ the
+PROPER fix is to make sub_8211BE68's load COMPLETE (the loader/GPU-create completion) rather than skip it; the
+skip is a powerful DIAGNOSTIC proving the gate + that the title can advance. NEXT: push past sub_82292D08 (is it
+another handleable null?) to see how far the title gets / whether it renders the menu; and/or make sub_8211BE68's
+load terminate properly. New gated diag `REX_FORCEBE68`. Default boot unaffected. Commits pending (NOT pushed).
