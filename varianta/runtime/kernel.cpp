@@ -1474,7 +1474,13 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                       if (tdmp.compare_exchange_strong(e,true)) {
                         uint32_t nz=0,prev=0,varied=0; for(int i=0;i<256;i++){ uint32_t w=GLD32(texBase+i*4); if(w)nz++; if(i&&w!=prev)varied++; prev=w; }
                         fprintf(stderr,"[scene-tex] base=0x%X first8dw=%08X %08X %08X %08X %08X %08X %08X %08X | nz=%u/256 varied=%u/255\n",
-                                texBase, GLD32(texBase),GLD32(texBase+4),GLD32(texBase+8),GLD32(texBase+12),GLD32(texBase+16),GLD32(texBase+20),GLD32(texBase+24),GLD32(texBase+28), nz, varied); }
+                                texBase, GLD32(texBase),GLD32(texBase+4),GLD32(texBase+8),GLD32(texBase+12),GLD32(texBase+16),GLD32(texBase+20),GLD32(texBase+24),GLD32(texBase+28), nz, varied);
+                        // also probe the STATIC font/sprite atlas (0xA5004800, from the XEX — not render-to-EDRAM):
+                        // if it holds real data, a textured pipeline + this atlas = readable glyphs (a tractable step).
+                        for (uint32_t fa : {0xA5004800u, 0xA5004000u}) { uint32_t fnz=0,fp=0,fv=0;
+                            for(int i=0;i<256;i++){ uint32_t w=GLD32(fa+i*4); if(w)fnz++; if(i&&w!=fp)fv++; fp=w; }
+                            fprintf(stderr,"[atlas] 0x%X first6dw=%08X %08X %08X %08X %08X %08X | nz=%u/256 varied=%u/255\n",
+                                    fa, GLD32(fa),GLD32(fa+4),GLD32(fa+8),GLD32(fa+12),GLD32(fa+16),GLD32(fa+20), fnz, fv); } }
                     }
                 }
             }
