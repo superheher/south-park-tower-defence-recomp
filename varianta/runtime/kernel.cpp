@@ -154,6 +154,17 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
         uint32_t bit = st < 31 ? (1u << st) : 0x80000000u;
         if (!(seen & bit)) { seen |= bit; fprintf(stderr, "[polldiag] NEW state=%u (mask=0x%X) at poll #%d\n", st, seen, pn); }
         if ((st == 1 || st == 12) && !doneLog) { doneLog = true; fprintf(stderr, "[polldiag] *** LOADER REACHED DONE state=%u after %d polls ***\n", st, pn); }
+        // task #7 (deep build): survey ALL 20 children (cont.22 focused on child[0]). child[i]=0x82657578+i*216,
+        // state @+136, ready-flag @+208. Periodic dump (every 200 polls) → which children COMPLETE (state 1/12)
+        // vs STICK, and what each loads (the leaf resource type) — pinpoints the SPECIFIC stuck resource.
+        static int surveyN = 0;
+        if ((pn % 200) == 1 && surveyN < 6) { surveyN++;
+            char buf[640]; size_t o=0; int done=0,stuck=0;
+            for (int i=0;i<20;i++){ uint32_t c=0x82657578u + i*216u; uint32_t cs=rd(c+136), cr=rd(c+208);
+                bool d=(cs==1||cs==12); if(d)done++; else stuck++;
+                o += snprintf(buf+o, sizeof(buf)-o, " [%d]s%u/r%u%s", i, cs, cr, d?"D":""); }
+            fprintf(stderr, "[children] poll#%d: %d done / %d stuck:%s\n", pn, done, stuck, buf);
+        }
     }
     // (cont.22 loop-iter 6: a REX_POLLFORCE experiment that forced *(r30+136)=done + skipped the pump did NOT
     // clear the transition — the state re-cycled and the title stalled, i.e. forcing an incomplete async result
