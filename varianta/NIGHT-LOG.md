@@ -3010,3 +3010,24 @@ limit the plan predicted ("poor /loop fit"): breakthrough ACHIEVED (title CAN ad
 Remaining = that deep multi-session build (model the per-item create-completion the loader checks — RE
 sub_822490D0's done-vs-requeue condition + the GPU resource it represents). New gated diags REX_CPDRAIN,
 REX_ITEMSPIN, REX_LOADERLATCH. Default boot unaffected. Commits pending (NOT pushed).
+
+**cont.25 /loop — no VISIBLE-result shortcut either; /loop PAUSED at the breakthrough milestone.** Confirmed the
+force-skip yields no new rendered content: with REX_FORCEBE68+REX_EXECSEGS the executed device+13568 segments are
+STILL the intro placeholders ([esdraw] prim5/4/13/8, same as baseline) — the title advances its LOADING (level/
+gameplay data) but the new menu/gameplay render content needs it to fully reach the render state (gated on the
+GPU-create). ⇒ every shortcut is exhausted: clean advance (latch/counter-drain/fence-forward — all fail), and
+visible result (force-skip — loading only, no new render). **/loop has delivered its value for this build and
+reached the structural limit the plan predicted.** Achieved this session (cont.25, commits d636ec0→21a9cf9, NOT
+pushed): (1) RE-GROUNDED the wall (loader file-read + frontend completion-drain WORK; the docs' "stuck loader"
+was a worker-poll artifact); (2) characterized the renderer wall (3 empty texture sources; texture DATA partly
+EXISTS — 14/35 bound textures populated); (3) ⭐ BREAKTHROUGH: identified the title's ADVANCE GATE = sub_8211BE68
+(the loader work-loop sub_82247E70 spinning forever on GPU-pending items, re-queued via sub_8224F918), and PROVED
+the title CAN advance — REX_FORCEBE68 skip → loads level-select (Levels/Campaigns/Challenges.xmc) + gameplay
+(particles/projectiles/structures); (4) EXHAUSTIVELY confirmed no shortcut to a clean/visible result. **Remaining
+= the deep multi-session GPU-resource-create subsystem** (Xenos tiled-texture decode + .xbv→SPIR-V + EDRAM RT +
+real draw translation + per-item create-completion so the loader loop drains) — a deliberate go/no-go the plan
+flags as the user's, best done in a FRESH focused session (not /loop, not this 11-iteration context). Entry
+points all localized: sub_8211BE68 / sub_82247E70 / sub_822490D0 (done-vs-requeue) / sub_8224F918. Gated diags
+retained: REX_ADVGATE / REX_FORCEBE68 / REX_ITEMSPIN / REX_LOADERLATCH / REX_CPDRAIN / REX_TEXWATCH / REX_TEXBIND.
+Default boot unregressed throughout. ⭐TO RESUME: re-issue /loop (or a focused session) to start the deep
+GPU-create build; entry = model the per-item create-completion sub_822490D0 checks, or build texture-decode first.
