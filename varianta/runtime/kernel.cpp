@@ -1774,7 +1774,7 @@ PPC_FUNC(sub_8242BF10)
         if (d >= 0xA01F0000u && d < 0xA0300000u && sz >= 16 && sz < 0x20000 && (sz % 8) == 0) {
             uint32_t nv = sz / 8;
             if (nv > 100) { static std::atomic<bool> td{false}; bool e=false;   // one-shot: dump a TEXT fill's verts
-              if (td.compare_exchange_strong(e,true)) { fprintf(stderr,"[text] nv=%u DEST=0x%X src=0x%X first 32 verts:\n ", nv, d, s);
+              if (td.compare_exchange_strong(e,true)) { fprintf(stderr,"[text] nv=%u DEST=0x%X src=0x%X caller_lr=0x%08X first 32 verts:\n ", nv, d, s, (uint32_t)ctx.lr);
                 for(int i=0;i<32;i++){ float x,y; uint32_t a=GLD32(s+i*8),b=GLD32(s+i*8+4); memcpy(&x,&a,4);memcpy(&y,&b,4); fprintf(stderr,"(%.1f,%.1f) ",x,y); }
                 fprintf(stderr,"\n");
                 // Is the per-draw transform LIVE in the register file at memcpy (fill) time? If c0/c4 hold a real
