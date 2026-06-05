@@ -116,6 +116,39 @@ translation (the menu-quad path is debug-only: position+flat-color, no textures/
   perf floor; building it is large. Worth a deliberate go/no-go vs. other floor approaches before
   committing the multi-session effort.
 
+## ⭐ ALTERNATIVE PATH (cont.23, more tractable) — bypass the stuck loader via DISK resources
+The deep loader fix (inlined-D3D resource-create, no hook) is the hard wall. But **the game ships
+all the resources on disk** (`private/extracted/media/`), so the renderer can load them DIRECTLY
+instead of waiting for the loader:
+- **PS shaders:** `media/shaders/*.updb` (19, all `ps_3_0`) are **XML with the ORIGINAL HLSL
+  source** inline (e.g. `Simple.psh` = `tex2D(diffuseTexture, In.Tex) * In.Color`). Extract the
+  HLSL → compile to SPIR-V via the project's existing `shaderc` (already used for the menu-quad
+  shaders). Names map to materials: `SPBackdropTextured/Untextured` (background), `SPTextured/
+  Untextured` (sprites), `SPHud*` (HUD), `SpMovie`, `Simple` (textured sprite). The matching `.xbv`
+  (612 B for Simple) is the compiled microcode the title loads — match a draw's IM_LOAD'd PS
+  microcode bytes to a `.xbv` file → use that `.updb`'s HLSL.
+- **VS:** NOT in the `.updb` set (all PS). Write a small transform VS — the transform is already
+  measured (reg 0x4000 = World-translate c0/c1 + screen-ortho Proj c4/c5), input = pos.xy + uv.xy
+  (+ color), output = clip + uv + color. (The title's real VS is generated/shared, or in the PM4
+  IM_LOAD microcode; a hand-written transform VS suffices for these flat 2D draws.)
+- **Textures:** 659 `.png` under `media/Assets/{Frontend,hud,Global,Fonts,...}` (the runtime `.xmc`
+  are the tiled versions of the same art). Decode a `.png` → RGBA → VkImage. Map by draw: backdrop
+  draws → the backdrop art `.png`; sprite/atlas draws → the UI/font atlas `.png`.
+
+**Build order (this path):** (1) a textured VkPipeline in vulkan_render.cpp — input pos.xy+uv (+
+color), sampler2D, FS = the `Simple` HLSL (tex2D×color), alpha-blended; (2) load ONE `.png` → VkImage
++ a `SubmitTexturedGeometry(clipXY, uv, texId)` bridge (extend the menu-quad path, which already
+carries the verts/UVs via `REX_UITEXT` snapshots — UVs are captured but currently unused); (3)
+texture the existing geometry (backdrop quadrants → backdrop png; text glyph-quads → font atlas).
+**⚠ Honest limits:** this textures the SPARSE content the stuck title builds (backdrop + a few
+sprites + the one text label) — a *textured* version of the current sparse menu, NOT the rich menu
+(which still needs the loader to progress the title). But it's far more tractable than the loader
+build, produces a real textured result, and reuses the proven geometry path. **⚠ Risks:** the
+draw→png mapping (heuristic; match by shader name / texture address); whether the `.png` art aligns
+with the title's UVs (likely — `.png` is the source of the `.xmc`); the backdrop samples EDRAM
+(`0xB0000000`, a render-to-texture composition, not one png) so its art may need the actual
+background `.png` chosen by name, not the EDRAM contents.
+
 ## Diagnostics retained (gated, default boot unregressed)
 `REX_EXECSEGS` (+[esdraw/esvf/esidx/esprim/esalu/esset/esset2]), `REX_VBFILL` (+[text]),
 `REX_UITEXT`/`REX_UITEXT_FIT` (text geometry), `REX_UITRACE` (VB Lock/Unlock), `REX_SCENE`
