@@ -225,9 +225,18 @@ corrected target (renderer, not loader). Each of the 3 paths is multi-step; the 
   (0xA5004800) is a SEPARATE path (TTF raster of the loaded `.ttf` — also never runs). R1 starts by implementing
   the decode+upload for ONE texture (the format is in the Xenos fetch-constant; ref Xenia texture_conversion) and
   wiring SetTexture's fetch constant, then checking whether the title-advance still gates the visible draw.
-- **R1:** model the create for ONE texture → REX_SCENE shows a non-null `tex=` for a sprite draw → wire the
-  executed draw to sample it via the existing textured pipeline (g_texPipe + UploadTexture from cont.24, which
-  already decode-and-sample a guest RGBA buffer). First real textured UI draw.
+- **R1 — CORRECTED + ADVANCED (cont.25 /loop, REX_TEXBIND):** R0's "populate never runs" was an unlucky single-
+  block sample. Measuring ALL texture-fetch d1 writes (the bind chokepoint WriteGpuReg, ring+segments) shows the
+  title binds **35 distinct real textures** (bases 0xA4023000…0xA5F5B000) + EDRAM — so the **bind path WORKS, not
+  stubbed**. And sampling each bound texture's data: **14 of 35 are POPULATED** (nz=64/64, real varied pixels —
+  e.g. 0xA4188000/0xA4739000/0xA4023000/0xA4354000), 22 are empty (EDRAM-RT + deferred/uncreated). ⇒ the texture
+  DECODE/POPULATE path WORKS for many textures; real texture data EXISTS in guest GPU mem. The remaining gap is
+  NARROW: connect the populated textures to the executed draws. ⚠ Note: [texbind] sees binds in slots 0..42 but
+  REX_SCENE only scanned slots 0..31 — its "tex=0x0" was partly a too-small slot scan; some menu draws may bind
+  populated textures in higher slots. NEXT (R1 cont.): widen the per-draw texture scan to 0..42, correlate which
+  EXECUTED draw binds which populated texture, then sample it via the existing textured pipeline (g_texPipe +
+  UploadTexture from cont.24) → first real textured UI draw. The empty 22 (incl. EDRAM backdrop) are the
+  render-target / deferred subset (pieces 4 + the A↔B advance).
 - **R2:** generalize (texture decode for the Xenos tiled formats — ref Xenia texture_conversion), then the font
   atlas + the title-advance (A↔B) for the positioned menu.
 - Each step committable + REX_SCENE-verifiable; keep default boot unregressed.

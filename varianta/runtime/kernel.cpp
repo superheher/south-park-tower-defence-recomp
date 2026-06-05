@@ -1316,7 +1316,33 @@ thread_local std::vector<TxtSnap>* tl_txtFrame = nullptr;               // swap-
 std::atomic<uint64_t> g_drawCount{0}, g_swapCount{0};
 const bool g_cptrace = (getenv("REX_CPTRACE") != nullptr);
 
-inline void WriteGpuReg(uint32_t index, uint32_t value) { GST32(0x7FC80000u + index * 4u, value); }
+inline void WriteGpuReg(uint32_t index, uint32_t value) {
+    GST32(0x7FC80000u + index * 4u, value);
+    // R1 (REX_TEXBIND): does the title EVER bind a real TEXTURE base to a fetch constant anywhere (ring / init /
+    // segment)? A Xenos texture fetch constant's d1 holds the base in bits[31:12]; vertex pools live at
+    // 0x01xxxxxx (below the filter), so a write to the fetch region (0x4800..0x48FF) whose value masks to a
+    // base in [0x04000000,0x20000000) is a TEXTURE bind. NONE ever = the bind/create path is fully stubbed;
+    // SOME = bound but those draws aren't reached (the A↔B title-advance gate). Dedup by (reg,base). Gated.
+    static const bool s_texbind = getenv("REX_TEXBIND") != nullptr;
+    if (s_texbind && index >= 0x4800u && index < 0x4900u && ((index - 0x4800u) % 6u) == 1u) {
+        uint32_t b = value & 0xFFFFF000u;   // d1 of a texture fetch slot holds the base in bits[31:12]
+        // categorize to cut noise: UI/texture allocs (phys 0x04..0x06, incl. UI.xzp 0x048D + the 0xA494..0xA51C
+        // texture blocks) and EDRAM (phys 0x10). Skip the rest (sizes/control words coincidentally in range).
+        bool tex = (b >= 0x04000000u && b < 0x06000000u), edram = (b >= 0x10000000u && b < 0x10100000u);
+        if (tex || edram) {
+            static std::mutex m; static std::unordered_set<uint64_t> seen;
+            std::lock_guard<std::mutex> lk(m);
+            uint64_t key = (static_cast<uint64_t>(index) << 32) | b;
+            if (seen.size() < 120 && seen.insert(key).second) {
+                // R1 decisive: is the BOUND texture populated? sample 64 dwords for non-zero/varied content.
+                uint32_t ga = 0xA0000000u | b, nz = 0, vr = 0, prev = 0;
+                for (int i = 0; i < 64; i++) { uint32_t w = GLD32(ga + i*4); if (w) nz++; if (i && w != prev) vr++; prev = w; }
+                fprintf(stderr, "[texbind] slot %u d1=0x%08X -> texBase=0x%08X (%s) DATA nz=%u/64 varied=%u/63 first=%08X %08X\n",
+                        (index - 0x4800u) / 6u, value, ga, edram ? "EDRAM-RT" : "texture", nz, vr, GLD32(ga), GLD32(ga+4));
+            }
+        }
+    }
+}
 
 void ExecutePM4(uint32_t addr, uint32_t dwords, int depth);   // fwd
 

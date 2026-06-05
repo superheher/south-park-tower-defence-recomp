@@ -2910,3 +2910,14 @@ Xenos untile + fetch-constant setup) NEVER RUNS.** Keystone isolated. R1 open Q:
 decode+copy+fetch-const, ref Xenia texture_conversion) vs A↔B-gated. Plan §R0/R1/R2 (GPU-RESOURCE-BUILD-PLAN.md).
 New gated diag: `REX_TEXWATCH` (+[texwatch]/[texread], +the [ldframe] texture-block population sample), `REX_TEXTRAP`
 (gdb-only SIGTRAP). Default boot unregressed (12s smoke clean). Commits pending (NOT pushed).
+
+**cont.25 /loop R1 — CORRECTS R0's pessimism (REX_TEXBIND):** instrumented the texture-fetch d1 bind chokepoint
+(WriteGpuReg, ring+segments). The title binds **35 distinct real textures** (bases 0xA4023000…0xA5F5B000) + EDRAM
+⇒ **the bind path WORKS (not stubbed)**. Sampling each bound texture's data: **14 of 35 are POPULATED** (nz=64/64,
+real varied pixels — 0xA4188000/0xA4739000/0xA4023000/0xA4354000/…), 22 empty (EDRAM-RT + deferred). ⇒ R0's
+"populate never runs" was an unlucky single-block sample (0xA4949000 happened to be one of the empty 22); the
+decode/populate path WORKS for many textures, and real texture DATA exists in guest GPU mem. The gap is NARROW:
+connect the populated textures to the executed draws. ⚠ [texbind] sees slots 0..42 but REX_SCENE only scanned
+0..31 — its "tex=0x0" was partly a too-small scan. NEXT (R1 cont.): widen the per-draw scan to 0..42, correlate
+executed-draw→populated-texture, sample via g_texPipe (cont.24) → first real textured UI draw. Gated diag
+`REX_TEXBIND` ([texbind] + per-bind data sample). Commits pending (NOT pushed).
