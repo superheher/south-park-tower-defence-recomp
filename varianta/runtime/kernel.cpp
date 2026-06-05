@@ -2372,6 +2372,19 @@ ADV_HOOK(sub_8211D160, 0x8211B8A4u)
 ADV_HOOK(sub_8211DB78, 0x8211B8B0u)
 ADV_HOOK(sub_8211DD18, 0x8211B8BCu)
 #undef ADV_HOOK
+// REX_ITEMSPIN (cont.25): the loader work-loop sub_82247E70 spins forever calling the item state-machine
+// sub_82249338 (switch on item-state r5) while items stay pending (re-queued, never GPU-completed). Log the
+// item+state sequence: if ONE item cycles a fixed state forever, that's the stuck resource + the completion
+// state to model (the plan's STEP-0: signal what that state polls). Cap to keep it cheap. Gated, default-off.
+extern "C" PPC_FUNC(__imp__sub_82249338);
+PPC_FUNC(sub_82249338) {
+    static const bool on = getenv("REX_ITEMSPIN") != nullptr;
+    uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
+    __imp__sub_82249338(ctx, base);
+    if (on) { static std::atomic<int> n{0}; int k = n.fetch_add(1);
+        if (k < 60) fprintf(stderr, "[itemspin] #%d state(r5)=%u item(r3)=0x%08X r4=0x%08X -> ret=0x%08X\n",
+                            k, r5, r3, r4, ctx.r3.u32); }
+}
 // Diag (gated): confirm the title's own completion poster fires after a forced EOS (sub_82425BF8 EOF branch).
 extern "C" PPC_FUNC(__imp__sub_8222A9F8);
 PPC_FUNC(sub_8222A9F8)
