@@ -3186,3 +3186,34 @@ an oversized memcpy; cont.25 noted size=numI*16, cont.26 saw 0x60606060 garbage 
 to replace the REX_SKIPPOLL workaround; (2) push the advance further toward a rendered menu (combine with the
 renderer/REX_EXECSEGS). REX_SKIPPOLL is a clean gated workaround that demonstrably advances the title. Default
 boot unregressed.
+
+## cont.29 (2026-06-05, /loop) — ⭐ ROOT CAUSE PINNED: the poll's stack-shredding memcpy = size *(obj+60)=0xFFFFFFFF; REX_CLAMPCPY (surgical) preserves r31 + advances the title
+
+Continued cont.28 (the proper fix). PINNED the corruption to the exact memcpy + a surgical fix. New gated diags
+REX_R31TRACK, REX_CLAMPCPY (default boot unregressed — exit124, 65 assets, 0 leakage). Commit cont.29 (NOT pushed).
+
+**Localized the corruptor (REX_R31TRACK — set g_inPoll across the poll, log r31 in/out of each callee).** The poll
+sub_822487C8 ENTER r31=0x820D2844 (path) → EXIT r31=0xFFFFFFFF (CORRUPTED). The callee that flips it: **sub_82448158**
+(r31 0x820D2844→0xFFFFFFFF). sub_82448158 DOES save/restore r31 (std r31,-16(r1) … ld r31,-16(r1)), so its saved
+slot is OVERWRITTEN during execution — a stack-memory corruption, not a missing save.
+
+**⭐ THE BUG (REX_R31TRACK logs every in-poll memcpy dest/src/size): the poll's first memcpy is
+`sub_8242BF10(dest=0x9825F6CC, src=0x9825F430, size=0xFFFFFFFF)`** — a 4GB stack-to-stack copy that shreds
+sub_82448158's saved-r31 slot (and the frame). In sub_8244FE80 (ppc_recomp.65.cpp, the memcpy's caller) the size
+is `r5 = *(r31 + 60)` — **the size is read from object field +60, which holds 0xFFFFFFFF (uninitialized/garbage; a
+-1 sentinel mis-used as a length).** Same class as cont.26's 0x60606060 garbage count: an unready/uninitialized
+resource object drives a wild-size copy.
+
+**⭐⭐ REX_CLAMPCPY (zero the in-poll memcpy when size>=0x100000): r31 is PRESERVED (poll ENTER/EXIT both 0x820D2844)
+and the title ADVANCES** — Meshes\Global.bin opens, 65→94 assets (level-select + gameplay + attract movie), 1
+INDIRECT-NULL. Two independent fixes (cont.28 REX_SKIPPOLL, cont.29 REX_CLAMPCPY) now confirm the root cause;
+CLAMPCPY is the more SURGICAL (it neutralizes only the garbage copy, keeping the rest of the poll's real work).
+
+**⇒ ROOT CAUSE = a wild-size memcpy (size from an uninitialized object field +60 = 0xFFFFFFFF) shredding the
+stack across the resource poll.** A tractable data/recomp bug, NOT a GPU dependency (confirms cont.28). ⭐ NEXT:
+(1) the FULLY-proper fix — RE why object+60 is 0xFFFFFFFF (which object, why uninitialized at poll time — same
+loader-state thread as cont.26's 0x60606060); decide whether to promote REX_CLAMPCPY to a default-on guard
+(it cleanly advances the title and default boot is safe) vs fixing the upstream init; (2) push the advance toward
+a rendered menu (combine CLAMPCPY/SKIPPOLL with the renderer). ⚠ honest: the default-boot INDIRECT-NULL guard-fire
+count is high-variance (pre-existing intermittent race, non-fatal — exit124/65 assets invariant); my default-boot
+changes are gated no-ops. Diags REX_R31TRACK/REX_CLAMPCPY. Default boot unregressed.

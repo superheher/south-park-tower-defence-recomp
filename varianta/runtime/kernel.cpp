@@ -2004,9 +2004,27 @@ PPC_FUNC(sub_821BF298)
 // each fill's dest+source+size to recover the per-draw vertex REGIONS (discrete boundaries heuristic carving
 // can't see). Filter to the slot-1 vert range. r3=dest, r4=src, r5=size (confirmed memcpy). Temporary diagnostic.
 std::mutex g_vbMtx; std::vector<float> g_vbVerts;   // REX_VBFILL render accumulator
+// cont.29 r31-corruption localization state (defined here, before the first user sub_8242BF10).
+static bool g_inPoll = false;
+static int  g_r31seq = 0;
 extern "C" PPC_FUNC(__imp__sub_8242BF10);
 PPC_FUNC(sub_8242BF10)
 {
+    // REX_R31TRACK (cont.29): inside the poll, log every memcpy dest+size — the one overrunning sub_82448158's
+    // saved-r31 slot (~0x9825F540) is the corruptor. A garbage/huge size = the overflow.
+    static const bool s_r31trk = getenv("REX_R31TRACK") != nullptr;
+    if (g_inPoll && s_r31trk) { static std::atomic<int> mc{0}; if (mc.fetch_add(1) < 16)
+        fprintf(stderr, "[r31]   memcpy dest=0x%08X src=0x%08X size=0x%X%s\n", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                (ctx.r3.u32 <= 0x9825F544u && ctx.r3.u32 + ctx.r5.u32 > 0x9825F544u) ? "  <== HITS saved-r31!" : ""); }
+    // REX_CLAMPCPY (cont.29): the poll's first memcpy is called with size=0xFFFFFFFF (a -1 "not found" sentinel
+    // mis-used as a length) -> a 4GB stack-to-stack copy that shreds sub_82448158's saved r31 (and the frame).
+    // Neutralize ONLY the in-poll garbage-size copy (size>=0x100000) by zeroing it. Surgical fix vs REX_SKIPPOLL.
+    static const bool clampcpy = getenv("REX_CLAMPCPY") != nullptr;
+    if (clampcpy && g_inPoll && ctx.r5.u32 >= 0x100000u) {
+        static std::atomic<int> cc{0}; if (cc.fetch_add(1) < 4)
+            fprintf(stderr, "[clampcpy] in-poll memcpy size 0x%X -> 0 (garbage; was shredding the stack)\n", ctx.r5.u32);
+        ctx.r5.u64 = 0;
+    }
     // REX_UITEXT: snapshot each text-glyph fill (guest thread) keyed by vert count, for exec-time pairing.
     static const bool s_uitext = getenv("REX_UITEXT") != nullptr;
     if (s_uitext && rex_render::Enabled()) {
@@ -2595,17 +2613,38 @@ IH728(sub_82250090, 0x821107F0)
 // corruption hypothesis: when called from that site, return success (1) WITHOUT running the corrupting body, so
 // sub_8211BE68 proceeds with an intact frame. If the Meshes fetch then reaches sub_82247E70(path) / the title
 // advances, the poll's corruption is the blocker. Filtered to the one site (sub_822487C8 is a hot vtable method).
+// REX_R31TRACK (cont.29): localize WHICH callee of the poll sub_822487C8 corrupts r31 (path -> 0xFFFFFFFF). Set
+// g_inPoll while inside the poll (from site 0x8211BE98); the callee hooks log r31 entry/exit only then. The call
+// whose r31-out != r31-in is the corruptor (or its subtree). tid=10 single-thread here, so a plain flag is fine.
+// (g_inPoll / g_r31seq defined earlier, before sub_8242BF10.)
 extern "C" PPC_FUNC(__imp__sub_822487C8);
 PPC_FUNC(sub_822487C8) {
     static const bool skip = getenv("REX_SKIPPOLL") != nullptr;
-    if (skip && static_cast<uint32_t>(ctx.lr) == 0x8211BE98u) {
+    static const bool trk  = getenv("REX_R31TRACK") != nullptr;
+    bool atSite = (static_cast<uint32_t>(ctx.lr) == 0x8211BE98u);
+    if (skip && atSite) {
         static std::atomic<int> sc{0}; if (sc.fetch_add(1) < 4)
             fprintf(stderr, "[skippoll] skipping sub_822487C8 @0x8211BE98 (returning 1, no body) — frame-corruption test\n");
         ctx.r3.u64 = 1;
         return;
     }
+    if (atSite) {
+        // Always mark in-poll here so REX_CLAMPCPY works standalone (the 0x8211BE98 poll is rare, not hot).
+        uint32_t r31in = ctx.r31.u32; bool prev = g_inPoll; g_inPoll = true;
+        bool logTrk = trk && g_r31seq < 2; int seq = logTrk ? g_r31seq++ : -1;
+        if (logTrk) fprintf(stderr, "[r31] === poll #%d ENTER r31=0x%08X r1=0x%08X ===\n", seq, r31in, ctx.r1.u32);
+        __imp__sub_822487C8(ctx, base);
+        g_inPoll = prev;
+        if (logTrk) fprintf(stderr, "[r31] === poll #%d EXIT  r31=0x%08X %s ===\n", seq, ctx.r31.u32,
+                            ctx.r31.u32 == r31in ? "(preserved)" : "(CORRUPTED!)");
+        return;
+    }
     __imp__sub_822487C8(ctx, base);
 }
+// (cont.29) The callee r31-trackers R31_HOOK(sub_82448158/sub_82448B50/sub_8244FE80) confirmed sub_82448158 as the
+// corruptor; removed (they wrapped hot loader fns, adding per-call overhead). The root cause is now pinned to the
+// in-poll memcpy with size=*(obj+60)=0xFFFFFFFF; REX_CLAMPCPY neutralizes it (and REX_R31TRACK still logs the
+// poll ENTER/EXIT + the memcpy dest/size for re-verification).
 // Diag (gated): confirm the title's own completion poster fires after a forced EOS (sub_82425BF8 EOF branch).
 extern "C" PPC_FUNC(__imp__sub_8222A9F8);
 PPC_FUNC(sub_8222A9F8)
