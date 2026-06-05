@@ -109,6 +109,23 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
     // dispatch to sub_8210AF90 (the 0x828E82A6 setter) ever fires.
     uint32_t lr = static_cast<uint32_t>(ctx.lr);
     bool trace = g_traceB740 && lr >= 0x8211B748u && lr < 0x8211C000u;
+    // REX_UITRACE (deep build, task #5): capture the D3D dynamic-VB Lock/fill/Unlock method targets in the text
+    // renderer sub_821F8E60 (the un-emitted bind+draw). Its 3 indirect call sites by return-lr: vtable+200
+    // factory (0x821F906C, returns r30=VB obj), vtable+120 Lock (0x821F9098), vtable+124 Unlock/submit
+    // (0x821F90C4, r3=r30). One-shot each: target = the method, r3 = the object, rd(r3) = its vtable. The
+    // Unlock/submit method (= vtable[31]) is the stubbed GPU-submit to decode + reconstruct.
+    static const bool g_uitrace = getenv("REX_UITRACE") != nullptr;
+    if (g_uitrace && (lr == 0x821F906Cu || lr == 0x821F9098u || lr == 0x821F90C4u)) {
+        static std::atomic<uint32_t> seen{0};
+        uint32_t bit = lr==0x821F906Cu?1u : lr==0x821F9098u?2u : 4u;
+        if (!(seen.load() & bit)) { seen.fetch_or(bit);
+            auto rd = [&](uint32_t a){ uint32_t b; memcpy(&b, base + a, 4); return __builtin_bswap32(b); };
+            const char* site = lr==0x821F906Cu ? "factory(vt+200)" : lr==0x821F9098u ? "Lock(vt+120)" : "Unlock/submit(vt+124)";
+            uint32_t r3 = ctx.r3.u32, vt = r3 ? rd(r3) : 0;
+            fprintf(stderr, "[uitrace] %-20s lr=0x%08X target=sub_%08X | r3(obj)=0x%08X vtable=0x%08X vt[120]=0x%08X vt[124]=0x%08X\n",
+                    site, lr, target, r3, vt, vt?rd(vt+120):0, vt?rd(vt+124):0);
+        }
+    }
     // REX_TASKDIAG (cont.22 loop-iter 8): classify the transition's leaf async sub-ops. sub_82248010 (the
     // per-child state machine) advances each stage on a polymorphic sub-op call returning status 3 / waits on
     // status 2; log those calls (lr inside sub_82248010 = [0x82248010,0x82248260)) + the returned status, to
@@ -1255,6 +1272,16 @@ thread_local uint32_t tl_s1cursor = 0;   // REX_SPRITECARVE: byte cursor into th
 // DRAW can decode the VS's OWN vfetch (which fetch slot + dword offset it reads). The sprite/text VS's slot
 // 0 is a texture, so their verts come from a different slot/offset that only the vfetch instruction names.
 thread_local uint32_t tl_vsUcode = 0, tl_vsSize = 0;
+// REX_UITEXT (task #5 experiment): the UI text verts exist only at memcpy-fill time (local-space stride-16,
+// recycled by exec time); the per-draw transform exists only at exec time (reg 0x4000, recorded in the
+// segment). Bridge them: snapshot each text fill (guest thread, by vert COUNT) → at exec, pair the Nth
+// prim-13 draw to the snapshot whose count == its numI (count is a strong discriminator), apply the live
+// reg-0x4000 World+screen-ortho transform, render. Per-frame: the swap thread swaps out the accumulated
+// snapshots, consumes by matching count, clears for the next frame. UNVERIFIED pairing (build-order vs
+// draw-order) — gated, render-verified by eye.
+struct TxtSnap { uint32_t count; std::vector<float> pos; bool used; };   // pos = count*2 (local x,y per vert)
+std::mutex g_txtMtx; std::vector<TxtSnap> g_txtSnaps;                    // guest thread appends; swap drains
+thread_local std::vector<TxtSnap>* tl_txtFrame = nullptr;               // swap-local snapshot view during exec
 std::atomic<uint64_t> g_drawCount{0}, g_swapCount{0};
 const bool g_cptrace = (getenv("REX_CPTRACE") != nullptr);
 
@@ -1436,18 +1463,54 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                 fprintf(stderr, "[esalu] prim-13 text draw numI=%u — ALU consts c0..c19 (reg 0x4000):\n", numInd);
                 for (int c=0;c<20;c++){ float f[4]; for(int j=0;j<4;j++){ uint32_t u=GLD32(0x7FC80000u+(0x4000u+c*4+j)*4u); memcpy(&f[j],&u,4);}
                   fprintf(stderr, "  c%-2d = %11.4f %11.4f %11.4f %11.4f\n", c, f[0],f[1],f[2],f[3]); }
-                uint32_t vb = 0xA01FE0FCu;   // slot-1 text VB the [esdraw] scan found (stride-16: pos.xy + uv.xy)
-                fprintf(stderr, "  slot-1 text verts @0x%X (first 6, stride-16):\n", vb);
-                for (int i=0;i<6;i++){ float p[4]; for(int j=0;j<4;j++){uint32_t u=GLD32(vb+i*16+j*4); memcpy(&p[j],&u,4);}
-                  fprintf(stderr, "    v%d pos=(%9.2f,%9.2f) uv=(%.3f,%.3f)\n", i, p[0],p[1],p[2],p[3]); }
+                // DECISIVE (task #5): does the REAL text VB (0xA022FFF0, the sub_821F8E60 Lock allocation that the
+                // memcpy filled) still hold valid local-space verts at exec time? If YES, render structurally =
+                // verts from this known VB + transform from reg0x4000 (both live at exec). If zeros, it's recycled.
+                for (uint32_t vb : {0xA022FFF0u, 0xA01FE0FCu}) {
+                    fprintf(stderr, "  text VB @0x%X (first 6, stride-16 pos.xy+uv.xy):\n", vb);
+                    for (int i=0;i<6;i++){ float p[4]; for(int j=0;j<4;j++){uint32_t u=GLD32(vb+i*16+j*4); memcpy(&p[j],&u,4);}
+                      fprintf(stderr, "    v%d pos=(%9.2f,%9.2f) uv=(%.3f,%.3f)\n", i, p[0],p[1],p[2],p[3]); }
+                }
               }
+            }
+            // REX_UITEXT: pair THIS prim-13 text draw to the text snapshot whose vert count == numI (count is a
+            // strong discriminator), then apply the LIVE reg-0x4000 transform (World-translate c0.w/c1.w +
+            // screen-ortho Proj c4.x/c4.w, c5.y/c5.w) the segment just set → clip-space glyph quads. Bridges the
+            // fill-time verts with the exec-time transform (the two never coexist otherwise). Pairing UNVERIFIED.
+            if (tl_txtFrame && prim == 13 && numInd >= 4) {
+                TxtSnap* snap = nullptr;
+                for (auto& sn : *tl_txtFrame) if (!sn.used && sn.count == numInd) { snap = &sn; sn.used = true; break; }
+                {   // DIAG: every prim-13 text draw's transform (Tx,Ty) — to see where each label wants to land
+                    static std::atomic<int> td{0}; int dk=td.fetch_add(1);
+                    if (dk < 20) { auto rg=[&](uint32_t c,int cc){ float f; uint32_t w=GLD32(0x7FC80000u+(0x4000u+c*4+cc)*4u); memcpy(&f,&w,4); return f; };
+                        fprintf(stderr,"[uitxt] draw#%d numI=%u paired=%d World=(%.1f,%.1f) Proj=(%.4f,%.4f)\n",
+                                dk, numInd, snap!=nullptr, rg(0,3), rg(1,3), rg(4,0), rg(5,1)); } }
+                if (snap) {
+                    auto reg = [&](uint32_t c,int comp){ float f; uint32_t w=GLD32(0x7FC80000u+(0x4000u+c*4+comp)*4u); memcpy(&f,&w,4); return f; };
+                    float Tx=reg(0,3), Ty=reg(1,3), Px=reg(4,0), Pxw=reg(4,3), Py=reg(5,1), Pyw=reg(5,3);
+                    // game-accurate placement: clip = Proj * (local + World-translate). For the captured label
+                    // this lands off-screen (World.y=866 > the Proj's ~714 screen height) — a genuinely off-screen
+                    // element in the executed segments. REX_UITEXT_FIT: render the glyph quads at their LOCAL
+                    // coords mapped onto a visible band instead, to VALIDATE the glyph geometry/kerning (the text
+                    // pipeline) even when the real placement is off-screen. Clearly a shape-validation, not placement.
+                    static const bool s_fit = getenv("REX_UITEXT_FIT") != nullptr;
+                    auto tfReal=[&](float lx,float ly,float&ox,float&oy){ float wx=lx+Tx, wy=ly+Ty; ox=wx*Px+Pxw; oy=wy*Py+Pyw; };
+                    auto tfFit =[&](float lx,float ly,float&ox,float&oy){ ox=lx/640.0f-1.0f; oy=(ly+340.0f)/360.0f-1.0f; };
+                    const float* p = snap->pos.data();
+                    for (uint32_t g=0; g+4<=snap->count; g+=4) {       // glyph quad (TL,TR,BR,BL) → 2 tris
+                        float q[8]; for(int j=0;j<4;j++){ if(s_fit) tfFit(p[(g+j)*2],p[(g+j)*2+1],q[j*2],q[j*2+1]); else tfReal(p[(g+j)*2],p[(g+j)*2+1],q[j*2],q[j*2+1]); }
+                        float t[12]={q[0],q[1],q[2],q[3],q[4],q[5], q[0],q[1],q[4],q[5],q[6],q[7]};
+                        if (tl_esVerts.size()<60000) tl_esVerts.insert(tl_esVerts.end(), t, t+12);
+                    }
+                }
             }
             // T2b-step-2: carve THIS draw's geometry into clip-space triangles for the render bridge.
             // Content draws = prim 8 (kRectangleList) numI 3, fetch type-3 kVertex, float2 (stride 2dw) screen
             // coords. kRectangleList: v0,v1,v2 given + v3 = v1+v2-v0 (the parallelogram's 4th corner) → 2 tris.
             // Screen→Vulkan-NDC: clip=(x/640-1, y/360-1) for the 1280×720 fb (NDC y-down matches screen y-down).
             uint32_t fc0 = GLD32(0x7FC80000u + 0x4800u*4u);
-            if ((fc0 & 3u) == 3u && prim == 8 && numInd >= 3) {
+            static const bool s_skipBackdrop = getenv("REX_UITEXT_FIT") != nullptr;   // text-only validation view
+            if (!s_skipBackdrop && (fc0 & 3u) == 3u && prim == 8 && numInd >= 3) {
                 uint32_t base = fc0 & 0xFFFFFFFCu, gv = 0xA0000000u | (base & 0x1FFFFFFFu);
                 float x[3], y[3];
                 for (int i = 0; i < 3; i++) { uint32_t ux = GLD32(gv + i*8), uy = GLD32(gv + i*8 + 4);
@@ -1768,6 +1831,31 @@ std::mutex g_vbMtx; std::vector<float> g_vbVerts;   // REX_VBFILL render accumul
 extern "C" PPC_FUNC(__imp__sub_8242BF10);
 PPC_FUNC(sub_8242BF10)
 {
+    // REX_UITEXT: snapshot each text-glyph fill (guest thread) keyed by vert count, for exec-time pairing.
+    static const bool s_uitext = getenv("REX_UITEXT") != nullptr;
+    if (s_uitext && rex_render::Enabled()) {
+        uint32_t d = ctx.r3.u32, s = ctx.r4.u32, sz = ctx.r5.u32;
+        if (d >= 0xA01F0000u && d < 0xA0300000u && sz >= 64 && sz < 0x20000 && (sz % 16) == 0) {
+            uint32_t vc = sz / 16;                                // stride-16 (pos.xy + uv.xy) glyph verts
+            auto rdf = [&](uint32_t off){ float f; uint32_t w=GLD32(s+off); memcpy(&f,&w,4); return f; };
+            float u0=rdf(8), v0=rdf(12), px0=rdf(0);              // vert0: uv at +8/+12, pos.x at +0
+            bool textLike = u0>=-0.3f && u0<=1.6f && v0>=-0.3f && v0<=1.6f && px0>=-4.f && px0<2200.f
+                            && (vc % 4)==0 && vc>=4 && vc<=2048;   // 4 verts/glyph quad
+            if (textLike) {
+                std::lock_guard<std::mutex> lk(g_txtMtx);
+                // dedup: the menu caches/refills the same labels every frame — keep each unique label once
+                // (by count + first vert), so the persistent set stays the current screen's labels.
+                float fx0=rdf(0), fy0=rdf(4); bool dup=false;
+                for (auto& sn : g_txtSnaps) if (sn.count==vc && sn.pos.size()>=2
+                        && fabsf(sn.pos[0]-fx0)<0.5f && fabsf(sn.pos[1]-fy0)<0.5f) { dup=true; break; }
+                if (!dup && g_txtSnaps.size() < 256) {
+                    TxtSnap snap; snap.count = vc; snap.used = false; snap.pos.reserve(vc*2);
+                    for (uint32_t i=0;i<vc;i++){ snap.pos.push_back(rdf(i*16)); snap.pos.push_back(rdf(i*16+4)); }
+                    g_txtSnaps.push_back(std::move(snap));
+                }
+            }
+        }
+    }
     static const bool s_vbfill = getenv("REX_VBFILL") != nullptr;
     if (s_vbfill && rex_render::Enabled()) {
         uint32_t d = ctx.r3.u32, s = ctx.r4.u32, sz = ctx.r5.u32;
@@ -2520,6 +2608,12 @@ PPC_FUNC(__imp__VdSwap) {
             tl_execsegs = true;   // T2b-step-1: let DRAW_INDX capture each executed draw's live fetch slot-0
             tl_esVerts.clear();   // T2b-step-2: fresh per-frame geometry accumulator
             tl_s1cursor = 0;      // REX_SPRITECARVE: rescan the slot-1 dense start each frame
+            // REX_UITEXT: take this frame's accumulated text snapshots (drain the guest-thread buffer); the
+            // prim-13 DRAW handler consumes them by matching count, applying the live reg-0x4000 transform.
+            std::vector<TxtSnap> txtFrame;
+            if (getenv("REX_UITEXT")) { std::lock_guard<std::mutex> lk(g_txtMtx); txtFrame = g_txtSnaps; }  // COPY (persist)
+            for (auto& sn : txtFrame) sn.used = false;                                                       // re-match each frame
+            tl_txtFrame = txtFrame.empty() ? nullptr : &txtFrame;
             for (uint32_t a = base; a + 8 <= wptr; a += 4) {
                 uint32_t d = GLD32(a);
                 if ((d >> 24) != 0x81u) continue;                       // census parse: 0x81LLLLLL descriptor tag
@@ -2532,6 +2626,9 @@ PPC_FUNC(__imp__VdSwap) {
                 segs++;
             }
             tl_execsegs = false;
+            tl_txtFrame = nullptr;
+            { static std::atomic<int> tf{0}; if (getenv("REX_UITEXT") && tf.fetch_add(1) < 4)
+                fprintf(stderr, "[uitext] frame: %zu text snapshots available, esVerts now %zu\n", txtFrame.size(), tl_esVerts.size()/2); }
             // EXPERIMENT (REX_S1RENDER): render slot-1's LARGEST dense vert region as a quad-list — cont.22 found
             // it holds clean UI quads. Ignores the (missing) per-draw mapping; draws every quad in the main UI
             // vert buffer. authoring(~1768x1043)→clip (x/884-1, y/521.5-1). A shot at visible UI without the
