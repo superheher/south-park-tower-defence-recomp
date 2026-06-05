@@ -1477,12 +1477,18 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                     float Tx=rg(0,3),Ty=rg(1,3),Px=rg(4,0),Pxw=rg(4,3),Py=rg(5,1),Pyw=rg(5,3);
                     // transform a representative point: the World origin (0,0) → clip, to see where the element sits
                     float ox=(0+Tx)*Px+Pxw, oy=(0+Ty)*Py+Pyw;
-                    // find a bound texture (physical-window base): scan 32 fetch slots (6dw) for a 0x05xxxxxx base
-                    uint32_t texBase=0; for(uint32_t s=0;s<32;s++){ uint32_t d1=GLD32(0x7FC80000u+(0x4800u+s*6u+1u)*4u);
-                        uint32_t b=d1&0xFFFFF000u; if(b>=0x04000000u && b<0x20000000u){ texBase=0xA0000000u|b; break; } }
+                    // find a bound texture (physical-window base): scan 32 fetch slots (6dw) for a 0x05xxxxxx base.
+                    // Task #8 cont. (cont.25): ALSO decode the texture DIMENSIONS — the Xenos 2D texture fetch
+                    // constant stores width-1 in d2[12:0], height-1 in d2[25:13], data_format in d1[5:0]. The dims
+                    // are the key to mapping a UI sprite draw to a disk .png (match by size) for disk-texturing.
+                    uint32_t texBase=0, texW=0, texH=0, texFmt=0;
+                    for(uint32_t s=0;s<32;s++){ uint32_t d1=GLD32(0x7FC80000u+(0x4800u+s*6u+1u)*4u);
+                        uint32_t b=d1&0xFFFFF000u; if(b>=0x04000000u && b<0x20000000u){ texBase=0xA0000000u|b;
+                            uint32_t d2=GLD32(0x7FC80000u+(0x4800u+s*6u+2u)*4u);
+                            texW=(d2&0x1FFFu)+1u; texH=((d2>>13)&0x1FFFu)+1u; texFmt=d1&0x3Fu; break; } }
                     bool onScreen = ox>-1.2f && ox<1.2f && oy>-1.2f && oy<1.2f;
-                    fprintf(stderr, "[scene] #%d prim=%u numI=%u World=(%.0f,%.0f) origin→clip=(%.2f,%.2f) %s tex=0x%X\n",
-                            sk, prim, numInd, Tx, Ty, ox, oy, onScreen?"ON":"off", texBase);
+                    fprintf(stderr, "[scene] #%d prim=%u numI=%u World=(%.0f,%.0f) origin→clip=(%.2f,%.2f) %s tex=0x%X %ux%u fmt=0x%X\n",
+                            sk, prim, numInd, Tx, Ty, ox, oy, onScreen?"ON":"off", texBase, texW, texH, texFmt);
                     // one-shot: does the bound texture hold real pixel data (non-zero/varied)? decides whether
                     // texturing the backdrop/sprites shows real art, or the render-to-texture never ran.
                     if (texBase) { static std::atomic<bool> tdmp{false}; bool e=false;
