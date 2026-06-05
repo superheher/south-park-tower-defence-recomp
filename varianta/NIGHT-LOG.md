@@ -3102,3 +3102,39 @@ wired into this resource's stream source (a **TRACTABLE loader-plumbing bug**), 
 build)? This is the FIRST evidence the gate might be tractable. Entry points: sub_8224F890 (resource fetch),
 sub_82247E70 (returns null), the global heap 0x828F9A78, and whatever should populate *(output+16) for shaders.
 Default boot unregressed throughout.
+
+## cont.27 (2026-06-05, /loop "работай дальше автономно") — ⭐ advance-gate resource IDENTIFIED = Meshes\Global.bin; prod loads it, variant A doesn't (strace prod-oracle, no gdb)
+
+Continued cont.26's open question (tractable vs deep). New gated diag REX_RESID (default boot unregressed). Used
+**strace on the PROD binary as the oracle** — sidesteps the gdb-SIGSEGV-paging problem entirely (same file-open
+syscalls). Commit cont.27 (NOT pushed).
+
+**Resource IDENTIFIED (REX_RESID dumps the stuck sub_8211BE68 call's job arg + the static descriptors as
+hex/ASCII).** job r3 = 0x820D2844 = the path string **"Assets\Global\Meshes\Global.bin"** — a global MESH
+resource (NOT a shader; cont.26's SQ_PROGRAM_CNTL came from a different field). In sub_8211B740 (the transition
+handler, ppc_recomp.3.cpp:11227) the path is loaded into r3 (`addi r3,r11,10308`) then sub_8211BE68(r3=path) is
+called directly — exactly ONCE (Textures\Global.bin is loaded by a different path). So sub_8211BE68(path) is the
+fetch of Meshes\Global.bin.
+
+**sub_8211BE68's flow has NO file-open** — it's a pure FETCH expecting the resource pre-loaded: sub_8224F890
+(sub_82248AF8 = name-lookup in the registry; sub_8224F918→sub_82247E70 = lookup-by-path → NULL) then sub_82249C08
+(a "not-ready" WARNING/callback, NOT a loader: it calls sub_8244E4D0 with a string + a stored callback *(obj+12),
+no open) → null buffer → sub_82250110 null-source stream → sub_82110728 runaway (cont.26). So a SEPARATE
+global-asset loader must open+register Meshes\Global.bin before the transition runs.
+
+**⭐ PROD-ORACLE (strace -f -tt -e trace=openat on south_park_td, 40s).** Prod opens **Meshes/Global.bin at
+20:37:52.729, immediately after Textures/Global.bin (.571)**, then a full batch: StructureGeom.bin, WallsGeom.bin,
+CharacterGeom.bin, ParticleTextures.bin, Projectiles.bin, Structures.bin… (107 distinct assets; reaches the menu).
+**Variant A opens Textures/Global.bin (#64) then STOPS at 65 assets — never opens Meshes/Global.bin.** (These are
+exactly the assets REX_FORCEBE68 unlocked.) So the global-asset loader loads a SEQUENCE (Textures\Global.bin →
+Meshes\Global.bin → gameplay meshes/textures); variant A's halts right after Textures\Global.bin.
+
+**⇒ REFRAME (corrects cont.25's "GPU resource create" framing).** The advance gate needs **Meshes\Global.bin —
+a MESH = CPU vertex/index data, loaded by plain file I/O that variant A implements faithfully** — NOT a GPU
+texture/EDRAM create. tid=10's bt is stuck in sub_8211BE68's deserialize runaway (NOT in a texture create) ⇒ NOT
+blocked on GPU. **Strongest evidence yet that the gate is TRACTABLE** (a loader-sequence/ordering divergence around
+a CPU mesh asset). ⚠ Honest open Q (rigor — NOT yet pinned): WHY does variant A's global-asset loader stop after
+Textures\Global.bin? Could be a loader bug/ordering (tractable) or a real sub-gate. ⭐ NEXT /loop: find the
+global-asset loader (what opens Textures\Global.bin and should continue to Meshes\Global.bin) and its stop
+condition — instrument the NtCreateFile caller chain / find the manifest-driven loader; the prod strace
+(/tmp/prod_strace.log) gives the exact asset order to match. Default boot unregressed. New tool: REX_RESID.

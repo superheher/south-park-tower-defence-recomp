@@ -2378,6 +2378,30 @@ PPC_FUNC(sub_8211BE68) {
         ctx.r3.u64 = 0;
         return;
     }
+    // REX_RESID (cont.27): identify the resource the stuck advance-gate fetch is for. Dump the job arg + the
+    // two static descriptors the fetch uses (sub_8224F890's type key 0x820DA30C, sub_82247E70's comparator
+    // 0x820D066C) as hex+ASCII (MSVC vtable/RTTI may carry a class name) to learn if it's a shader/render res.
+    static const bool resid = getenv("REX_RESID") != nullptr;
+    if (resid && _lr == 0x8211B894u) {
+        static std::atomic<int> rc{0};
+        if (rc.fetch_add(1) < 3) {
+            auto dumpr = [&](const char* nm, uint32_t a){
+                fprintf(stderr, "[resid] %s @0x%08X hex:", nm, a);
+                for (int i=0;i<8;i++) fprintf(stderr, " %08X", PPC_LOAD_U32(a+i*4));
+                fprintf(stderr, "  asc:");
+                for (int i=0;i<48;i++){ uint8_t c=PPC_LOAD_U8(a+i); fprintf(stderr, "%c", (c>=32&&c<127)?(char)c:'.'); }
+                fprintf(stderr, "\n");
+            };
+            uint32_t job = ctx.r3.u32;
+            fprintf(stderr, "[resid] === sub_8211BE68 job(r3)=0x%08X ===\n", job);
+            dumpr("typekey 820DA30C", 0x820DA30Cu);
+            dumpr("compare 820D066C", 0x820D066Cu);
+            // follow word0 of each one level (vtable -> code, or RTTI -> name)
+            uint32_t k0 = PPC_LOAD_U32(0x820DA30Cu);
+            if (k0 >= 0x82000000u && k0 < 0x83000000u) dumpr("  typekey[0]->", k0);
+            if (job >= 0x82000000u && job < 0xA0000000u) dumpr("job->", job);
+        }
+    }
     AdvLog(_lr, 0x8211B894u, "sub_8211BE68", "ENTER"); __imp__sub_8211BE68(ctx, base); AdvLog(_lr, 0x8211B894u, "sub_8211BE68", "RET");
 }
 ADV_HOOK(sub_8211D160, 0x8211B8A4u)
