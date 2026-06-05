@@ -110,6 +110,17 @@ void PPCInvokeGuest(PPCContext& ctx, uint8_t* base, uint32_t target)
     // dispatch to sub_8210AF90 (the 0x828E82A6 setter) ever fires.
     uint32_t lr = static_cast<uint32_t>(ctx.lr);
     bool trace = g_traceB740 && lr >= 0x8211B748u && lr < 0x8211C000u;
+    // REX_ADVGATE (cont.25 R2): the intro→menu advance gate. sub_8211B740's middle-block dispatch at
+    // lr=0x8211B91C is vtable[33] of the screen-state global *(0x828E83C0) — the path to sub_8210AF90 (the
+    // 0x828E82A6 setter). It appears in NEITHER the [b740] success trace NOR as INDIRECT-NULL ⇒ likely not
+    // reached (the direct sub_82267630 just before it not returning). Log it the instant it IS reached, with
+    // the computed target, to confirm whether it fires + where it points. Default-off.
+    static const bool s_advgate = getenv("REX_ADVGATE") != nullptr;
+    if (s_advgate && (lr == 0x8211B91Cu || lr == 0x8211B964u)) {
+        static std::atomic<int> ag{0}; if (ag.fetch_add(1) < 8)
+            fprintf(stderr, "[advgate] REACHED dispatch lr=0x%08X target=0x%08X (vtable method -> %s)\n",
+                    lr, target, target == 0x8210AF90u ? "sub_8210AF90 THE SETTER!" : "other");
+    }
     // REX_UITRACE (deep build, task #5): capture the D3D dynamic-VB Lock/fill/Unlock method targets in the text
     // renderer sub_821F8E60 (the un-emitted bind+draw). Its 3 indirect call sites by return-lr: vtable+200
     // factory (0x821F906C, returns r30=VB obj), vtable+120 Lock (0x821F9098), vtable+124 Unlock/submit

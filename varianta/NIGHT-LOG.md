@@ -2921,3 +2921,21 @@ connect the populated textures to the executed draws. ⚠ [texbind] sees slots 0
 0..31 — its "tex=0x0" was partly a too-small scan. NEXT (R1 cont.): widen the per-draw scan to 0..42, correlate
 executed-draw→populated-texture, sample via g_texPipe (cont.24) → first real textured UI draw. Gated diag
 `REX_TEXBIND` ([texbind] + per-bind data sample). Commits pending (NOT pushed).
+
+**cont.25 /loop R1-cont + R2.** R1-cont (commit 6918042): widened the per-draw texture scan to slots 0..42 +
+populated-check — the EXECUTED menu draws STILL bind NO texture (sprite/text/tri = slot −1; backdrop = empty
+EDRAM). The 14 populated textures are bound by OTHER draws; AND the binds are RUN-TO-RUN VARIABLE (36 once, 1 in
+4 retries — cont.12 NOTOKEN race). ⇒ both walls root in the title not advancing to the interactive menu.
+**R2 — the A↔B advance gate, precisely localized:** intro→menu transition `sub_82163118` is gated behind byte
+**0x828E82A6**, set by prod via **sub_8210AF90** (chain sub_82250420[tid=10]→sub_8211B740[718-line handler]→
+sub_8210AF90). MEASURED (REX_INITDIAG/REX_TRACEB740/new REX_ADVGATE): sub_82250420 ✓ + sub_8211B740 ✓ run, but
+**sub_8210AF90 NEVER runs** (byte stays 0). [b740] inside sub_8211B740: calls at 0x8211B7D4(sub_82118E10→1),
+0x8211B804(sub_82248F18→0x0133F260), then JUMPS to the tail 0x8211BE60(sub_82249018) — **skipping the middle
+block** holding the sub_8210AF90 dispatch at **0x8211B91C** (vtable[33] of the screen-state global *(0x828E83C0)).
+REX_ADVGATE: 0x8211B91C/0x8211B964 NEVER reached (no success, no INDIRECT-NULL). The loc_8211B81C→dispatch path
+is a LINEAR run of direct calls (sub_82131758/8213E7E8/82132918/8212BE48/8211BD60/82110BE8/82267630) ⇒ the divert
+is a non-returning middle call or a longjmp/SEH unwind to the tail. **XFLAG force = broken stopgap:** forces the
+byte → state machine advances PREMATURELY → INDIRECT-NULL crash at sub_8215DE84 (0xFFFFFFFF) + only 12 assets (vs
+65). NEXT (R2 cont.): gdb single-step sub_8211B740 from 0x8211B804 to find the exact divert, OR prod-oracle
+compare (why prod reaches sub_8210AF90 — a return value / global state that differs). cont.21 "A↔B" root; the
+proper fix makes the title advance naturally. New gated diag `REX_ADVGATE` ([advgate]). Commits pending (NOT pushed).
