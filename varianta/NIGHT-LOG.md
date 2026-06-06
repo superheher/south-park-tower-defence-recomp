@@ -3608,3 +3608,31 @@ sustained build, cont.10-35), now with the exact entry function (sub_821B0F18) l
 REX_TEXSCAN. **NEXT:** decode the sub_821B0F18 descriptor structs (which field = source ptr / width / height /
 format / dest GPU block) → then either implement the tile+upload here (the keystone) or confirm it's GPU-deferred
 (A↔B). Entry: sub_821B0F18 (ppc_recomp ~135148) + its 0x9825xxxx descriptors + the sub_82108xxx caller.
+
+## cont.40 (2026-06-06, /loop "go deep renderer job") — DECODED the texture-create: sub_821BE840 = CreateTexture (dims+format captured); the POPULATE (Lock/copy) is the precise missing step
+
+Climbed the create/allocator chain to the actual texture-CREATE and read its signature. Default boot UNREGRESSED
+(96 assets, exit137, 0 crash, clamp 4×; all gated behind REX_TEXSCAN). RE iteration (no new render).
+
+**The chain, fully decoded (each level via a reliable hook + the resource path string):**
+- **sub_821B0F18 = AUDIO resource-create** — its r4 = the resource PATH ("media\Assets\Audio\MainSoundBank.xsb").
+  A RED HERRING (cont.39 mis-guessed it as the texture-create because it's render-range; it allocates GPU blocks
+  for SOUND BANKS). Added a GuestStr() path decoder.
+- **sub_82448090 (loader range) = the texture GPU-memory ALLOCATOR** — r3 = size (0xE1000=924KB / 0x43800=276KB =
+  the cont.38 texture blocks); caller 0x821BE8F0. It just allocates the block (→ sub_824495D8 → MmAllocate).
+- **⭐ sub_821BE840 = the TEXTURE-CREATE (D3D CreateTexture)** — args: **r3 = WIDTH** (0x500=1280 / 0x280=640),
+  **r4 = HEIGHT** (0x2D0=720 / 0x168=360), r5=1 (depth), r6=1 (mips), **r8 = FORMAT token (0x28000002)**, r10=3;
+  **returns a texture OBJECT (ret=0x06xxxxxx, the UI/texture range)** and allocates the GPU dest block (0xA49xxxxx).
+  Caller 0x8232D488. The first texture is **1280×720** (full-screen — the menu bg / a render target; 1280×720×1 =
+  0xE1000 = the 924KB block exactly → ~1 byte/px, consistent with DXT5/an 8-bit format).
+
+**⭐ KEYSTONE PRECISELY LOCATED:** CreateTexture (sub_821BE840) **RUNS** — it allocates the GPU block + records
+dims/format + returns a texture object — but it takes **NO source data** (it's an empty-texture alloc). So the
+missing step (cont.25 R0 "allocates but the data-populate doesn't execute") is the **POPULATE = the title's
+Lock/copy/Unlock that uploads the decompressed source (working buffers 0xA27-0xA2F, cont.38) into the texture
+object's GPU block.** That Lock/copy/Unlock is what doesn't run (or is GPU-deferred = A↔B). New gated diags
+[texdesc]/[texload]/[texcreate2] under REX_TEXSCAN; GuestStr() path decoder. **NEXT:** find the title's texture
+POPULATE — how it writes data into the texture object (0x06xxxxxx) / its GPU block (Lock-Unlock, or a copy command)
+— and why it doesn't run; then implement it (I have dims/format/dest from CreateTexture; need to bind the source
+working buffer) OR confirm it's GPU-deferred. Entry: sub_821BE840 (the texture object 0x06xxxxxx + its GPU block) +
+the caller 0x8232D488.

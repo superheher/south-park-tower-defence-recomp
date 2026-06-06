@@ -2080,6 +2080,28 @@ void StartVblankPump() {
 // sole immediate caller of MmAllocatePhysicalMemoryEx). To find the texture-CREATE (the cont.25 R0 keystone that
 // allocates the GPU-window texture blocks but never populates them), hook the allocator and log ITS immediate
 // caller (ctx.lr, reliable — no fragile back-chain walk) whenever it returns a GPU-window (0xA4-0xA5) block.
+// cont.40: correlate the texture-create with its GPU-block alloc (thread-local set by the allocator hook) so the
+// descriptor structs can be dumped ONLY for the sub_821B0F18 calls that actually allocate a GPU texture block.
+static thread_local uint32_t g_tl_lastGpuAlloc = 0;
+// Dump 28 dwords of a descriptor object, flagging fields that look like a GPU block / working buffer / a dim.
+static void DumpDesc(const char* tag, uint32_t obj) {
+    if (obj < 0x1000u || obj >= 0xC0000000u) { fprintf(stderr, "    %s=0x%08X (not a ptr)\n", tag, obj); return; }
+    fprintf(stderr, "    %s=0x%08X:", tag, obj);
+    for (int i = 0; i < 28; i++) { uint32_t v = GLD32(obj + i*4); const char* f = "";
+        if (v >= 0xA4000000u && v < 0xA6000000u) f = "<GPU";
+        else if (v >= 0xA0000000u && v < 0xA4000000u) f = "<WBUF";
+        else if (v >= 0x04000000u && v < 0x07000000u) f = "<src?";
+        else if (v >= 8 && v <= 2048) f = "<n";
+        fprintf(stderr, " [%02d]=%08X%s", i, v, f); }
+    fprintf(stderr, "\n");
+}
+// Read a guest string (chars are stored in normal byte order; read base[addr+i] directly).
+static std::string GuestStr(uint32_t addr, int maxLen = 80) {
+    std::string s; if (addr < 0x1000u || addr >= 0xC0000000u) return "(null)";
+    for (int i = 0; i < maxLen; i++) { uint8_t c = g_base[addr + i]; if (!c) break; s += (c >= 32 && c < 127) ? (char)c : '.'; }
+    return s;
+}
+
 extern "C" PPC_FUNC(__imp__sub_824495D8);
 PPC_FUNC(sub_824495D8)
 {
@@ -2089,6 +2111,7 @@ PPC_FUNC(sub_824495D8)
     if (s_texscan) {
         uint32_t result = ctx.r3.u32;
         if (result >= 0xA4000000u && result < 0xA6000000u) {
+            g_tl_lastGpuAlloc = result;   // cont.40: let the sub_821B0F18 hook know a GPU block was just allocated
             static std::mutex m; static std::unordered_map<uint32_t,int> seen;
             std::lock_guard<std::mutex> lk(m);
             if (seen[caller]++ == 0)
@@ -2097,21 +2120,69 @@ PPC_FUNC(sub_824495D8)
     }
 }
 
-// REX_TEXSCAN (cont.39): sub_821B0F18 is the render-range texture-create (it allocates the GPU-window texture
-// blocks via sub_824495D8). Log its entry args (r3-r10) to learn the create signature — which arg is the source
-// pixel pointer / dims / format — so the missing tile+upload (cont.25 R0 keystone) can be implemented here.
+// REX_TEXSCAN (cont.39/40): sub_821B0F18 is the render-range texture-create. cont.40: dump its descriptor structs
+// (r3/r4/r5 = 0x9825xxxx) ONLY when it allocates a GPU block — to find which field = source ptr / dims / format /
+// dest GPU block, the basis for implementing the missing tile+upload (cont.25 R0 keystone).
 extern "C" PPC_FUNC(__imp__sub_821B0F18);
 PPC_FUNC(sub_821B0F18)
 {
     static const bool s_texscan = getenv("REX_TEXSCAN") != nullptr;
-    if (s_texscan) {
-        static std::atomic<int> n{0}; int i = n.fetch_add(1);
-        if (i < 14) fprintf(stderr, "[texcreatefn] #%d r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X lr=%08X\n",
-                            i, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32, (uint32_t)ctx.lr);
-    }
+    uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32, r7 = ctx.r7.u32, lr = (uint32_t)ctx.lr;
+    if (s_texscan) g_tl_lastGpuAlloc = 0;       // cleared; the original sets it if it allocs a GPU block
     __imp__sub_821B0F18(ctx, base);
-    if (s_texscan) { static std::atomic<int> m{0}; int i = m.fetch_add(1);
-        if (i < 14) fprintf(stderr, "[texcreatefn] #%d -> r3=%08X\n", i, ctx.r3.u32); }
+    if (s_texscan && g_tl_lastGpuAlloc) {
+        static std::atomic<int> n{0}; int i = n.fetch_add(1);
+        if (i < 60) {
+            std::string path = GuestStr(r4);   // cont.40: r4 = the resource PATH ("media\Assets\...")
+            bool tex = path.find("extur") != std::string::npos || path.find("Hud") != std::string::npos ||
+                       path.find("Graphics") != std::string::npos || path.find("Frontend") != std::string::npos ||
+                       path.find(".bin") != std::string::npos;
+            fprintf(stderr, "[texdesc] #%d -> GPU 0x%08X path='%s'%s\n", i, g_tl_lastGpuAlloc, path.c_str(), tex ? "  <-- TEXTURE?" : "");
+            if (tex) { DumpDesc("r3", r3); DumpDesc("r5", r5); }   // full-dump the texture creates' descriptors
+        }
+    }
+}
+
+// cont.40: sub_82448090 (loader range) is the OTHER creator of GPU-window blocks (it allocates the 924KB/272KB
+// TEXTURE blocks at 0xA49xxxxx — sub_821B0F18 turned out to be AUDIO). Dump its args/path/descriptors when it
+// allocates a GPU block, to find the texture source/dims/format/dest (the cont.25 R0 upload keystone).
+extern "C" PPC_FUNC(__imp__sub_82448090);
+PPC_FUNC(sub_82448090)
+{
+    static const bool s_texscan = getenv("REX_TEXSCAN") != nullptr;
+    uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32, r7 = ctx.r7.u32, lr = (uint32_t)ctx.lr;
+    if (s_texscan) g_tl_lastGpuAlloc = 0;
+    __imp__sub_82448090(ctx, base);
+    if (s_texscan && g_tl_lastGpuAlloc) {
+        static std::atomic<int> n{0}; int i = n.fetch_add(1);
+        if (i < 40) {
+            std::string p3 = GuestStr(r3), p4 = GuestStr(r4), p5 = GuestStr(r5);
+            fprintf(stderr, "[texload] #%d -> GPU 0x%08X lr=%08X | r3=%08X('%s') r4=%08X('%s') r5=%08X('%s') r6=%08X r7=%08X ret=%08X\n",
+                    i, g_tl_lastGpuAlloc, lr, r3, p3.c_str(), r4, p4.c_str(), r5, p5.c_str(), r6, r7, ctx.r3.u32);
+            DumpDesc("r3", r3); DumpDesc("r5", r5);
+        }
+    }
+}
+
+// cont.40: sub_821BE840 is the TEXTURE-CREATE proper — it calls the GPU allocator sub_82448090 (at 0x821BE8F0)
+// for the big 924KB/276KB texture blocks. Dump its args + the objects they point to: this level should carry the
+// source pixel pointer + dims + format (the inputs for the missing tile+upload, cont.25 R0 keystone).
+extern "C" PPC_FUNC(__imp__sub_821BE840);
+PPC_FUNC(sub_821BE840)
+{
+    static const bool s_texscan = getenv("REX_TEXSCAN") != nullptr;
+    uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32, r7 = ctx.r7.u32,
+             r8 = ctx.r8.u32, r9 = ctx.r9.u32, r10 = ctx.r10.u32, lr = (uint32_t)ctx.lr;
+    if (s_texscan) g_tl_lastGpuAlloc = 0;
+    __imp__sub_821BE840(ctx, base);
+    if (s_texscan && g_tl_lastGpuAlloc) {
+        static std::atomic<int> n{0}; int i = n.fetch_add(1);
+        if (i < 20) {
+            fprintf(stderr, "[texcreate2] #%d -> GPU 0x%08X lr=%08X ret=%08X | r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X\n",
+                    i, g_tl_lastGpuAlloc, lr, ctx.r3.u32, r3, r4, r5, r6, r7, r8, r9, r10);
+            DumpDesc("r3", r3); DumpDesc("r4", r4);
+        }
+    }
 }
 
 extern "C" PPC_FUNC(__imp__sub_821B9270);
