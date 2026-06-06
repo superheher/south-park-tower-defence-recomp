@@ -3761,3 +3761,31 @@ signal and would be the test bed IF a genuinely tiled texture is found. New gate
 late multi-vbc sampling. **NEXT:** (a) compose the real textures into the actual menu LAYOUT (needs the per-draw
 mapping / the draw stream — cont.24's open problem); (b) find a genuinely TILED texture to fix/confirm the tiler;
 (c) the advance-gate (deep A↔B) for the live interactive menu.
+
+## cont.45 (2026-06-06, /loop "render the real menu from working buffers") — the faithful composed MENU is blocked (executed draws have stubbed texture bindings even at late attract); the GPU-window textures are gameplay sprite-sheets + logos, not a composable menu screen
+
+Continued the render-path redirect: tried to render the title's actual composed menu (bind the now-populated
+GPU-window textures to the title's draws). Measurement iteration (no code change). Two findings:
+
+**(1) The faithful menu composition is BLOCKED — the executed draws have stubbed texture bindings, even at late
+attract.** REX_EXECSEGS + REX_SCENE at a late attract state (50s, after the GPU window populates): the executed
+device+13568 segment draws are STILL the frontend placeholders — prim5 sprite at off-screen (-253,-226) tex=0x0,
+prim4 tri at (64,36) tex=0x0, prim13 text tex=0x0, prim8 backdrop = EDRAM(0xB0000000) empty. **NO draw binds a real
+GPU-window texture.** So the real per-draw texture→draw mapping is NOT in the executed segments — it's in the
+inlined-D3D SetTexture path that the recomp stubbed (cont.23-24 dead-end), confirmed now at late attract: the
+populated textures (cont.44) are bound by the kicked ring IBs variant A doesn't execute, not the segments.
+
+**(2) The GPU-window textures are gameplay EFFECT sprite-sheets, not menu UI.** The clean-decoded 512×512 (e.g.
+0xA55C2000) is a 16-frame green-screen EXPLOSION/poof animation (green = chroma/alpha key); others are tornado/
+lightning/fire FX + a sunburst + red UI panels (cont.44). The 1920×1080 DXT1 (0xA51C3000) does NOT decode clean
+(grid artifact — tiled, or wrong format/dims). So there's no single full-screen "menu" image in the GPU window;
+the complete faithful frontend renders remain the intro LOGOS (working buffers: Microsoft splash + Comedy Central,
+cont.44).
+
+**⇒ HONEST CONCLUSION for "render the real menu":** the real TEXTURES are decoded + shown (cont.44), but the
+COMPOSED menu SCREEN cannot be faithfully rendered — the title's menu draw→texture bindings are stubbed (the
+recompiled inlined-D3D path), so the exact layout requires the deep render build (reconstruct the SetTexture/
+SetStreamSource bindings, cont.23 entry sub_821F8E60). A heuristic compose (real textures at guessed positions)
+is possible but would be a MOCK-UP, not the title's real layout. NEXT: either the deep render build (reconstruct
+the stubbed per-draw bindings — the path to the real composed menu) or a clearly-labeled heuristic compose if a
+visible menu-like result is wanted over fidelity.
