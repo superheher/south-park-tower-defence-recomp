@@ -4143,3 +4143,31 @@ working-buffer texture: per textured DRAW_INDX (slot0 type=2), decode slot0 d1's
 draw's geometry+UV (vtxSlot=1 vbase), UploadTexture, and draw that group with that texture (extend the textured
 pipeline g_texPipe / SubmitTexturedGeometry to per-draw {verts, texture}). Capture (REX_RENDER_SHOT). Refine the
 scanline/pitch (try height/2 or the real pitch) for the logo/font textures.
+
+## cont.59 (2026-06-06, /loop) — the composed menu is blocked by the GEOMETRY, not the textures: the executed segment has bound textures (cont.57) but NO valid vertex source (the cont.34 placeholder program). Textures are the solved half.
+
+Started the per-draw textured render (cont.58 NEXT). Checked the per-draw GEOMETRY first (cont.22-23 flagged the
+sprite/text vertex pools as "soup") — DECISIVE: the executed textured draws have NO usable geometry:
+  - [esidx]: every textured draw reads idxBase=0xA0006000 **sz=0x80000000 (the not-ready sentinel)**, idx=[0,0,0,0],
+    and the verts at vbase read **(0.0, 0.0)**.
+  - [esvf]: the VS's own vfetch decodes to **slot 0 (the TEXTURE slot, type=2)** with base 0xA5004800 (font atlas) /
+    0xA2000000, off=0, v0=(0,0) — i.e. the executed segment's VS is a PLACEHOLDER that fetches from the texture
+    slot, not a real vertex buffer. esdraw's slot-1 "vertex" base (0xA018A244) has words=2753285 (absurd) = garbage.
+
+⇒ the executed segment (device+13568) is the cont.34 PLACEHOLDER program: it has the real per-draw TEXTURES bound
+(cont.57, slot0 d1 = the 0xA2 working buffers) but a placeholder VS + not-ready/garbage index+vertex buffers. The
+REAL menu geometry is in the title's dynamic VBs (e.g. the text VB 0xA022FFF0 that sub_821F8E60 fills, cont.47) which
+the placeholder segment does NOT read. So the composed menu AT REAL POSITIONS is blocked by the GEOMETRY (the cont.34
+real-frame / cont.22-23 vertex-source wall) — NOT by the textures (decoded + bound, the solved half, cont.56-58).
+
+**⇒ Honest session state (cont.52-59):** the "render the real menu FROM WORKING BUFFERS" directive is SOLVED at the
+texture level — the menu's per-draw textures ARE the 0xA2-0xA3 working buffers, decoded + bound + shown (cont.56-58,
+image sent). The remaining wall is the COMPOSITION's geometry: variant A executes a placeholder segment (textures
+bound, geometry not), and the real menu frame (which reads the dynamic-VB geometry) isn't executed = the cont.34
+A↔B / deep renderer wall (cont.21-49 territory, multi-week).
+
+**⇒ NEXT (cont.60):** two tracks — (a) VISIBLE-NOW (no geometry): render the decoded menu textures LIVE in variant A's
+Vulkan (contact-sheet / reuse cont.37 REX_HUDSHEET but from the live working-buffer fetch constants) → proves the
+working-buffer→live-render path on-screen (capture+send); (b) the real composition = attack the geometry — find the
+real menu draws' vertex source (the dynamic VBs 0xA022FFF0+, cont.47) and either read+compose them with the per-draw
+textures, or get the real frame executed (cont.34). Track (b) is the deep wall; (a) is the tangible interim render.
