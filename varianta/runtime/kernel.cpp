@@ -838,6 +838,12 @@ namespace { uint32_t g_physNext = 0xA0000000; }  // Xbox physical-address window
 // R0 keystone (REX_TEXWATCH): non-static so an attached gdb can read it by name after the SIGTRAP, to set a
 // hardware write-watchpoint on g_base + g_texWatchAddr and catch the texture-populate writer (or confirm none).
 uint32_t g_texWatchAddr = 0;
+// REX_TEXSCAN (cont.38): the COMPLETE, bind-independent sweep cont.25 R0 never did (it sampled only the FIRST
+// 924KB block). Tracks every >=256KB physical alloc so the vblank pump can sample each for population — to
+// rigorously settle whether ANY tiled texture data exists in guest GPU memory at the attract state.
+struct TexAlloc { uint32_t addr, size; };
+std::vector<TexAlloc> g_texAllocs;
+std::mutex g_texAllocsMtx;
 // PVOID MmAllocatePhysicalMemoryEx(flags r3, size r4, protect r5, min r6, max r7, align r8)
 PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
 {
@@ -851,6 +857,10 @@ PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
     uint32_t addr = g_physNext;
     g_physNext += size ? size : pageSize;
     KTRACE("MmAllocatePhysicalMemoryEx(sz=0x%X prot=0x%X) -> 0x%X\n", size, protect, addr);
+    // REX_TEXSCAN: record texture-sized blocks (>=256KB) so the vblank pump can sweep them for population.
+    { static const bool s_texscan = getenv("REX_TEXSCAN") != nullptr;
+      if (s_texscan && size >= 0x40000u) { std::lock_guard<std::mutex> lk(g_texAllocsMtx);
+          if (g_texAllocs.size() < 256) g_texAllocs.push_back({addr, size}); } }
     // R0 keystone (REX_TEXWATCH): GPU texture memory IS allocated but never populated (atlas zeros). Flag the
     // FIRST big-texture block (0xE1000 ≈ 924KB) so an attached gdb can hardware-watchpoint it and catch WHO
     // writes it (the decode/upload = "model the upload" territory) — or confirm NOTHING does (decode stubbed =
@@ -1892,6 +1902,66 @@ void VblankPump() {
             fprintf(stderr, "[ldframe] vbc=%u childrenStarted=%d/20 ch0(+136)=%u ch0(+152)=0x%X ch0(+160)=0x%X | atlasA5004800=%08X edramB0000000=%08X | tex0x%X[0/64k/900k]=%08X %08X %08X |%s\n",
                     vbc, started, rd(0x82657578u+136), rd(0x82657578u+152), rd(0x82657578u+160),
                     rd(0xA5004800u), rd(0xB0000000u), tw, t0, t1, t2, buf);
+        }
+        // REX_TEXSCAN (cont.38): the COMPLETE bind-independent texture sweep — (1) every tracked texture-sized
+        // physical alloc sampled for population, (2) the reg-file fetch region (0x4800..0x48BF, 32 slots × 6 dw)
+        // for set texture fetch constants. If a fetch const has populated data, DECODE it (cont.36 decoder,
+        // tiled!) -> PPM = the live-tiled-texture render + the tiler's hardware confirmation. Once, at steady state.
+        static const bool s_texscan = getenv("REX_TEXSCAN") != nullptr;
+        static int s_scanDone = 0;
+        if (s_texscan && (vbc % 300) == 60 && s_scanDone < 3) {
+            s_scanDone++;
+            auto rd = [&](uint32_t a){ uint32_t b; memcpy(&b, g_base + a, 4); return __builtin_bswap32(b); };
+            std::lock_guard<std::mutex> lk(g_texAllocsMtx);
+            int populated = 0;
+            for (size_t i = 0; i < g_texAllocs.size(); i++) {
+                uint32_t a = g_texAllocs[i].addr, sz = g_texAllocs[i].size, nz = 0, samples = 0;
+                for (uint32_t off = 0; off + 4 <= sz; off += 4096) { if (rd(a + off)) nz++; samples++; }
+                bool pop = samples && nz > samples / 20;   // >5% of sampled dwords nonzero
+                if (pop) populated++;
+                if (i < 28)
+                    fprintf(stderr, "[texscan] block#%zu 0x%08X sz=0x%X nz=%u/%u %s first=%08X %08X\n",
+                            i, a, sz, nz, samples, pop ? "POPULATED" : "zero", rd(a), rd(a + 4));
+                // decode-attempt: if the block looks like an 8888 image (size <=8MB, pixel count = a clean
+                // common width), decode it as linear 8888 -> PPM, to SEE the title's in-memory texture data.
+                if (pop && sz <= 0x800000u) {
+                    uint32_t px = sz / 4, w = 0;
+                    if (px % 1280 == 0 && px / 1280 <= 1200) w = 1280;
+                    else if (px % 1024 == 0 && px / 1024 <= 1200) w = 1024;
+                    else if (px % 512 == 0 && px / 512 <= 1200) w = 512;
+                    else if (px % 256 == 0 && px / 256 <= 1200) w = 256;
+                    if (w) { uint32_t hh = px / w;
+                        rex_tex::Desc dd{}; dd.guestBase = a; dd.format = rex_tex::FMT_8_8_8_8; dd.width = w; dd.height = hh; dd.tiled = 0; dd.endian = rex_tex::END_NONE;
+                        std::vector<uint8_t> rgba;
+                        if (rex_tex::DecodeGuestToRGBA(dd, rgba) && !rgba.empty()) {
+                            char p[96]; snprintf(p, sizeof p, "/tmp/texblk_%08X_%ux%u.ppm", a, w, hh);
+                            rex_tex::WriteRGBAasPPM(p, rgba.data(), w, hh);
+                            fprintf(stderr, "[texscan] block 0x%08X decoded as %ux%u 8888 -> %s\n", a, w, hh, p);
+                        }
+                    }
+                }
+            }
+            int texConsts = 0, decoded = 0;
+            for (int slot = 0; slot < 32; slot++) {
+                uint32_t base = 0x4800u + slot * 6;
+                uint32_t d0 = rd(0x7FC80000u + base * 4), d1 = rd(0x7FC80000u + (base + 1) * 4), d2 = rd(0x7FC80000u + (base + 2) * 4);
+                uint32_t b = d1 & 0xFFFFF000u;
+                if (b < 0x04000000u || b >= 0x20000000u) continue;
+                uint32_t ga = 0xA0000000u | b, fmt = d1 & 0x3Fu, w = (d2 & 0x1FFFu) + 1, h = ((d2 >> 13) & 0x1FFFu) + 1, tiled = (d0 >> 31) & 1u;
+                uint32_t s0 = rd(ga), s1 = rd(ga + 4); texConsts++;
+                fprintf(stderr, "[texscan] fetch slot %d base=0x%08X %ux%u fmt=0x%X tiled=%u data=%08X %08X\n", slot, ga, w, h, fmt, tiled, s0, s1);
+                if ((s0 || s1) && rex_tex::BytesPerBlock(fmt)) {     // populated + decodable -> decode it
+                    rex_tex::Desc dd{}; dd.guestBase = ga; dd.format = fmt; dd.width = w; dd.height = h; dd.tiled = tiled; dd.endian = (d1 >> 6) & 3u;
+                    std::vector<uint8_t> rgba;
+                    if (rex_tex::DecodeGuestToRGBA(dd, rgba) && !rgba.empty()) {
+                        char p[96]; snprintf(p, sizeof p, "/tmp/texscan_s%d_%08X_%ux%u_f%02X_t%u.ppm", slot, ga, w, h, fmt, tiled);
+                        rex_tex::WriteRGBAasPPM(p, rgba.data(), w, h);
+                        fprintf(stderr, "[texscan] DECODED fetch slot %d -> %s\n", slot, p); decoded++;
+                    }
+                }
+            }
+            fprintf(stderr, "[texscan] SUMMARY vbc=%u: %zu tex-allocs (%d POPULATED); %d fetch-consts set, %d decoded\n",
+                    vbc, g_texAllocs.size(), populated, texConsts, decoded);
         }
         uint32_t cb = g_interruptCallback;
         if (!cb) continue;

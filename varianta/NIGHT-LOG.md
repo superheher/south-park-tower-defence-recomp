@@ -3543,3 +3543,38 @@ hygiene respected: REX_RENDER in the FOREGROUND with `timeout -s KILL -k 5` (nev
 lesson). New gated flag REX_HUDSHEET. NEXT: (a) map the contact-sheet approach toward the title's actual menu
 composition, or render OTHER containers (Character/Enemy/Particle textures); (b) the live wire-up (decode the
 title's tiled guest textures when a draw binds one); (c) the deep A<->B work.
+
+## cont.38 (2026-06-06, /loop "go deep renderer job") — REX_TEXSCAN: a COMPLETE bind-independent guest-memory sweep CORRECTS cont.25 R0 + decodes the title's OWN in-memory texture (the Microsoft splash) from guest memory
+
+Planned step: rigorously settle whether the title has any decodable texture data in guest memory at the attract
+state (rather than assume cont.25 R0's "texture blocks zero"). Built REX_TEXSCAN — a complete sweep of EVERY
+texture-sized (>=256KB) physical allocation + the reg-file fetch region, with a decode-attempt. Default boot
+UNREGRESSED (96 assets, exit137, 0 crash, clamp 4×; all gated behind REX_TEXSCAN). Image sent.
+
+**⭐ CORRECTS cont.25 R0:** R0 sampled only the FIRST 924KB block (0xA49xxxxx) and called all GPU texture memory
+zero. The complete sweep of all 24 texture-sized allocs shows a SPLIT:
+- **0xA4–0xA5 GPU-texture-window blocks (the 5×924KB + 11×272KB, incl. cont.25's flagged 0xA4949000): ZERO** —
+  confirms the upload-into-the-GPU-window doesn't run (the verdict HOLDS for the GPU window).
+- **0xA27–0xA2F blocks (#3-7): POPULATED** with ARGB8888-looking pixels (first dwords FF8CA88C / FFFEFEFE /
+  FF000000, alpha=FF) — the title's **decompressed image working buffers**, which cont.25 never looked at. block#7
+  (0xA2FF9000, sz=0x384000 = exactly 1280×720×4) is a clean full-screen image.
+- **fetch region: only EDRAM (0xB0000000) set, NO texture fetch const** — so no texture is bound; the fetch-path
+  decode found nothing (0 decoded). Consistent with cont.36 (the attract state binds no real textures).
+
+**⭐ DECODED the title's OWN in-memory texture:** decoding block#7 as linear 8888 (1280×720) →
+`/tmp/texblk_A2FF9000_1280x720.ppm` = **the "Microsoft Game Studios" splash screen**, a clean recognizable image
+straight from the title's guest memory (NOT a disk read), decoded 1:1 by the cont.36 decoder. (Blocks #3/#5/#6 are
+also real images but my byte-count width-guess was wrong → sheared; their true dims live in the title's image
+object, not a header — block#7 read first=FF8CA88C = raw pixels, no DDS magic.) Image sent to the user.
+
+**⇒ FINDINGS:** (1) the decoder works on the title's REAL runtime texture data, not just disk files. (2) The title
+decompresses images into LINEAR 8888 working buffers (0xA27–0xA2F); the tile+upload into the GPU window (0xA4–0xA5)
+is the step that doesn't run (cont.25/35 verdict holds, now precisely located). (3) ⚠ these working buffers are
+LINEAR (not tiled) and no fetch const references them ⇒ the tiler's HARDWARE confirmation STILL needs the A↔B
+advance (no tiled guest data exists at attract) — but the scan found WHERE the title's texture data lives + a new,
+more-authentic render source (the title's own decompressed images, incl. runtime-composed ones a disk read can't
+give). New gated diag REX_TEXSCAN (tracks >=256KB allocs; sweeps blocks + fetch region; decodes populated blocks).
+**NEXT:** (a) find the title's image object that tracks width/height (to decode blocks #3/#5/#6 correctly, not
+sheared) — likely a struct near each buffer or in a registry; (b) hunt for the menu-BACKGROUND buffer (1280×720)
+at the attract state → render the title's REAL menu bg from its own memory (more authentic than the disk
+LevelSelectBG stand-in); (c) the deep A↔B work (the only path to live TILED textures + the real menu).
