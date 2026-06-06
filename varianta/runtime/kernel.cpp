@@ -906,6 +906,15 @@ std::unordered_map<uint32_t, CachedTex> g_decCache;
 std::vector<uint8_t> g_frameBuf;            // 1280*720*4 RGBA on black, lazy-init
 bool g_frameDirty = false;
 std::mutex g_frameMtx;
+// cont.73: exec-time World+Proj transform per text-label glyph-count (captured at the prim-13 EXECSEGS draw, cont.23)
+// so the guest-thread textured text raster (REX_TEXTRENDER, cont.70-71) can place each label at its GAME-accurate
+// screen position. clip = (lx+Tx)*Px + Pxw (cont.23 tfReal); screen px = (clip+1)*half-extent. Diagnostic: shows
+// whether the menu labels' transforms land on-screen (composable) or off-screen (the executed-segment placeholder).
+struct TextXform { float Tx, Ty, Px, Pxw, Py, Pyw; };
+std::unordered_map<uint32_t, TextXform> g_textXform;
+std::mutex g_textXformMtx;
+std::vector<uint8_t> g_textFrame;           // 1280*720*4, the placed menu text
+std::mutex g_textFrameMtx;
 // PVOID MmAllocatePhysicalMemoryEx(flags r3, size r4, protect r5, min r6, max r7, align r8)
 PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
 {
@@ -1757,6 +1766,11 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
             // screen-ortho Proj c4.x/c4.w, c5.y/c5.w) the segment just set → clip-space glyph quads. Bridges the
             // fill-time verts with the exec-time transform (the two never coexist otherwise). Pairing UNVERIFIED.
             if (tl_txtFrame && prim == 13 && numInd >= 4) {
+                // cont.73: capture this draw's exec-time World+Proj transform keyed by glyph-count, so the guest-thread
+                // REX_TEXTRENDER can place the matching label (same count) at its game-accurate screen position.
+                { auto rg=[&](uint32_t c,int cc){ float f; uint32_t w=GLD32(0x7FC80000u+(0x4000u+c*4+cc)*4u); memcpy(&f,&w,4); return f; };
+                  std::lock_guard<std::mutex> lk(g_textXformMtx);
+                  g_textXform[numInd] = { rg(0,3), rg(1,3), rg(4,0), rg(4,3), rg(5,1), rg(5,3) }; }
                 TxtSnap* snap = nullptr;
                 for (auto& sn : *tl_txtFrame) if (!sn.used && sn.count == numInd) { snap = &sn; sn.used = true; break; }
                 {   // DIAG: every prim-13 text draw's transform (Tx,Ty) — to see where each label wants to land
@@ -2751,6 +2765,37 @@ PPC_FUNC(sub_8242BF10)
                                 rex_tex::WriteRGBAasPPM(fp, fb.data(), LW, LH);
                                 fprintf(stderr,"[textrender] label %d: %u glyphs atlas=0x%08X %dx%d local[%.0f..%.0f,%.0f..%.0f] uv[%.2f..%.2f] -> %s\n",
                                         ti, vc/4, g_lastTexBase, atlas->w, atlas->h, lmnx,lmxx,lmny,lmxy, minu, maxu, fp); } }
+                        // cont.73: GAME-ACCURATE PLACEMENT — if this label's exec-time transform (by glyph-count) was
+                        // captured (cont.23), place the glyphs on the shared 1280x720 g_textFrame at their REAL screen
+                        // positions (clip=(l+T)*P+Pw; screen px=(clip+1)*half). Diagnostic: anyOn = did any glyph land
+                        // on-screen (composable) or off-screen (the executed-segment placeholder, cont.59)?
+                        TextXform xf{}; bool haveXf=false;
+                        { std::lock_guard<std::mutex> lk(g_textXformMtx); auto it=g_textXform.find(vc); if(it!=g_textXform.end()){xf=it->second;haveXf=true;} }
+                        if (haveXf) { const int W=1280,H=720;
+                            std::lock_guard<std::mutex> lk(g_textFrameMtx);
+                            if (g_textFrame.empty()) { g_textFrame.assign(size_t(W)*H*4,0); for(size_t z=0;z<size_t(W)*H;z++) g_textFrame[z*4+3]=255; }
+                            auto sx=[&](float lx){ return ((lx+xf.Tx)*xf.Px+xf.Pxw + 1.f)*0.5f*W; };
+                            auto sy=[&](float ly){ return ((ly+xf.Ty)*xf.Py+xf.Pyw + 1.f)*0.5f*H; };
+                            bool anyOn=false;
+                            for (uint32_t g=0; g+4<=vc; g+=4) {
+                                float gx0=1e9f,gy0=1e9f,gx1=-1e9f,gy1=-1e9f,gu0=1e9f,gv0=1e9f,gu1=-1e9f,gv1=-1e9f;
+                                for(int j=0;j<4;j++){ float px=rdf((g+j)*16),py=rdf((g+j)*16+4),u=rdf((g+j)*16+8),v=rdf((g+j)*16+12);
+                                    gx0=fminf(gx0,px);gy0=fminf(gy0,py);gx1=fmaxf(gx1,px);gy1=fmaxf(gy1,py);
+                                    gu0=fminf(gu0,u);gv0=fminf(gv0,v);gu1=fmaxf(gu1,u);gv1=fmaxf(gv1,v); }
+                                float px0=sx(gx0),px1=sx(gx1),py0=sy(gy0),py1=sy(gy1);
+                                int rx0=(int)(fminf(px0,px1)+0.5f), ry0=(int)(fminf(py0,py1)+0.5f);
+                                int rw=(int)(fabsf(px1-px0)+0.5f), rh=(int)(fabsf(py1-py0)+0.5f); if(rw<1||rh<1||rw>W||rh>H)continue;
+                                for(int yy=0;yy<rh;yy++){ int fy=ry0+yy; if(fy<0||fy>=H)continue; float vv=gv0+(gv1-gv0)*((float)yy/rh);
+                                    int ay=(int)(vv*atlas->h); if(ay<0)ay=0; if(ay>=atlas->h)ay=atlas->h-1;
+                                    for(int xx=0;xx<rw;xx++){ int fx=rx0+xx; if(fx<0||fx>=W)continue; float uu=gu0+(gu1-gu0)*((float)xx/rw);
+                                        int ax=(int)(uu*atlas->w); if(ax<0)ax=0; if(ax>=atlas->w)ax=atlas->w-1;
+                                        const uint8_t* sp=&atlas->rgba[(size_t(ay)*atlas->w+ax)*4]; if(sp[0]<40&&sp[1]<40&&sp[2]<40)continue;
+                                        uint8_t* dp=&g_textFrame[(size_t(fy)*W+fx)*4]; dp[0]=sp[0];dp[1]=sp[1];dp[2]=sp[2];dp[3]=255; anyOn=true; } } }
+                            static std::atomic<int> pn{0}; int pi=pn.fetch_add(1);
+                            if (pi < 16) { char fp[64]; snprintf(fp,sizeof fp,"/tmp/cont73_placed_%02d.ppm", pi);
+                                rex_tex::WriteRGBAasPPM(fp, g_textFrame.data(), W, H);
+                                fprintf(stderr,"[placed] %u glyphs xf(T=%.0f,%.0f P=%.4f,%.4f Pw=%.3f,%.3f) onscreen=%d -> %s\n", vc/4, xf.Tx,xf.Ty,xf.Px,xf.Py,xf.Pxw,xf.Pyw, anyOn, fp); }
+                        }
                     }
                 }
             }

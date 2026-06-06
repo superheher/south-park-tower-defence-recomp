@@ -4535,3 +4535,30 @@ surface at wake. No code change.
 **⇒ NEXT (cont.73):** the deep remaining work toward the live composited menu — game-accurate placement via the
 cont.23 exec-time transform (pair the captured readable menu labels with reg-0x4000 at EXECSEGS → place them at game
 positions; the cont.34 A↔B path), or refine the pre-rendered-string atlases (A2D76000).
+
+## cont.73 (2026-06-07, /loop "go deep renderer job", autonomous — user asleep) — game-accurate placement attempt DEFINITIVELY demonstrates the A↔B wall: the executed segment is a placeholder (only the off-screen debug label), so the real menu text's transform is unavailable
+
+Attempted game-accurate text placement: capture the exec-time World+Proj transform per glyph-count at the prim-13
+EXECSEGS draw (cont.23), then apply it in the guest REX_TEXTRENDER raster to place each label at its real screen
+position (g_textFrame, `[placed]` diagnostic).
+
+**RESULT** (REX_RENDER+EXECSEGS+UITEXT+TEXTRENDER+SKIPINTRO): DECISIVE — all 16 placed frames are the SAME 63-glyph
+DEBUG label (the cont.70 "This control is used as a runtime indicator…" tooltip), ALL **onscreen=0**. Its transform
+T=(334,866) P=(0.0016,-0.0028) → clip_y ≈ −1.5 (above the screen) = cont.23's off-screen "World.y=866". The EXECSEGS
+prim-13 draws captured ONLY this placeholder label's transform — the real menu text (cont.71: SELECT GAME MODE etc.)
+was NOT among them.
+
+**⇒ DEFINITIVE A↔B WALL DEMONSTRATION:** the guest thread builds the REAL menu text (cont.71, readable), but variant A
+executes a PLACEHOLDER segment (cont.59) whose only text draw is the off-screen debug label. So the menu text's
+TRANSFORM (needed for game-accurate placement) is in the un-executed REAL frame, not the executed placeholder. The menu
+CONTENT renders (cont.65/68/70/71); its game-accurate PLACEMENT is the cont.34/59 A↔B wall. This **closes the
+menu-rendering investigation**: rendering ✓, placement = A↔B (multi-week).
+
+**Default boot UNREGRESSED** (gated; 169k lines, 0 real crashes).
+
+**⇒ CONCLUSION of the night's renderer work:** the rendering PRIMITIVES + CONTENT all work (splashes at real positions
+cont.65, decoded assets cont.68, readable menu text cont.70–71); the LIVE composited interactive menu at game-accurate
+positions is the cont.34 A↔B wall (the title gates its real frame on GPU completion variant A can't produce; the
+executed segment is a placeholder), genuinely multi-week. **⇒ NEXT (cont.74+):** the deep menu work has reached its
+wall — shift to refinement/consolidation (slower cadence), or the multi-week A↔B build (execute the real frame). New:
+`g_textXform`, `[placed]`.
