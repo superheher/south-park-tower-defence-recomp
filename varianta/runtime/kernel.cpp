@@ -2665,7 +2665,7 @@ PPC_FUNC(sub_8242BF10)
             if (s_fcompose && lr == 0x82205114u && g_lastTexBase >= 0xA2000000u && g_lastTexBase < 0xA3000000u)
                 AccumulateFrame(g_lastTexBase, minx, miny, maxx, maxy);
             static std::atomic<int> dn{0}; int i = dn.fetch_add(1);
-            if (i < 48)
+            if (i < 600)   // cont.67: raised from 48 (the cap was entirely consumed by the intro phase -> the menu/legal draws were never logged)
                 fprintf(stderr, "[drawcap] #%d lr=0x%08X tex=0x%08X dest=0x%08X vc=%u %s pos[%.1f..%.1f,%.1f..%.1f] uv[%.2f..%.2f,%.2f..%.2f] v0=(%.1f,%.1f / %.2f,%.2f)\n",
                         i, lr, g_lastTexBase, d, vc, space, minx,maxx,miny,maxy, minu,maxu,minv,maxv, rdf(0),rdf(4),rdf(8),rdf(12));
             // cont.64: raw float dump of the IMAGE-renderer fills (lr=0x82205114) to decode the exact vertex format

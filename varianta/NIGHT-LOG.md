@@ -4399,3 +4399,30 @@ also drives toward Level 1, not a clean menu stop — cleanly reaching the main 
 sprite renderer fills, or texcoords set via a different path) so the atlas-based menu renders — OR the TEXT transform
 (cont.23: pair the local-space glyph verts with the World+Proj set later). New: `AccumulateFrame`,
 `SnapshotFrameOnSwap`, `g_frameBuf`, `g_decCache`, `REX_FCOMPOSE`, `[fcompose]`.
+
+## cont.67 (2026-06-07, /loop "go deep renderer job", autonomous — user asleep) — investigation: the sprite path is IMAGE-only (splashes); the menu TEXT is the lr=0x821F90B0 local-space path, gated on the deferred transform (the cont.34 A↔B wall). cont.66's "menu = atlas quads" was a 48-cap artifact.
+
+Followed up cont.66's "the menu needs the atlas per-draw UVs." Findings (all measured):
+- The sprite fill is **sub_822050B8** (ppc_recomp.23, a generic dynamic-VB fill: alloc sub_821C48B0 → one memcpy
+  sub_8242BF10; the per-format vertex STRIDE comes from a table at **0x820A8E60** indexed by r4). It is called
+  INDIRECTLY (no direct `bl` sites) so a weak override won't fire (cont.55) — capturing r4 needs gdb at 0x822050B8.
+- The cont.66 `[drawcap]` log was CAPPED at 48 and entirely consumed by the INTRO phase, so cont.66's "the menu
+  sprites are all the UI atlas 0xA337D000 full-screen quads" was an INTRO artifact, not the menu. Raised the cap to 600.
+- With the cap at 600 + REX_SKIPINTRO: the sprite renderer (lr=0x82205114) draws almost entirely FULL-SCREEN bg quads
+  (0,0)-(1768,1043) + only 2 small non-bg sprites (A2D96000 the SP logo, A2FD1000 64×64). ⇒ the menu's rich content is
+  **NOT** in the image-sprite path.
+- The accumulator (cont.66) DID capture frames of recognizable glyphs (MICROSOFT / copyright text) from per-word 0xA2
+  glyph textures (A2D76000/A2FE9000/…, varying per run) — so legal/title TEXT does render as small textured sprites,
+  but the layout is scattered and the texture set is timing-dependent.
+- The real menu TEXT is the **lr=0x821F90B0** path (sub_821F8E60): glyphs with NORMALIZED uv (font atlas) but in LOCAL
+  space (pos[16.5..458.5, -0.5..76.5]) needing the deferred World+Proj transform — which cont.23 measured = zeros at
+  fill time (set later in the segment variant A doesn't execute = the **cont.34 A↔B wall**).
+
+**⇒ HONEST CONCLUSION:** the IMAGE elements render at real positions (splashes, cont.65); the menu TEXT is local-space
+and gated on the deferred transform = the cont.34 A↔B deep wall (multi-week). The composed interactive menu needs that
+wall cracked OR the title's text positions reconstructed another way. Default boot UNREGRESSED (gated; cap-raise only).
+
+**⇒ NEXT (cont.68):** CONSOLIDATE the achievable on-screen — render the cont.65 real-position splash composite LIVE on
+variant A's Vulkan swapchain (extend cont.60 REX_MENULIVE to the real-position 1280×720 frame, not the contact sheet)
++ capture = on-screen proof of the real boot splash. (The menu TEXT remains the cont.34 A↔B wall — a separate deep
+effort.) Tools for the text route: gdb at 0x822050B8 (capture r4/stride/verts) + the cont.34 segment-execution work.
