@@ -11,6 +11,41 @@
 > completion) are deprioritized: the loader already completes. The "wall" sections below describe the loader as
 > stuck — that is the corrected framing; treat pieces 2–5 + the cont.21 A↔B coupling as the plan.
 
+> ═══════════════════════════════════════════════════════════════════════════════════════════════════
+> ⭐ **cont.49 DEEP-BUILD STATE + ROADMAP (2026-06-06) — read FIRST; consolidates cont.36-48.** User chose the
+> deep render build (cont.47, AskUserQuestion). **DONE:** the Xenos texture DECODER (cont.36, runtime/rex_texture.h
+> — XGAddress2DTiledOffset + Untile + 8888/565/1555/4444 + BC1/2/3, self-tested) and decode of the title's REAL
+> LOADED textures (cont.44 — the GPU window DOES populate over time at attract: 5→103 textures incl. gameplay FX/
+> sprite-sheets/UI; cont.38/42's "GPU window zero" was a too-early sample). Real frontend renders delivered: the
+> intro logos (Microsoft splash 1280×720 + Comedy Central 384×448, from the working buffers) + a heuristic menu
+> mock-up (cont.44-46, images sent).
+>
+> **THE 4 BLOCKERS to a faithful rendered menu (all multi-week; the menu render is MULTIPLY-blocked):**
+> 1. **Per-draw VERTEX binding** — MOSTLY SOLVED. cont.22-23: the executed device+13568 segments have the draws +
+>    geometry; the slot-0 vertex bind is stubbed but cont.23 count-correlation (REX_UITEXT) renders the text/UI
+>    geometry. Proper bind: the text renderer `sub_821F8E60` (ppc_recomp.21:22258) fills a dynamic VB (→0xA022FFF0),
+>    returns it to its callers (21874/22228) which build glyph geometry + draw. The backdrop (prim8) already renders.
+> 2. **Per-draw TEXTURE binding for LOADED textures** — the TRACTABLE remaining piece. The executed UI draws have
+>    `tex=0x0` (cont.45, confirmed late-attract): the inlined-D3D SetTexture that should write the per-draw texture
+>    fetch-const into the deferred segment is recomp-STUBBED (cont.24 dead-end). Entry: find the SetTexture recording
+>    (hook CreateTexture sub_821BE840 → texObj→GPU-base map; find who reads the texObj / writes the segment's tex
+>    fetch-const). The loaded textures (piece-DONE) are available to bind once this is reconstructed.
+> 3. **GENERATED textures (font atlas + EDRAM)** — DON'T RUN. cont.48: the font atlas (0xA5004800, TTF raster) and
+>    EDRAM (0xB0000000, render-to-texture) stay ZERO the whole attract run — the raster/RT generation is stubbed/
+>    gated. So TEXT (needs the font atlas) and the EDRAM backdrop are blocked at the GENERATION step.
+> 4. **Advance-gate (A↔B)** — the on-screen MENU STATE. At attract the UI draws are OFF-SCREEN placeholders (cont.24);
+>    the real on-screen interactive menu needs the title to advance, gated on the gameplay-subsystem creation
+>    (*(0x827FD56C)=0, never created; the creator is indirection-hidden, cont.42-43). Texture data-presence is NOT
+>    the gate (cont.41 texfill). cont.31 forcing reaches L1-loading (skips the menu render).
+>
+> **CRITICAL PATH:** (4) advance to the on-screen menu state → then (1)+(2)+(3) render it. A visible faithful menu
+> needs ≥ (4)+(2) (text also needs (3)). Each is deep RE of the inlined-D3D path. **NEXT executable piece:** (2) the
+> sprite-draw texture binding for loaded textures (find the SetTexture recording) — the most tractable, and reusable
+> once (4) brings the real draws on-screen. Entry points: sub_821F8E60 (VB), sub_821BE840 (CreateTexture/texObj),
+> sub_82292CE0 + 0x827FD56C (subsystem gate), sub_824253C8 + 0x828183A0 (menu-setup handler). Gated diags:
+> REX_TEXSCAN (decode), REX_UITRACE/UITEXT (VB), REX_GATEDIAG (subsystem), REX_TEXFILL/TEXDECODE.
+> ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
 # Variant A — GPU-Resource Subsystem: build plan (cont.23, 2026-06-05)
 
 The authoritative, current plan for the remaining deep build. **Supersedes** the cont.13–19

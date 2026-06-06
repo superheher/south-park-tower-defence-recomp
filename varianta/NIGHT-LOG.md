@@ -3848,3 +3848,19 @@ state (attract draws are off-screen placeholders). A visible REAL menu needs ≥
 push the tractable half — the per-draw TEXTURE binding for the loaded textures (find the title's SetTexture: hook
 CreateTexture sub_821BE840 → record texObj→GPU-base, then find who reads the texObj to bind it / writes the draw's
 texture fetch const). That's the path to texturing the title's real draws with the available loaded textures.
+
+## cont.49 (2026-06-06, /loop "render the real menu" — deep build, paced) — traced the text bind+draw path (confirms cont.23) + CONSOLIDATED the deep-build roadmap into GPU-RESOURCE-BUILD-PLAN.md
+
+Deep-build RE: traced the text renderer's bind+draw. sub_821F8E60 (ppc_recomp.21:22258) takes a material/renderer
+arg (r4, color@+164), fills a dynamic VB (→0xA022FFF0), and RETURNS it (r3) to its 2 callers (21874, 22228), which
+store it (r1+104) and build glyph geometry in a loop (per-glyph float math + vtable calls) then draw. So the
+vertex/geometry path is the cont.23 territory (already rendered via count-correlation); the text TEXTURE is the
+font atlas, which cont.48 showed NEVER populates (generated-texture blocker #3). ⇒ the text path is blocked at the
+atlas; the tractable texture path is the SPRITE draws (loaded textures, which DO populate, cont.44).
+
+**Consolidated the deep-build state (cont.36-48) into an actionable roadmap at the top of GPU-RESOURCE-BUILD-PLAN.md**
+— the 4 blockers (1 vertex binding mostly-solved, 2 texture binding for loaded textures = tractable, 3 generated
+textures don't run, 4 advance-gate), the critical path ((4)→(1)+(2)+(3)), the entry points, and what's DONE
+(decoder + loaded-texture decode). This structures the multi-week build for execution. NEXT executable piece:
+(2) the per-draw texture binding for loaded textures — find the inlined-D3D SetTexture recording (hook CreateTexture
+sub_821BE840 for the texObj→GPU-base map, then find who reads the texObj / writes the segment's texture fetch-const).
