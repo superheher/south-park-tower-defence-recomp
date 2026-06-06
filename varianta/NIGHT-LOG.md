@@ -4171,3 +4171,29 @@ Vulkan (contact-sheet / reuse cont.37 REX_HUDSHEET but from the live working-buf
 working-buffer→live-render path on-screen (capture+send); (b) the real composition = attack the geometry — find the
 real menu draws' vertex source (the dynamic VBs 0xA022FFF0+, cont.47) and either read+compose them with the per-draw
 textures, or get the real frame executed (cont.34). Track (b) is the deep wall; (a) is the tangible interim render.
+
+## cont.60 (2026-06-06, /loop) — ⭐VARIANT A RENDERS THE REAL MENU TEXTURES LIVE from the working buffers (REX_MENULIVE; image sent). On-screen proof of the working-buffer→Vulkan path; geometry/composition still the cont.34 wall.
+
+Did track (a) (cont.59 NEXT). New REX_MENULIVE path: kernel.cpp's REX_TEXDECODE (which decodes each per-draw menu
+texture from the 0xA2 working buffers, cont.58) now also calls the new **rex_render::BlitMenuCell** to composite each
+decoded texture into a render-side 4×2 contact sheet (1024×512, dedup by GPU base); the render thread (PresentOnce)
+uploads it (LoadMenuSheetLive, once ≥3 cells) and draws it via the existing textured pipeline (g_texPipe). Needs
+REX_RENDER + REX_MENUTEST (the textured present path) + REX_EXECSEGS + REX_TEXBIND + REX_TEXDECODE.
+
+**RESULT (captured from the live swapchain, frame 886): variant A's OWN Vulkan renderer draws the REAL menu textures
+live** — the 4×2 cells are the per-draw menu textures decoded via the LIVE fetch constant: top-mid = the South Park
+cityscape/buildings (clean, recognizable), top-left = logo text (scanline artifact), bottom-left = a UI orb, others
+empty/dark (textures that decoded to black or weren't populated at capture). 8 cells blitted (g_menuCells capped 8).
+PNG captured + VIEWED + SENT to the user. This is the first LIVE render (in variant A's renderer, not a PPM dump,
+cont.58) of the real menu art from the working buffers — the working-buffer→decode→UploadTexture→Vulkan path proven
+on-screen end-to-end. Default boot UNREGRESSED (0 crashes, full 20s, attract spin); all changes gated behind
+REX_MENULIVE / the REX flags.
+
+⇒ the "render the real menu FROM WORKING BUFFERS" directive is now demonstrated on-screen at the TEXTURE level (the
+real menu textures render live in variant A). The COMPOSITION (real per-draw positions) remains the cont.34/22-23
+GEOMETRY wall (cont.59: the executed segment is a placeholder with no valid vertex source).
+
+**⇒ NEXT (cont.61):** (a) refine the texture decode (the logo/font scanline/pitch artifact — try the real surface
+pitch / height) for cleaner cells; (b) the real composition = the geometry (cont.34): find the real menu draws'
+vertex source (dynamic VBs 0xA022FFF0+, cont.47) to place the textures, or break the cont.34 A↔B so the real frame
+(geometry+textures) executes. New: rex_render::BlitMenuCell + LoadMenuSheetLive + REX_MENULIVE.

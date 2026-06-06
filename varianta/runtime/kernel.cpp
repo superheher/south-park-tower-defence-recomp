@@ -1447,6 +1447,10 @@ inline void WriteGpuReg(uint32_t index, uint32_t value) {
                             char path[96]; snprintf(path, sizeof path, "/tmp/texdec_%02d_%08X_%ux%u_f%02X.ppm", n, ga, w_, h_, fmt);
                             rex_tex::WriteRGBAasPPM(path, rgba.data(), w_, h_);
                             fprintf(stderr, "[texdecode] wrote %s (tiled=%u endian=%u)\n", path, tiled, endian);
+                            // cont.60: composite the live menu textures (the 0xA2 working buffers) into the
+                            // render-side contact sheet for REX_MENULIVE (the working-buffer -> live render proof).
+                            if (ga >= 0xA2000000u && ga < 0xA3000000u)
+                                rex_render::BlitMenuCell(rgba.data(), (int)w_, (int)h_, ga);
                         }
                     }
                 }

@@ -111,6 +111,7 @@ void*                 g_texVBMap     = nullptr;
 // submitted verts carry synthetic screen→[0,1] UVs, so the 4 quadrants reassemble the full background.
 // Requires REX_MENUTEST (shares its present path); the debug menu-quads then draw panels/text on top.
 const bool g_menutex = (getenv("REX_MENUTEX") != nullptr);
+const bool g_menulive = (getenv("REX_MENULIVE") != nullptr);  // cont.60: live menu-texture contact sheet
 bool                  g_bgLoaded     = false;            // background texture uploaded into g_tex* (once)
 std::mutex            g_texGeomMtx;
 std::vector<float>    g_texGeom;                          // interleaved pos.xy+uv.xy, guarded by g_texGeomMtx
@@ -639,7 +640,7 @@ bool Init() {
     if (!CreateSwapchain()) return false;
     if (g_drawtest) CreateGraphicsPipeline();   // GPU build (piece 1): render pass already made in CreateSwapchain
     if (g_menutest) CreateMenuPipeline();       // GPU build (piece 3b): the menu-quad pipeline
-    if (g_textest || g_menutex || g_hudsheet) CreateTexturedPipeline();   // disk-resource path: the textured UI pipeline
+    if (g_textest || g_menutex || g_hudsheet || g_menulive) CreateTexturedPipeline();   // disk-resource path: the textured UI pipeline
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -857,6 +858,23 @@ bool LoadHudSheetOnce() {
     return UploadTexture(sheet.data(), SW, SH);
 }
 
+// cont.60 (REX_MENULIVE): live menu-texture contact sheet. kernel.cpp's REX_TEXDECODE decodes each per-draw
+// menu texture (the 0xA2 working buffers, cont.58) and calls BlitMenuCell (below) to composite it here; the
+// render thread uploads + draws the sheet (proves the working-buffer texture -> live Vulkan render path).
+static const int MS_COLS = 4, MS_CELL = 256;
+static const int MS_W = MS_COLS * MS_CELL, MS_H = 2 * MS_CELL;   // 1024x512, up to 8 cells
+static std::vector<uint8_t> g_menuSheet;
+static std::mutex           g_menuSheetMtx;
+static uint32_t             g_menuBases[8] = {0};
+static std::atomic<int>     g_menuCells{0};
+
+bool LoadMenuSheetLive() {                       // render thread: upload the sheet once enough cells are placed
+    if (!g_menulive || g_menuCells.load() < 3) return false;   // wait for several menu textures to decode+blit
+    std::lock_guard<std::mutex> lk(g_menuSheetMtx);
+    if (g_menuSheet.empty()) return false;
+    return UploadTexture(g_menuSheet.data(), MS_W, MS_H);
+}
+
 void PumpEvents() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -903,12 +921,12 @@ bool PresentOnce() {
             if (g_texGeoVBMap) memcpy(g_texGeoVBMap, g_texGeom.data(), g_texGeom.size()*sizeof(float)); }
         // disk-resource path (REX_TEXTEST): one-time texture upload + textured-quad VB, BEFORE the render pass
         // (the upload uses its own command buffer + a blocking wait, which must not be nested in g_cmd's pass).
-        if ((g_textest || g_hudsheet) && g_texPipe && !g_texVB) {
+        if ((g_textest || g_hudsheet || g_menulive) && g_texPipe && !g_texVB) {
             const char* texfile = getenv("REX_TEXFILE");   // a real .png to load; else the procedural checker
-            // cont.37: REX_HUDSHEET decodes the title's real HUD DDS container into a contact sheet; else
-            // REX_TEXFILE=<png> or the procedural checker (REX_TEXTEST).
-            if (g_hudsheet ? LoadHudSheetOnce() : (texfile ? LoadPNGToTexture(texfile) : CreateTestTexture())) {
-                const float fs = g_hudsheet ? 0.98f : 0.9f, lo = g_hudsheet ? -0.98f : 0.1f;
+            // cont.37: REX_HUDSHEET decodes the title's real HUD DDS container into a contact sheet; cont.60:
+            // REX_MENULIVE composites the live-decoded menu textures (working buffers); else REX_TEXFILE/checker.
+            if (g_menulive ? LoadMenuSheetLive() : g_hudsheet ? LoadHudSheetOnce() : (texfile ? LoadPNGToTexture(texfile) : CreateTestTexture())) {
+                const float fs = (g_hudsheet || g_menulive) ? 0.98f : 0.9f, lo = (g_hudsheet || g_menulive) ? -0.98f : 0.1f;
                 const float tq[] = {                                 // pos.xy + uv.xy, 2 tris, clip-space quad
                     lo,lo, 0.0f,0.0f,  fs,lo, 1.0f,0.0f,  fs,fs, 1.0f,1.0f,
                     lo,lo, 0.0f,0.0f,  fs,fs, 1.0f,1.0f,  lo,fs, 0.0f,1.0f };
@@ -966,7 +984,7 @@ bool PresentOnce() {
         }
         // disk-resource path (REX_TEXTEST / cont.37 REX_HUDSHEET): draw the textured quad — validates the
         // textured pipeline end to end (pos+uv input + sampler2D descriptor + SPTextured FS = tex(diffuse,uv)*color).
-        if ((g_textest || g_hudsheet) && g_texPipe && g_texSet && g_texVB) {
+        if ((g_textest || g_hudsheet || g_menulive) && g_texPipe && g_texSet && g_texVB) {
             vkCmdBindPipeline(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_texPipe);
             VkDeviceSize to = 0; vkCmdBindVertexBuffers(g_cmd, 0, 1, &g_texVB, &to);
             vkCmdBindDescriptorSets(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_texLayout, 0, 1, &g_texSet, 0, nullptr);
@@ -1189,6 +1207,28 @@ void SubmitTexturedGeometry(const float* posUV, int vertCount) {
     g_texGeomVerts.store(vertCount);
     static int s_logged = 0;
     if (s_logged++ < 3) fprintf(stderr, "[render] disk-resource: textured geometry submitted (%d verts)\n", vertCount);
+}
+
+// cont.60: composite a live-decoded per-draw menu texture into the contact sheet (see rex_render.h).
+void BlitMenuCell(const uint8_t* rgba, int w, int h, uint32_t base) {
+    if (!g_menulive || !rgba || w <= 0 || h <= 0) return;
+    std::lock_guard<std::mutex> lk(g_menuSheetMtx);
+    if (g_menuSheet.empty()) {                                  // lazy-init: dark-grey background
+        g_menuSheet.assign((size_t)MS_W * MS_H * 4, 0);
+        for (size_t i = 0; i < g_menuSheet.size(); i += 4) { g_menuSheet[i]=g_menuSheet[i+1]=g_menuSheet[i+2]=30; g_menuSheet[i+3]=255; }
+    }
+    int cell = -1, n = g_menuCells.load();
+    for (int i = 0; i < n; i++) if (g_menuBases[i] == base) { cell = i; break; }
+    if (cell < 0) { if (n >= 8) return; g_menuBases[n] = base; cell = n; g_menuCells.store(n + 1); }
+    int cx = (cell % MS_COLS) * MS_CELL, cy = (cell / MS_COLS) * MS_CELL;
+    float s = std::min((float)MS_CELL / (float)w, (float)MS_CELL / (float)h);
+    int dw = (int)(w * s), dh = (int)(h * s);
+    for (int yy = 0; yy < dh; yy++) for (int xx = 0; xx < dw; xx++) {
+        int sx = (int)(xx / s), sy = (int)(yy / s); if (sx >= w || sy >= h) continue;
+        const uint8_t* sp = &rgba[((size_t)sy * w + sx) * 4];
+        uint8_t* dp = &g_menuSheet[((size_t)(cy + yy) * MS_W + (cx + xx)) * 4];
+        dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = 255;
+    }
 }
 
 } // namespace rex_render

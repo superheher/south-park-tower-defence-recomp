@@ -29,4 +29,11 @@ void SubmitMenuGeometry(const float* clipXY, int vertCount);
 // for the backdrop quadrants — synthetic screen→[0,1] UVs reassemble the full background across them.
 // Gated behind REX_MENUTEX (the renderer must also be in REX_MENUTEST mode for the present path).
 void SubmitTexturedGeometry(const float* posUV, int vertCount);
+
+// cont.60 (REX_MENULIVE): composite a live-decoded per-draw menu texture (the 0xA2 working buffers,
+// cont.58) into a render-side contact sheet. Called from kernel.cpp's REX_TEXDECODE after it decodes each
+// bound menu texture (rgba = w*h*4 RGBA8; base = the texture's GPU base, used to dedup into a grid cell).
+// The render thread (PresentOnce) uploads + draws the sheet, proving the working-buffer texture -> live
+// Vulkan render path on-screen. Gated behind REX_MENULIVE (no-op otherwise).
+void BlitMenuCell(const uint8_t* rgba, int w, int h, uint32_t base);
 }
