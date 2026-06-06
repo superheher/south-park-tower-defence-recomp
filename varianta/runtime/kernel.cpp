@@ -841,7 +841,7 @@ uint32_t g_texWatchAddr = 0;
 // REX_TEXSCAN (cont.38): the COMPLETE, bind-independent sweep cont.25 R0 never did (it sampled only the FIRST
 // 924KB block). Tracks every >=256KB physical alloc so the vblank pump can sample each for population — to
 // rigorously settle whether ANY tiled texture data exists in guest GPU memory at the attract state.
-struct TexAlloc { uint32_t addr, size; };
+struct TexAlloc { uint32_t addr, size, lr; };
 std::vector<TexAlloc> g_texAllocs;
 std::mutex g_texAllocsMtx;
 // PVOID MmAllocatePhysicalMemoryEx(flags r3, size r4, protect r5, min r6, max r7, align r8)
@@ -857,10 +857,21 @@ PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
     uint32_t addr = g_physNext;
     g_physNext += size ? size : pageSize;
     KTRACE("MmAllocatePhysicalMemoryEx(sz=0x%X prot=0x%X) -> 0x%X\n", size, protect, addr);
-    // REX_TEXSCAN: record texture-sized blocks (>=256KB) so the vblank pump can sweep them for population.
+    // REX_TEXSCAN: record texture-sized blocks (>=256KB) + the guest CALLER (ctx.lr) so the vblank pump can
+    // sweep them for population AND so the texture-create function (the inlined-D3D create that allocates the
+    // GPU block — cont.38 keystone) is identified by its alloc site. Log the GPU-window (0xA4-0xA5) callers now.
     { static const bool s_texscan = getenv("REX_TEXSCAN") != nullptr;
-      if (s_texscan && size >= 0x40000u) { std::lock_guard<std::mutex> lk(g_texAllocsMtx);
-          if (g_texAllocs.size() < 256) g_texAllocs.push_back({addr, size}); } }
+      if (s_texscan && size >= 0x40000u) { uint32_t lr = static_cast<uint32_t>(ctx.lr);
+          std::lock_guard<std::mutex> lk(g_texAllocsMtx);
+          if (g_texAllocs.size() < 256) g_texAllocs.push_back({addr, size, lr});
+          // The immediate caller (lr) is a generic allocator wrapper; walk the PPC back-chain 3 levels to find
+          // the texture-CREATE (the distinct caller of the GPU-window texture-block allocs vs working buffers).
+          uint32_t sp = ctx.r1.u32, bc1 = sp ? GLD32(sp) : 0, lr1 = bc1 ? GLD32(bc1 + 4) : 0;
+          uint32_t bc2 = bc1 ? GLD32(bc1) : 0, lr2 = bc2 ? GLD32(bc2 + 4) : 0;
+          uint32_t bc3 = bc2 ? GLD32(bc2) : 0, lr3 = bc3 ? GLD32(bc3 + 4) : 0;
+          bool gpu = (addr >= 0xA4000000u && addr < 0xA6000000u);
+          fprintf(stderr, "[texalloc] 0x%08X sz=0x%X lr=%08X up=[%08X %08X %08X]%s\n", addr, size, lr,
+                  lr1, lr2, lr3, gpu ? "  <- GPU-window" : ""); } }
     // R0 keystone (REX_TEXWATCH): GPU texture memory IS allocated but never populated (atlas zeros). Flag the
     // FIRST big-texture block (0xE1000 ≈ 924KB) so an attached gdb can hardware-watchpoint it and catch WHO
     // writes it (the decode/upload = "model the upload" territory) — or confirm NOTHING does (decode stubbed =
@@ -2065,6 +2076,44 @@ void StartVblankPump() {
 // then defer to the original logic. Skip the yield on the pump's own thread, which can re-enter this via
 // the graphics-interrupt callback while legitimately holding the token. Strong def overrides the weak
 // guest alias; __imp__sub_821B9270 is the recompiled body.
+// REX_TEXSCAN (cont.39): sub_824495D8 is the generic physical-memory allocator (its 0x82449634 call site is the
+// sole immediate caller of MmAllocatePhysicalMemoryEx). To find the texture-CREATE (the cont.25 R0 keystone that
+// allocates the GPU-window texture blocks but never populates them), hook the allocator and log ITS immediate
+// caller (ctx.lr, reliable — no fragile back-chain walk) whenever it returns a GPU-window (0xA4-0xA5) block.
+extern "C" PPC_FUNC(__imp__sub_824495D8);
+PPC_FUNC(sub_824495D8)
+{
+    static const bool s_texscan = getenv("REX_TEXSCAN") != nullptr;
+    uint32_t caller = static_cast<uint32_t>(ctx.lr);
+    __imp__sub_824495D8(ctx, base);
+    if (s_texscan) {
+        uint32_t result = ctx.r3.u32;
+        if (result >= 0xA4000000u && result < 0xA6000000u) {
+            static std::mutex m; static std::unordered_map<uint32_t,int> seen;
+            std::lock_guard<std::mutex> lk(m);
+            if (seen[caller]++ == 0)
+                fprintf(stderr, "[texcreate] GPU-window alloc via sub_824495D8 <- caller=0x%08X -> 0x%08X\n", caller, result);
+        }
+    }
+}
+
+// REX_TEXSCAN (cont.39): sub_821B0F18 is the render-range texture-create (it allocates the GPU-window texture
+// blocks via sub_824495D8). Log its entry args (r3-r10) to learn the create signature — which arg is the source
+// pixel pointer / dims / format — so the missing tile+upload (cont.25 R0 keystone) can be implemented here.
+extern "C" PPC_FUNC(__imp__sub_821B0F18);
+PPC_FUNC(sub_821B0F18)
+{
+    static const bool s_texscan = getenv("REX_TEXSCAN") != nullptr;
+    if (s_texscan) {
+        static std::atomic<int> n{0}; int i = n.fetch_add(1);
+        if (i < 14) fprintf(stderr, "[texcreatefn] #%d r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X lr=%08X\n",
+                            i, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32, (uint32_t)ctx.lr);
+    }
+    __imp__sub_821B0F18(ctx, base);
+    if (s_texscan) { static std::atomic<int> m{0}; int i = m.fetch_add(1);
+        if (i < 14) fprintf(stderr, "[texcreatefn] #%d -> r3=%08X\n", i, ctx.r3.u32); }
+}
+
 extern "C" PPC_FUNC(__imp__sub_821B9270);
 PPC_FUNC(sub_821B9270)
 {

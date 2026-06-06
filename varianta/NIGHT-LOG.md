@@ -3578,3 +3578,33 @@ give). New gated diag REX_TEXSCAN (tracks >=256KB allocs; sweeps blocks + fetch 
 sheared) — likely a struct near each buffer or in a registry; (b) hunt for the menu-BACKGROUND buffer (1280×720)
 at the attract state → render the title's REAL menu bg from its own memory (more authentic than the disk
 LevelSelectBG stand-in); (c) the deep A↔B work (the only path to live TILED textures + the real menu).
+
+## cont.39 (2026-06-06, /loop "go deep renderer job") — PINNED the texture-create call chain (the cont.25 R0 keystone): MmAllocate ← sub_824495D8 (generic allocator) ← sub_821B0F18 (render-range texture-create) ← sub_82108xxx
+
+Goal: find the inlined-D3D texture-CREATE that allocates the GPU-window texture blocks (0xA4-0xA5) but never
+populates them (cont.38: source images sit in linear working buffers 0xA27-0xA2F; the tile+upload doesn't run).
+RE-only iteration (REX_TEXSCAN extended); default boot UNREGRESSED (96 assets, exit137, 0 crash, clamp 4×).
+
+**Trace (reliable, via source + a hook — NOT fragile stack-walking):**
+- The sole immediate caller of MmAllocatePhysicalMemoryEx is **sub_824495D8** (site 0x82449634) — a GENERIC
+  physical-memory allocator used for ALL allocs (textures, working buffers, audio). So the texture-create is
+  one level up. ⚠ PPC back-chain stack-walking from the import is UNRELIABLE in recompiled code — most "frames"
+  decoded to data (e.g. FFFE0301 = the shader version token, not a return address); only the immediate ctx.lr is
+  trustworthy.
+- Hooked sub_824495D8 (override + call __imp__) and logged its caller when it returns a GPU-window (0xA4-0xA5)
+  block → **two creators: sub_821B0F18 (site 0x821B0FF0, RENDER range 0x821Bxxxx) + sub_82448090 (loader range).**
+  sub_821B0F18 is the render-side texture-create (the inlined-D3D create).
+- Hooked sub_821B0F18, logged its args: it takes **0x9825xxxx resource-DESCRIPTOR objects** (r3=0x9825DF20/
+  0x9825DDF8, r4=0x9825F050/0x9825F450, r5=0x9825D9../0x9825DE40), called from **sub_82108xxx** (0x82108F8C/
+  0x821084E8); returns r3=0 (the allocated block is stored INTO the descriptor, not returned). The 0x9825xxxx
+  objects are the same resource-working-memory class as cont.26 (0x9825F640 shader / 0x9825F860 stream).
+
+**⇒ STATE:** the texture-create chain is pinned end to end. The source pixels / dims / format / dest-block live
+inside the 0x9825xxxx descriptor structs that sub_821B0F18 consumes. The missing **populate (tile+copy source →
+the allocated GPU block)** is the next layer — either a stubbed step in/after sub_821B0F18, or deferred to a GPU
+copy the title's CP never runs (the A↔B coupling). This is genuine multi-step deep RE (confirms the keystone is a
+sustained build, cont.10-35), now with the exact entry function (sub_821B0F18) localized. New gated diags:
+[texalloc] (alloc + caller), [texcreate] (allocator→creator), [texcreatefn] (sub_821B0F18 signature) under
+REX_TEXSCAN. **NEXT:** decode the sub_821B0F18 descriptor structs (which field = source ptr / width / height /
+format / dest GPU block) → then either implement the tile+upload here (the keystone) or confirm it's GPU-deferred
+(A↔B). Entry: sub_821B0F18 (ppc_recomp ~135148) + its 0x9825xxxx descriptors + the sub_82108xxx caller.
