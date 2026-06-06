@@ -3495,3 +3495,17 @@ cont.24's source PNGs) and closes the verification gap WITHOUT needing the A↔B
 `DecodeGuestToRGBA` → `rex_render::UploadTexture` → bind in the executed-draw path (currently only fires on the
 rare populated bind); (c) the deep A↔B work (execute the real textured ring/segment draws so textures populate).
 New gated diags: REX_TEXSELFTEST, REX_TEXDECODE. Default boot unregressed.
+
+**⭐ DISK-CONTAINER finding (characterized, not yet coded — de-risks the next iteration).** The texture
+containers the title loads (`Assets/Global/Textures/{HudImages,Global,Character,Enemy,Particle,…}.bin`, 11 of
+them) are **zlib-compressed** (magic `78 da`). HudImages.bin = 13.8 MB → **80.4 MB** decompressed = a flat
+sequence of **496 DDS textures**, each `[~12-byte mini-header {id, size, hash}] + [standard 128-byte DDS] +
+[pixel data]`. ALL are **uncompressed 32-bit A8R8G8B8, LINEAR** (DDS `fourcc=0`, `bitcount=32`, pf_flags=0x41;
+masks R=00FF0000 G=0000FF00 B=000000FF A=FF000000 — exactly my FMT_8_8_8_8). Extracted the 256×256 entry and
+decoded it **through the real decoder** (REX_RATDDS path) → `/tmp/hud_256_decoded.png` = a recognizable red HUD
+element (viewed). ⇒ **two conclusions:** (1) the disk-resource textured path is very tractable — 496 real
+menu/HUD textures in a trivially-walkable container, my already-verified 8888 converter handles them; (2) the
+disk data is **LINEAR**, so the title TILES at GPU-upload time (the missing step) and the disk **cannot** close
+the tiler's hardware-confirmation gap — that still needs live tiled guest data (A↔B). The same DDS/8888 format is
+what the title uploads, so the decoder + this container parse are the building blocks for BOTH the disk-resource
+render and the live path. Artifacts: /tmp/HudImages.dec (decompressed), /tmp/hud_256.dds.
