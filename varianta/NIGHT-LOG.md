@@ -4027,3 +4027,30 @@ A↔B" / which-command-buffer question).
 stream the flush + the real per-frame draws target, vs what variant A's renderer executes (EXECSEGS=device+13568 vs
 the ring). Closing that gap (execute the real per-frame draw+flush stream) is the per-draw-texture-binding fix = the
 visible menu. No code change this iteration (investigation/tracing); tools added: vtbl15.gdb, settex.gdb.
+
+## cont.55 (2026-06-06, /loop) — captured the per-draw SetTexture STREAM (real texture handles per menu draw) via a runtime hook; texObj→GPU-block resolution still pending
+
+Built the per-draw texture-binding capture (REX_TEXSEQ). Hooked **sub_821BEC00** (the D3D SetTexture leaf, cont.54).
+⚠ LESSON: sub_821FFB10 / sub_82204BD0 are called INDIRECTLY (vtable → dispatch table → __imp__), which BYPASSES a
+weak-alias override — a runtime hook only fires on a DIRECTLY-called function. sub_821BEC00 is a direct `bl` from
+sub_82204BD0, so `PPC_FUNC(sub_821BEC00)` fires (gdb-confirmed: resolves to kernel.cpp, hit). Also added a
+texObj→GPU-block map (g_texObjToBlock) populated from the CreateTexture hook (sub_821BE840 return).
+
+**MEASURED (attract, headless):** the hook fires; the menu's per-draw SetTexture stream IS captured —
+interspersed stage-clears (texH=0, stage walks the sampler-mask bits) then REAL texture handles
+**0x0610FEB0 / 0x060FEE40 / …** (0x06xxxxxx, matching the cont.54 settex trace). So the title DOES bind real
+per-draw textures (recorded in device state, cont.54). ⚠ But they DON'T resolve to a GPU block: g_texObjToBlock is
+empty for them (CreateTexture sub_821BE840 didn't record these texObjs — either a different create path, or its
+return isn't the same 0x06xxxxxx object), and the handle's first words (h[0..3]=00100003 00000001 00000000…) are NOT
+the GPU base. So the handle→GPU-block→decoded-texture data path is NOT yet closed.
+
+⚠ Also (cont.54 decoupling stands): even fully resolved, this LIVE stream can't bind per-draw at the (batched) draw
+time — the real fix is still the deferred-state FLUSH reaching variant A's executed command buffer. The stream
+capture is the GROUND TRUTH of which textures the menu binds (useful for verifying any future bind), not itself the fix.
+
+Default boot UNREGRESSED (no flag: 0 crashes, full 25s, attract spin). New flag REX_TEXSEQ; new map g_texObjToBlock.
+
+**⇒ NEXT (cont.56):** decode the texture-HANDLE structure (0x0610FEB0): find the field holding the Xenos fetch
+constant / GPU base (0xA4xxxxxx) so handle→decoded-texture resolves (probe more handle words; cross-ref the
+CreateTexture object layout). THEN (the actual fix) the cont.54 draw-time flush → command-buffer gap: find where the
+real per-frame draw+flush stream lives and make variant A execute it (per-draw SET_CONSTANT inline) = visible menu.

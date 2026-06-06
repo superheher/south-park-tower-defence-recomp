@@ -874,6 +874,11 @@ std::mutex g_texAllocsMtx;
 struct TexDims { uint32_t w, h; };
 std::unordered_map<uint32_t, TexDims> g_texCreate;   // GPU block addr -> dims
 std::mutex g_texCreateMtx;
+// cont.55: CreateTexture also returns a texture OBJECT (0x06xxxxxx); map texObj -> its GPU block so the
+// per-draw SetTexture chain (sub_821F8E60 -> sub_821FFB10 -> sub_82204BD0, REX_TEXSEQ) can resolve the
+// bound texture for each menu draw to its decoded GPU data (the per-draw texture-binding ground truth).
+std::unordered_map<uint32_t, uint32_t> g_texObjToBlock;   // texObj -> GPU block addr
+std::mutex g_texObjMtx;
 // PVOID MmAllocatePhysicalMemoryEx(flags r3, size r4, protect r5, min r6, max r7, align r8)
 PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
 {
@@ -2243,6 +2248,12 @@ PPC_FUNC(sub_821BE840)
              r8 = ctx.r8.u32, r9 = ctx.r9.u32, r10 = ctx.r10.u32, lr = (uint32_t)ctx.lr;
     g_tl_lastGpuAlloc = 0;
     __imp__sub_821BE840(ctx, base);
+    // cont.55: record the returned texture object (ctx.r3 after the call) -> its GPU block, for REX_TEXSEQ.
+    if (g_tl_lastGpuAlloc && ctx.r3.u32 >= 0x06000000u && ctx.r3.u32 < 0x07000000u) {
+        std::lock_guard<std::mutex> lk(g_texObjMtx);
+        g_texObjToBlock[ctx.r3.u32] = g_tl_lastGpuAlloc;
+        g_texCreate[g_tl_lastGpuAlloc] = {r3, r4};   // also keep dims keyed by block (unconditional now)
+    }
     if ((s_texscan || s_texfill) && g_tl_lastGpuAlloc && r3 && r4 && r3 <= 4096 && r4 <= 4096) {
         // cont.44: record this texture's dims (r3=width, r4=height) keyed by its GPU block, so REX_TEXSCAN can
         // decode the (tiled) data at the correct dims when the title populates it over time.
@@ -2270,6 +2281,33 @@ PPC_FUNC(sub_821BE840)
         static std::atomic<int> fn{0};
         if (fn.fetch_add(1) < 8) fprintf(stderr, "[texfill] filled 0x%08X %u bytes (%ux%u fmt=%08X)\n", g_tl_lastGpuAlloc, bytes, w, h, r8);
     }
+}
+
+// cont.55: the D3D SetTexture leaf (sub_821F8E60 -> vtable[15] sub_821FFB10 -> vtable[8] sub_82204BD0 -> DIRECT
+// bl sub_821BEC00). Hooked here (not sub_821FFB10/sub_82204BD0, which are called INDIRECTLY via the dispatch
+// table -> __imp__ and bypass a weak-alias override); sub_821BEC00 is a direct bl so the override fires. Args:
+// r3=device, r5=the texture HANDLE the draw binds, r6=sampler-stage mask. REX_TEXSEQ logs the per-draw texture
+// SEQUENCE and resolves the handle to its decoded GPU block (the cont.55 texObj->block map / a field of the
+// handle) = the per-draw texture-binding GROUND TRUTH. cont.45's tex=0x0 = this binding never reaches variant A's
+// executed command buffer (the cont.54 deferred-state-flush gap); this shows WHICH real textures the menu binds.
+extern "C" PPC_FUNC(__imp__sub_821BEC00);
+PPC_FUNC(sub_821BEC00)
+{
+    static const bool s_texseq = getenv("REX_TEXSEQ") != nullptr;
+    if (s_texseq) {
+        uint32_t h = ctx.r5.u32, dev = ctx.r3.u32, stage = ctx.r6.u32;
+        static std::atomic<int> n{0}; int i = n.fetch_add(1);
+        if (i < 64) {
+            auto resolve = [](uint32_t o)->uint32_t{ std::lock_guard<std::mutex> lk(g_texObjMtx); auto it=g_texObjToBlock.find(o); return it!=g_texObjToBlock.end()?it->second:0; };
+            uint32_t blk = h ? resolve(h) : 0;
+            uint32_t w0 = h ? GLD32(h+0) : 0, w1 = h ? GLD32(h+4) : 0, w2 = h ? GLD32(h+8) : 0, w3 = h ? GLD32(h+12) : 0;
+            uint32_t blkF = 0;   // the handle may WRAP the texObj/block in a field — probe the first words too
+            if (!blk) { for (uint32_t f : {w0,w1,w2,w3}) { uint32_t b=resolve(f); if (b){ blkF=b; break; } } }
+            fprintf(stderr, "[texseq] #%d dev=0x%08X texH=0x%08X stage=0x%08X -> block=0x%08X (viaField=0x%08X) | h[0..3]=%08X %08X %08X %08X\n",
+                    i, dev, h, stage, blk, blkF, w0, w1, w2, w3);
+        }
+    }
+    __imp__sub_821BEC00(ctx, base);
 }
 
 extern "C" PPC_FUNC(__imp__sub_821B9270);
