@@ -4524,3 +4524,14 @@ clean scene-reaching (cont.34 A↔B), but the CONTENT all renders.
 **⇒ NEXT (cont.72):** (a) handle the A2D76000-style pre-rendered-string atlases (render the whole string texture, not
 glyph-quad sampling); (b) OR game-accurate placement via the cont.23 exec-time transform; (c) OR consolidate a morning
 report (the night's results: splash renders + asset inventory + readable menu text). New: dedup in REX_TEXTRENDER.
+
+## cont.72 (2026-06-07, /loop "go deep renderer job", autonomous — user asleep) — consolidation: combined night-results montage + morning report
+
+The night's rendering wins (cont.63–71) are comprehensive. Built `/tmp/SP_night_results.png` (a combined montage: boot
+splashes at real positions + the decoded asset inventory + readable menu text) and
+`varianta/MORNING-REPORT-2026-06-07.md` (structured summary). NOT sent to the user (asleep until 10:00 MSK) — to
+surface at wake. No code change.
+
+**⇒ NEXT (cont.73):** the deep remaining work toward the live composited menu — game-accurate placement via the
+cont.23 exec-time transform (pair the captured readable menu labels with reg-0x4000 at EXECSEGS → place them at game
+positions; the cont.34 A↔B path), or refine the pre-rendered-string atlases (A2D76000).
