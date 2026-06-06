@@ -4426,3 +4426,28 @@ wall cracked OR the title's text positions reconstructed another way. Default bo
 variant A's Vulkan swapchain (extend cont.60 REX_MENULIVE to the real-position 1280×720 frame, not the contact sheet)
 + capture = on-screen proof of the real boot splash. (The menu TEXT remains the cont.34 A↔B wall — a separate deep
 effort.) Tools for the text route: gdb at 0x822050B8 (capture r4/stride/verts) + the cont.34 segment-execution work.
+
+## cont.68 (2026-06-07, /loop "go deep renderer job", autonomous — user asleep) — ⭐REX_TEXDUMP decodes the title's full BOUND-texture inventory: the real menu/level-select assets (character portraits, text strings) exist and decode
+
+New `REX_TEXDUMP` (kernel.cpp sub_821BEC00 hook): decode each distinct BOUND texture once (guest-side, any 0xA2–0xB0
+base) → PPM. The executed-segment REX_TEXDECODE only sees textures bound in the replayed segments; the menu/text draws
+bind their textures on the guest thread, which never reach that path. With REX_SKIPINTRO (reaches the menu/level
+assets), it dumped **19 distinct bound textures**:
+- **CHARACTER PORTRAITS 215×110 fmt6:** Cartman (ADB63000), Stan (ADB9B000), Kyle (ADBB7000) — recognizable, the real
+  menu/level-select character art.
+- **PRE-RENDERED TEXT STRINGS 256×256 FMT_8 (fmt2):** A337D000, A2FD9000 ("…/THIS GAME…/X360…" = legal/copyright text
+  baked into textures), A2D76000, A2FE9000, ACE54000, ACE78000, B09E2000.
+- the splash logos (A2D96000 SP, A2E12000 doublesix, A2F25000 CC), 40×40 icons (ACE74000/AD8BA000/B09CC000/B09CF000),
+  a 256×64 banner (B09D2000).
+Montage `/tmp/cont68_uitex.png` (viewed) — Stan/Kyle/Cartman + the text-string atlases.
+
+**⇒ the menu's real assets EXIST and DECODE cleanly** (incl. the FMT_8 single-channel text atlases). This reframes
+cont.66/67: the "scattered glyphs" were these pre-rendered text-string textures; the menu has rich content (portraits,
+text). The remaining gap is their DRAW POSITIONS — the portraits are 0xAD/0xB0 base, OUTSIDE cont.65's 0xA2
+ComposeRealFrame filter, so they're decoded but not yet placed.
+
+**Default boot UNREGRESSED** (gated REX_TEXDUMP; 172k lines, 0 real crashes).
+
+**⇒ NEXT (cont.69):** widen ComposeRealFrame/AccumulateFrame to the 0xAC–0xB0 menu textures + capture their sprite
+draw rects (the portraits/panels' positions) → compose the real menu/level-select screen (character portraits at
+their real positions). New: `REX_TEXDUMP`, `[texdump]`.

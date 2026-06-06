@@ -2390,6 +2390,25 @@ PPC_FUNC(sub_821BEC00)
                 g_texDimsByBase[gbase] = { (uint16_t)(w > 4096 ? 4096 : w), (uint16_t)(ht > 4096 ? 4096 : ht),
                                            (uint16_t)(pitch > 8192 ? 8192 : pitch), (uint8_t)fmt, (uint8_t)endian, (uint8_t)((d0 >> 31) & 1) };
             }
+            // cont.68: REX_TEXDUMP — decode each distinct BOUND texture once to a PPM (guest-side, any 0xA2/0xA3 base).
+            // The executed-segment REX_TEXDECODE only sees textures bound in the replayed segments; the TEXT draws bind
+            // the font atlas (A337D000 256x256 FMT_8) on the guest thread, which never reaches that path. This dumps it.
+            static const bool s_texdump = getenv("REX_TEXDUMP") != nullptr;
+            if (s_texdump && type == 2 && w > 1 && ht > 1 && rex_tex::BytesPerBlock(fmt) != 0) {
+                static std::unordered_set<uint32_t> dumped; static std::mutex dm;
+                bool first; { std::lock_guard<std::mutex> lk(dm); first = dumped.insert(gbase).second; }
+                if (first) {
+                    uint32_t p2 = ((d0 >> 22) & 0x1FFu) << 5;
+                    rex_tex::Desc dd{}; dd.guestBase = gbase; dd.format = fmt; dd.width = w; dd.height = ht;
+                    dd.tiled = (d0 >> 31) & 1; dd.endian = endian; dd.pitchTexels = (p2 > w) ? p2 : 0;
+                    std::vector<uint8_t> r;
+                    if (rex_tex::DecodeGuestToRGBA(dd, r) && !r.empty()) {
+                        char pp[96]; snprintf(pp, sizeof pp, "/tmp/texbound_%08X_%ux%u_f%02X.ppm", gbase, w, ht, fmt);
+                        rex_tex::WriteRGBAasPPM(pp, r.data(), w, ht);
+                        fprintf(stderr, "[texdump] %s\n", pp);
+                    }
+                }
+            }
             if (s_texseq) {
                 static std::atomic<int> n{0}; int i = n.fetch_add(1);
                 if (i < 48)
