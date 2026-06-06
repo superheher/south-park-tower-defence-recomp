@@ -3864,3 +3864,26 @@ textures don't run, 4 advance-gate), the critical path ((4)→(1)+(2)+(3)), the 
 (decoder + loaded-texture decode). This structures the multi-week build for execution. NEXT executable piece:
 (2) the per-draw texture binding for loaded textures — find the inlined-D3D SetTexture recording (hook CreateTexture
 sub_821BE840 for the texObj→GPU-base map, then find who reads the texObj / writes the segment's texture fetch-const).
+
+## cont.50 (2026-06-06, /loop "render the real menu" — deep build, paced) — the advance-gate's registrations are SYSTEMATICALLY indirection-hidden (static RE exhausted); pivot to the PROD-ORACLE
+
+Worked the critical-path blocker (piece 4, the advance-gate). Piece 2 (SetTexture) is gated behind the menu state
+(textures aren't set for the attract PLACEHOLDER draws — cont.45), so the menu state must be reached first. The menu
+state has the menu-setup handler gate (cont.31: *(0x828183A0) = 0xFFFFFFFF unregistered sentinel; forcing it → L1).
+Tried to find the handler's REGISTRATION (the proper fix vs cont.31's guard): decoded the access (sub_824253C8,
+ppc_recomp.59:21119 — base 0x82820000 via lis -32126, offset -31840 → 0x828183A0, + the +4 field); a precise search
+for the WRITER (lis -32126 / addi -31840 + a store to +0/+4) found **NOTHING** — like the gameplay-subsystem creator
+(cont.43). ⇒ **the advance-gate's gate-clearing registrations (menu-setup handler 0x828183A0 + gameplay subsystem
+0x827FD56C) are SYSTEMATICALLY indirection-hidden** (written via passed pointers / computed bases, not direct
+stores). **Static RE for the advance-gate is EXHAUSTED.**
+
+**⇒ PIVOT to the PROD-ORACLE (cont.25's suggested method).** The prod recomp binary exists
+(out/build/linux-amd64-release/south_park_td, 20MB, WORKING — reaches gameplay). prod + variant A are
+recompilations of the SAME XEX (same sub_XXXX); the advance-gate gap is in variant A's RUNTIME (a stub returns
+not-ready) vs prod's full runtime — the subsystem-creation/handler-registration path runs in prod but stalls in
+variant A. Catching HOW prod does it → replicate in variant A. NEXT: prod-oracle — e.g. an LD_PRELOAD software
+watchpoint (mprotect + SIGSEGV-catch, no gdb [cont.25: gdb impractical for the recomp's lazy-paging SIGSEGV]) on
+0x827FD56C / 0x828183A0 in prod to catch the writer PC → map to the recompiled function → find the runtime trigger
+variant A stubs. ⚠ HONEST: this needs prod's guest g_base (to compute the host watch address) + careful SIGSEGV
+handling = a significant tooling effort (focused session). The deep-build advance-gate is genuinely autonomously-
+hard; the achievable renders (decoder + real textures + mock-up) are delivered (cont.44-46).
