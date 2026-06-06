@@ -4224,3 +4224,52 @@ build (cont.21-49 territory); /loop iterations narrow it but haven't cracked it.
 cleaner live render); OR the geometry (the real composition): trace the textured draws' ACTUAL vertex source (hook
 sub_821F8E60 directly if it's directly-called, to read the renderer's VB pointer + the fill), or apply the prod-oracle
 to the cont.34 A↔B (why the real frame with geometry isn't executed). New diag: REX_PITCHTEST; tool vbcheck.gdb.
+
+---
+
+## cont.62 (2026-06-06, /loop "go deep renderer job рендери реальное меню из working-буферов") — ⭐SCANLINE ARTIFACT SOLVED: non-power-of-2 row pitch; 3 boot splashes decoded CLEAN
+
+The cont.58/60/61 "scanline + horizontal-repeat" artifact on the menu textures — open for 5 continuations and
+guessed to be tiling / a per-texture d0-pitch hack (cont.61 thought pitch=512 for the logo) — is now **fully root-caused
+and fixed**. It was a **non-power-of-2 LINEAR ROW PITCH** that the d2 width field (256) does not carry.
+
+**Investigation (all measured, not guessed):**
+- Rebuilt with cont.61's `(d0>>25)&0x7F ×256` guess (pitch 512 for the logo): logo STILL scanlined (zoomed). Tried
+  `tiled=1`: full checkerboard scramble (worse) ⇒ the fetch constant's `tiled=0` is correct, NOT a tiling problem.
+- Dumped 2 MiB of each menu buffer (`/tmp/raw_*.bin`) and brute-forced the pitch OFFLINE in Python (no rebuild/guess).
+  First metric (adjacent-row difference) found 320/384/448 — but those are the **content widths**, and decoding there
+  STILL scanlined for the logo/scene: the metric is fooled because the half-pitch interleaves matching rows
+  (background-dominated). Decoding at the DOUBLED pitch with full width revealed the truth:
+  - **A2D96000 @ pitch=width=640** → CLEAN **"SOUTH PARK DIGITAL STUDIOS"** (Cartman portrait + logo). The earlier
+    "SOUTH PARK with scanlines" at 320 was the right half of this 640-wide image, row-interleaved.
+  - **A2F25000 @ 384** → CLEAN **COMEDY CENTRAL** logo. (Decoding at 768 shows TWO logos side-by-side = the 384-wide
+    image's even/odd rows split into halves ⇒ proves the fundamental is 384, not 768.)
+  - **A2E12000 @ 896** → CLEAN **"doublesix"** (the developer studio) glowing logo.
+- These are the title's **boot studio splash screens**, decoded straight from its own runtime working buffers.
+
+**The formula (universal, principled — not a fit):** the true pitch = the documented Xenos fetch-constant **d0 field
+bits[30:22] << 5** (Xenia `xe_gpu_texture_fetch_t.pitch`, texels). 20<<5=640 ✓, 12<<5=384 ✓, 28<<5=896 ✓ — all three.
+The surfaces are full-width (no right padding), so pitch == width; the d2 "width" (256) is simply not the real width.
+
+**Fix (kernel.cpp, REX_TEXDECODE block ~1452):** for `!tiled && !IsCompressed(fmt) && w_>=64`, set
+`d.width = d.pitchTexels = ((d0>>22)&0x1FF)<<5` when that exceeds the d2 width. `rex_texture.h`: removed the
+dead-end `DetectLinearPitch` (the adjacent-row-diff auto-detector found the HALF pitch — padding rows match — and the
+uniform-row-fraction variant was too noisy; the documented formula is correct and needs no runtime detection).
+
+**Result:** REX_MENULIVE now renders the three splashes CLEAN on variant A's own Vulkan swapchain (live capture
+`/tmp/varianta_menu.ppm`), and the standalone decodes are pixel-clean. Two images sent (live render + clean montage).
+
+**Default boot UNREGRESSED:** the pitchfix is entirely under `REX_TEXDECODE` (null in default boot); the rex_texture.h
+edit only removed an unused inline function. Verified default boot: 0 crash/abort/segfault markers, normal
+fence-forward render activity at the end.
+
+**⚠ Honest limits:** (1) the d2 HEIGHT (256) is also wrong — COMEDY CENTRAL is ~384×512 and is cut at the bottom at
+height 256 (SP/doublesix splashes are complete at 256); recovering the real height is a small separate step.
+(2) This is the TEXTURE half — now clean. The COMPOSED menu (real per-draw positions) is still the cont.34/22-23/59
+GEOMETRY wall (the textured draws' vertex source is unfindable; VB 0xA022FFF0 is empty cont.61; the executed segment
+is a placeholder). That remains the deep multi-week build.
+
+**⇒ NEXT (cont.63):** (a) the splash HEIGHT (crack the fc height field or decode taller → full COMEDY CENTRAL);
+(b) the composition GEOMETRY — the one remaining wall: hook `sub_821F8E60` DIRECTLY (the cont.55 trick used on
+sub_821BEC00) to read the renderer's real VB pointer + fill, OR apply the prod-oracle to the cont.34 A↔B (execute the
+real frame WITH geometry instead of the placeholder).

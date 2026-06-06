@@ -262,6 +262,11 @@ static inline bool DecodeGuestToRGBA(const Desc& d, std::vector<uint8_t>& rgbaOu
     return DecodeBytesToRGBA(g_base + d.guestBase, d, rgbaOut);
 }
 
+// cont.62 note: the title's boot/menu splash textures are LINEAR but their real row pitch/width
+// (640/384/896) is NOT the d2 width field (256). The true pitch is the documented Xenos fetch-constant
+// d0 field bits[30:22] << 5 (Xenia's xe_gpu_texture_fetch_t.pitch, texels) — kernel.cpp's WriteGpuReg
+// hook applies it (sets Desc.width = Desc.pitchTexels = pitch). No runtime auto-detection is needed.
+
 // ---- small RGBA8 -> PPM writer (debug capture; ignores alpha) ----
 static inline void WriteRGBAasPPM(const char* path, const uint8_t* rgba, uint32_t W, uint32_t H)
 {

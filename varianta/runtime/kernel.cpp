@@ -1440,29 +1440,33 @@ inline void WriteGpuReg(uint32_t index, uint32_t value) {
                     static std::atomic<int> s_n{0};
                     int n = s_n.fetch_add(1);
                     if (n < 16) {
+                        uint32_t outW = w_;
                         rex_tex::Desc d{}; d.guestBase = ga; d.format = fmt; d.width = w_; d.height = h_;
                         d.tiled = tiled; d.endian = endian; d.pitchTexels = 0;
+                        // cont.62: the title's boot/menu splash textures (SOUTH PARK DIGITAL STUDIOS, COMEDY CENTRAL,
+                        // doublesix) are LINEAR but their REAL row pitch/width (640/384/896) is NOT the d2 width field
+                        // (which reads 256) — decoding at width=256 gave the long-standing scanline+repeat artifact
+                        // (cont.58/60/61). The true pitch is the documented Xenos fetch-constant d0 field bits[30:22]
+                        // << 5 (Xenia's xe_gpu_texture_fetch_t.pitch, texels). Verified: 20<<5=640 (SP splash),
+                        // 12<<5=384 (Comedy Central), 28<<5=896 (doublesix), all decode CLEAN at that full width.
+                        // These surfaces are full-width (no right padding), so use the pitch as BOTH stride and width.
+                        if (!tiled && !rex_tex::IsCompressed(fmt) && w_ >= 64) {
+                            uint32_t pf = (d0 >> 22) & 0x1FFu, truePitch = pf << 5;
+                            if (truePitch > w_ && truePitch <= 4096u) {
+                                d.width = truePitch; d.pitchTexels = truePitch; outW = truePitch;
+                                fprintf(stderr, "[pitchfix] %08X %ux%u: d0=%08X pitchField=%u -> width/pitch=%u (was %u)\n",
+                                        ga, w_, h_, d0, pf, truePitch, w_);
+                            }
+                        }
                         std::vector<uint8_t> rgba;
                         if (rex_tex::DecodeGuestToRGBA(d, rgba) && !rgba.empty()) {
-                            char path[96]; snprintf(path, sizeof path, "/tmp/texdec_%02d_%08X_%ux%u_f%02X.ppm", n, ga, w_, h_, fmt);
-                            rex_tex::WriteRGBAasPPM(path, rgba.data(), w_, h_);
-                            fprintf(stderr, "[texdecode] wrote %s (tiled=%u endian=%u)\n", path, tiled, endian);
+                            char path[96]; snprintf(path, sizeof path, "/tmp/texdec_%02d_%08X_%ux%u_f%02X.ppm", n, ga, outW, h_, fmt);
+                            rex_tex::WriteRGBAasPPM(path, rgba.data(), outW, h_);
+                            fprintf(stderr, "[texdecode] wrote %s (tiled=%u endian=%u pitch=%u)\n", path, tiled, endian, d.pitchTexels ? d.pitchTexels : w_);
                             // cont.60: composite the live menu textures (the 0xA2 working buffers) into the
                             // render-side contact sheet for REX_MENULIVE (the working-buffer -> live render proof).
                             if (ga >= 0xA2000000u && ga < 0xA3000000u)
-                                rex_render::BlitMenuCell(rgba.data(), (int)w_, (int)h_, ga);
-                            // cont.61: scanline experiment — some menu textures (logo/font) decode with horizontal
-                            // scanlines at pitch=width (cont.58/60); the real row pitch likely differs. Re-decode at
-                            // a few candidate pitches/widths under REX_PITCHTEST to find the clean one.
-                            if (ga >= 0xA2000000u && ga < 0xA3000000u && getenv("REX_PITCHTEST")) {
-                                for (uint32_t pw : { w_*2u, w_/2u ? w_/2u : w_, 512u, 1024u }) {
-                                    rex_tex::Desc dp = d; dp.pitchTexels = pw; std::vector<uint8_t> r2;
-                                    if (rex_tex::DecodeGuestToRGBA(dp, r2) && !r2.empty()) {
-                                        char p2[110]; snprintf(p2, sizeof p2, "/tmp/pt_%08X_pitch%u_%ux%u.ppm", ga, pw, w_, h_);
-                                        rex_tex::WriteRGBAasPPM(p2, r2.data(), w_, h_);
-                                    }
-                                }
-                            }
+                                rex_render::BlitMenuCell(rgba.data(), (int)outW, (int)h_, ga);
                         }
                     }
                 }
