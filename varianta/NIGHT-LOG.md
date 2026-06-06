@@ -4054,3 +4054,31 @@ Default boot UNREGRESSED (no flag: 0 crashes, full 25s, attract spin). New flag 
 constant / GPU base (0xA4xxxxxx) so handle→decoded-texture resolves (probe more handle words; cross-ref the
 CreateTexture object layout). THEN (the actual fix) the cont.54 draw-time flush → command-buffer gap: find where the
 real per-frame draw+flush stream lives and make variant A execute it (per-draw SET_CONSTANT inline) = visible menu.
+
+## cont.56 (2026-06-06, /loop) — ⭐CRACKED the per-draw texture DATA PATH: the menu's textures ARE the working buffers (handle+0x1C = Xenos fetch constant → 0xA2-0xA3 base)
+
+Decoded the texture-HANDLE structure (cont.55's pending resolution). Dumped handle 0x0610FEB0 (gdb-style via GLD32):
+the **Xenos 2D texture FETCH CONSTANT is at handle+0x1C** — d0=GLD32(h+0x1C) bits[1:0]=2 (TEXTURE), d1=+0x20 base in
+bits[31:12], d2=+0x24 width-1[12:0]/height-1[25:13], format=d1[5:0], endian=d1[6:7]. (My first scan missed it: the
+base is in the **0xA2xxxxxx-0xA3xxxxxx WORKING-BUFFER** range, not the 0xA4-0xA5 GPU window I scanned.)
+
+**MEASURED (attract, REX_TEXSEQ, per-draw fetch-constant decode):** the menu binds, per draw, REAL working-buffer
+textures —
+  - 0xA2D96000 fmt6 584×198 = the **South Park logo** (handle embeds path "memory://…#Graphics\s_p_lo…")
+  - 0xA2F25000 fmt6 374×446 = the **Comedy Central logo** (exactly cont.44's 0xA2F25000 working buffer!)
+  - 0xA337D000 fmt2 256×256 = a UI texture
+These are cont.44's decoded LINEAR 0xA2-0xA3 buffers ⇒ **the menu's per-draw textures literally ARE the working
+buffers** (the user's "render the real menu from working buffers"). Every menu draw is now resolvable to decodable
+texture data (base+dims+format from handle+0x1C; data in the working buffers; decode via cont.44).
+
+⇒ the per-draw texture DATA PATH is CLOSED: SetTexture(handle) → handle+0x1C fetch constant → 0xA2xxxxxx working-buffer
+base + dims + format → decode → the texture. (REX_TEXSEQ now logs the per-draw texture descriptors.) Default boot
+UNREGRESSED (0 crashes, full 22s, attract spin).
+
+**⇒ NEXT (cont.57): the BINDING (toward a VISIBLE textured menu).** variant A executes the draws (cont.45) but the
+fetch slots are 0x0 (the cont.54 flush gap). Now that I have each draw's fetch constant at SetTexture time, attempt:
+maintain an ordered QUEUE of per-draw fetch constants (from the sub_821BEC00 hook, real handles only) and at each
+ExecutePM4 DRAW_INDX dequeue + inject it (WriteGpuReg the texture fetch slot) before the draw — relying on the
+cont.23 count-correlation (SetTexture order == executed-draw order). If the orders align, the menu draws bind their
+real working-buffer textures → first textured menu. Risk: SetTexture/draw correlation (stage-clears, redundant sets,
+per-frame boundaries) — verify the counts align first.

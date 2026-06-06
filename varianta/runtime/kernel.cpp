@@ -2296,15 +2296,23 @@ PPC_FUNC(sub_821BEC00)
     static const bool s_texseq = getenv("REX_TEXSEQ") != nullptr;
     if (s_texseq) {
         uint32_t h = ctx.r5.u32, dev = ctx.r3.u32, stage = ctx.r6.u32;
-        static std::atomic<int> n{0}; int i = n.fetch_add(1);
-        if (i < 64) {
-            auto resolve = [](uint32_t o)->uint32_t{ std::lock_guard<std::mutex> lk(g_texObjMtx); auto it=g_texObjToBlock.find(o); return it!=g_texObjToBlock.end()?it->second:0; };
-            uint32_t blk = h ? resolve(h) : 0;
-            uint32_t w0 = h ? GLD32(h+0) : 0, w1 = h ? GLD32(h+4) : 0, w2 = h ? GLD32(h+8) : 0, w3 = h ? GLD32(h+12) : 0;
-            uint32_t blkF = 0;   // the handle may WRAP the texObj/block in a field — probe the first words too
-            if (!blk) { for (uint32_t f : {w0,w1,w2,w3}) { uint32_t b=resolve(f); if (b){ blkF=b; break; } } }
-            fprintf(stderr, "[texseq] #%d dev=0x%08X texH=0x%08X stage=0x%08X -> block=0x%08X (viaField=0x%08X) | h[0..3]=%08X %08X %08X %08X\n",
-                    i, dev, h, stage, blk, blkF, w0, w1, w2, w3);
+        // cont.56: the Xenos 2D texture FETCH CONSTANT lives at handle+0x1C (d0=GLD32(h+0x1C): bits[1:0]=2=texture;
+        // d1=+0x20: base in bits[31:12]; d2=+0x24: width-1 in [12:0], height-1 in [25:13]; format=d1 bits[5:0],
+        // endian=d1 bits[7:6]). The base is in the 0xA2xxxxxx-0xA3xxxxxx WORKING-BUFFER range (cont.44's decompressed
+        // LINEAR images) — i.e. the menu's per-draw textures ARE the working buffers. This resolves each menu draw's
+        // texture to decodable data (the per-draw-texture-binding ground truth the cont.45 tex=0x0 path is missing).
+        if (h >= 0x06000000u && h < 0x07000000u) {
+            uint32_t d0 = GLD32(h+0x1C), d1 = GLD32(h+0x20), d2 = GLD32(h+0x24);
+            uint32_t type = d0 & 3, baseRaw = d1 & 0xFFFFF000u, fmt = d1 & 0x3F, endian = (d1 >> 6) & 3;
+            uint32_t w = (d2 & 0x1FFF) + 1, ht = ((d2 >> 13) & 0x1FFF) + 1;
+            uint32_t gbase = (baseRaw >= 0xA0000000u) ? baseRaw : (0xA0000000u | baseRaw);
+            static std::atomic<int> n{0}; int i = n.fetch_add(1);
+            if (i < 48)
+                fprintf(stderr, "[texseq] #%d stage=0x%08X H=0x%08X fc@+1C{type=%u base=0x%08X fmt=0x%X end=%u %ux%u} d0=%08X d1=%08X d2=%08X\n",
+                        i, stage, h, type, gbase, fmt, endian, w, ht, d0, d1, d2);
+        } else {
+            static std::atomic<int> nc{0}; int i = nc.fetch_add(1);
+            if (i < 4) fprintf(stderr, "[texseq] stage-clear/other texH=0x%08X\n", h);
         }
     }
     __imp__sub_821BEC00(ctx, base);
