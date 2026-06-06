@@ -4336,3 +4336,36 @@ full UV (0,0)-(1,1) → draw per-draw (extend cont.60 REX_MENULIVE / g_texPipe t
 Result = the real boot splashes (logo/doublesix centered) and, when the menu's image draws fire, the composed menu
 images at real positions. The TEXT (`sub_821F8E60`, local-space) remains a separate sub-problem (its deferred
 transform). New: `REX_DRAWCAP`, `g_lastTexBase`, `[drawcap]`.
+
+## cont.65 (2026-06-06, /loop "go deep renderer job", autonomous — user asleep) — ⭐⭐⭐REAL FRAMES AT REAL POSITIONS: variant A reconstructs the title's boot-splash frames (decoded texture composited at the sprite renderer's screen rect)
+
+cont.64 found the image draws are screen-space sprite quads (lr=0x82205114). cont.65 RENDERS them: composite each
+decoded texture (cont.63) onto a black 1280×720 frame at the captured screen rect = the title's REAL boot-splash
+frame at its REAL position.
+
+**IMPLEMENTATION (kernel.cpp):** the texture-handle info (sub_821BEC00 hook) now stores the full decode params
+(fmt/endian/tiled/pitch + content w/h) per base (`g_texDimsByBase` extended). `REX_DRAWCAP`, on the GUEST thread at
+each image draw (sub_8242BF10 from lr=0x82205114), captures the screen rect AND has the texture (g_lastTexBase) — so
+it decodes the texture (`ComposeRealFrame`, reusing the cont.63 decode: pitch=stride, handle=content dims) and blits
+it onto a black 1280×720 frame at the rect, one PPM per base. (First tried compositing in the executed-segment
+REX_TEXDECODE path, but that decodes once per base and races ahead of the rect capture — CC composed, SP/d6 missed;
+the guest-thread path has rect+texture both ready.)
+
+**RESULT** (REX_DRAWCAP, headless, run-base): three real boot-splash frames, each CENTERED (screen center 640,360):
+- **SP DIGITAL STUDIOS** (A2D96000) 584×198 @ (348,261)
+- **COMEDY CENTRAL** (A2F25000) 374×446 @ (453,137)
+- **doublesix** (A2E12000) 875×314 @ (203,203)
+
+Montage `/tmp/cont65_splashframes.png` (viewed). The full pipeline — working buffer → decode (cont.63) → composite at
+the sprite renderer's screen rect (cont.64) → real frame — is proven end-to-end. The positions ARE the title's (from
+its own sprite verts); all three centered = boot splashes.
+
+**Default boot UNREGRESSED** (gated REX_DRAWCAP; 245k lines, 0 real crashes, `[frame]`/`[drawcap]` dormant).
+
+**⇒ NEXT (cont.66):** (a) LIVE on-screen render of the real-position composite (extend cont.60 REX_MENULIVE to use
+the real-position frame, not the contact sheet); (b) the actual MENU = a PERSISTENT accumulator frame (all
+simultaneous image draws blitted into ONE 1280×720 frame, vs these per-base splash frames) — reach the attract/menu
+(input nav past the intro, or the attract loop) → the composed menu/attract scene at real positions. The TEXT
+(sub_821F8E60, local-space) still needs its deferred transform (separate). New: `ComposeRealFrame`, `g_texScreenRect`,
+`[frame]`; `g_texDimsByBase` extended with decode params. ⚠note: the dev shell is zsh — `rm glob*` aborts on no-match
+(use `find -delete` or `*(N)`).

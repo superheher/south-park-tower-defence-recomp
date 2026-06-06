@@ -883,7 +883,7 @@ std::mutex g_texObjMtx;
 // HANDLE (sub_821BEC00, handle+0x1C, cont.56) carries the REAL content dims (measured: SP 584x198, COMEDY CENTRAL
 // 374x446). Map base -> handle (w,h) so REX_TEXDECODE uses the real HEIGHT (the d0 pitch field already fixes the
 // width, cont.62) -> the full splash decodes instead of being cut at row 256.
-struct TexHandleDims { uint16_t w, h; };
+struct TexHandleDims { uint16_t w, h, pitch; uint8_t fmt, endian, tiled; };   // cont.65: +decode params for the composite
 std::unordered_map<uint32_t, TexHandleDims> g_texDimsByBase;
 std::mutex g_texDimsMtx;
 // cont.64: the last real 0xA2 working-buffer texture bound (set in the sub_821BEC00 hook). Thread-local because the
@@ -891,6 +891,13 @@ std::mutex g_texDimsMtx;
 // the VB fill (sub_8242BF10 from 0x821F90B0) this holds the draw's texture, pairing GEOMETRY with TEXTURE (the data
 // cont.23's vert capture lacked; the texture side was only cracked in cont.56-57). REX_DRAWCAP reads it.
 thread_local uint32_t g_lastTexBase = 0;
+// cont.65: the IMAGE renderer (sprite fill lr=0x82205114) draws each texture as a SCREEN-SPACE quad at its native
+// size (cont.64: SP logo 584x198 centered, doublesix 875x314 centered). REX_DRAWCAP records that rect per texture
+// base here; REX_TEXDECODE then composites the decoded texture (cont.63) onto a 1280x720 frame at this rect = the
+// title's REAL boot-splash/menu frame at REAL positions (vs cont.60's contact sheet).
+struct ScreenRect { float x0, y0, x1, y1; };
+std::unordered_map<uint32_t, ScreenRect> g_texScreenRect;
+std::mutex g_texScreenMtx;
 // PVOID MmAllocatePhysicalMemoryEx(flags r3, size r4, protect r5, min r6, max r7, align r8)
 PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
 {
@@ -1495,6 +1502,10 @@ inline void WriteGpuReg(uint32_t index, uint32_t value) {
                             // render-side contact sheet for REX_MENULIVE (the working-buffer -> live render proof).
                             if (ga >= 0xA2000000u && ga < 0xA3000000u)
                                 rex_render::BlitMenuCell(rgba.data(), (int)outW, (int)outH, ga);
+                            // cont.65: the real-frame composite (decoded texture -> black 1280x720 at its screen rect)
+                            // is done on the GUEST thread in the REX_DRAWCAP path (ComposeRealFrame), where the rect AND
+                            // the texture are both known at the image draw — the executed-segment decode here runs once
+                            // per base and often races ahead of the rect capture (cont.65: CC composed, SP/d6 missed).
                         }
                     }
                 }
@@ -2366,8 +2377,10 @@ PPC_FUNC(sub_821BEC00)
             // cont.63: record the handle's REAL content dims (base -> w,h) so REX_TEXDECODE uses the true HEIGHT.
             if (type == 2 && w > 1 && ht > 1) {
                 g_lastTexBase = gbase;   // cont.64: pair this texture with the next VB fill (sub_821F8E60 -> sub_8242BF10)
+                uint32_t pitch = ((d0 >> 22) & 0x1FFu) << 5;   // cont.65: full decode info for the guest-thread composite
                 std::lock_guard<std::mutex> lk(g_texDimsMtx);
-                g_texDimsByBase[gbase] = { (uint16_t)(w > 4096 ? 4096 : w), (uint16_t)(ht > 4096 ? 4096 : ht) };
+                g_texDimsByBase[gbase] = { (uint16_t)(w > 4096 ? 4096 : w), (uint16_t)(ht > 4096 ? 4096 : ht),
+                                           (uint16_t)(pitch > 8192 ? 8192 : pitch), (uint8_t)fmt, (uint8_t)endian, (uint8_t)((d0 >> 31) & 1) };
             }
             if (s_texseq) {
                 static std::atomic<int> n{0}; int i = n.fetch_add(1);
@@ -2429,6 +2442,31 @@ std::mutex g_vbMtx; std::vector<float> g_vbVerts;   // REX_VBFILL render accumul
 // default-on guard below safe against a concurrent large memcpy on another thread during the poll window.
 thread_local bool g_inPoll = false;
 static int  g_r31seq = 0;
+// cont.65: decode a bound working-buffer texture (via its handle info, cont.63) and composite it onto a black
+// 1280x720 frame at the IMAGE renderer's screen rect (cont.64) -> the title's real boot-splash/menu element at its
+// REAL position. One PPM per base. Called from the guest-thread REX_DRAWCAP path where rect+texture both exist.
+static void ComposeRealFrame(uint32_t base, const TexHandleDims& info, const ScreenRect& r) {
+    if (rex_tex::BytesPerBlock(info.fmt) == 0 || info.w == 0 || info.h == 0) return;
+    rex_tex::Desc dd{}; dd.guestBase = base; dd.format = info.fmt; dd.width = info.w; dd.height = info.h;
+    dd.tiled = info.tiled; dd.endian = info.endian; dd.pitchTexels = (info.pitch > info.w) ? info.pitch : 0;
+    std::vector<uint8_t> trgba;
+    if (!rex_tex::DecodeGuestToRGBA(dd, trgba) || trgba.empty()) return;
+    const int W = 1280, H = 720; int ow = info.w, oh = info.h;
+    int rx0 = (int)(r.x0 + 0.5f), ry0 = (int)(r.y0 + 0.5f);
+    int rw = (int)(r.x1 - r.x0 + 0.5f), rh = (int)(r.y1 - r.y0 + 0.5f);
+    if (rw < 1) rw = ow; if (rh < 1) rh = oh;
+    std::vector<uint8_t> frame(size_t(W) * H * 4, 0);
+    for (size_t i = 0; i < size_t(W) * H; i++) frame[i*4+3] = 255;            // opaque black
+    for (int dy = 0; dy < rh; dy++) { int fy = ry0 + dy; if (fy < 0 || fy >= H) continue;
+        int sy = (int)((long)dy * oh / rh); if (sy >= oh) sy = oh - 1;
+        for (int dx = 0; dx < rw; dx++) { int fx = rx0 + dx; if (fx < 0 || fx >= W) continue;
+            int sx = (int)((long)dx * ow / rw); if (sx >= ow) sx = ow - 1;
+            memcpy(&frame[(size_t(fy)*W + fx)*4], &trgba[(size_t(sy)*ow + sx)*4], 4); } }
+    char fp[112]; snprintf(fp, sizeof fp, "/tmp/cont65_frame_%08X_at_%d_%d_%dx%d.ppm", base, rx0, ry0, rw, rh);
+    rex_tex::WriteRGBAasPPM(fp, frame.data(), W, H);
+    fprintf(stderr, "[frame] %08X composed at (%d,%d) %dx%d (tex %dx%d pitch=%u) -> %s\n", base, rx0, ry0, rw, rh, ow, oh, info.pitch, fp);
+}
+
 extern "C" PPC_FUNC(__imp__sub_8242BF10);
 PPC_FUNC(sub_8242BF10)
 {
@@ -2550,6 +2588,25 @@ PPC_FUNC(sub_8242BF10)
             // classify pos range: SCREEN ~ [0..1280]x[0..720]; CLIP ~ [-1..1]; LOCAL ~ small box near origin.
             const char* space = (maxx>2.f && maxx<=1300.f && maxy<=730.f && minx>=-8.f && miny>=-8.f) ? "SCREEN?"
                               : (minx>=-1.5f && maxx<=1.5f && miny>=-1.5f && maxy<=1.5f) ? "CLIP?" : "LOCAL?";
+            // cont.65: record this IMAGE draw's screen rect for its texture (the sprite renderer lr=0x82205114).
+            // Keep only screen-sane sprite rects (skip the full-frame bg quad at maxx~1768) on decodable 0xA2
+            // working-buffer textures, so REX_TEXDECODE can composite the decoded texture at this real position.
+            if (lr == 0x82205114u && g_lastTexBase >= 0xA2000000u && g_lastTexBase < 0xA3000000u
+                && maxx <= 1300.f && maxy <= 730.f && minx >= -8.f && miny >= -8.f
+                && (maxx - minx) >= 8.f && (maxy - miny) >= 8.f) {
+                uint32_t tb = g_lastTexBase; ScreenRect rect = { minx, miny, maxx, maxy };
+                { std::lock_guard<std::mutex> lk(g_texScreenMtx); g_texScreenRect[tb] = rect; }
+                // cont.65: compose the real frame ONCE per base, here on the guest thread (rect + texture both known).
+                static std::unordered_set<uint32_t> s_framed; static std::mutex s_fmtx;
+                bool first = false; { std::lock_guard<std::mutex> lk(s_fmtx); first = s_framed.insert(tb).second; }
+                if (first) {
+                    TexHandleDims info{}; bool have = false;
+                    { std::lock_guard<std::mutex> lk(g_texDimsMtx); auto it = g_texDimsByBase.find(tb);
+                      if (it != g_texDimsByBase.end()) { info = it->second; have = true; } }
+                    if (have) ComposeRealFrame(tb, info, rect);
+                    else { std::lock_guard<std::mutex> lk(s_fmtx); s_framed.erase(tb); }   // no info yet -> retry later
+                }
+            }
             static std::atomic<int> dn{0}; int i = dn.fetch_add(1);
             if (i < 48)
                 fprintf(stderr, "[drawcap] #%d lr=0x%08X tex=0x%08X dest=0x%08X vc=%u %s pos[%.1f..%.1f,%.1f..%.1f] uv[%.2f..%.2f,%.2f..%.2f] v0=(%.1f,%.1f / %.2f,%.2f)\n",
