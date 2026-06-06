@@ -3667,3 +3667,34 @@ never produces; the existing fence-forwards (sub_821C6E58/sub_821C5DF0) don't co
 **NEXT:** attack the GPU-completion directly — pin the exact completion object/fence the L1 spin polls (sub_821C6F50
 + the 0x821BFF64/0x821C0864 sites) and produce it (execute the device+13568 L1 render segments → a real fence, or
 forward the specific fence the spin waits on). This is the cont.34 "focused renderer session" core.
+
+## cont.42 (2026-06-06, /loop "go deep renderer job") — narrowed the L1 advance-gate: the completion DRAIN RUNS at L1 (not a stuck spin) ⇒ the gate is the uncreated L1-start gameplay subsystem, NOT the completion drain or texture-data
+
+Measurement iteration (reused existing diags, no code change). Tested whether cont.34's "GPU-completion spin" is
+the L1 gate by inspecting the completion machinery + the transition worker + the null subsystem at the L1 stall
+(REX_SKIPINTRO + REX_HANDLERGUARD).
+
+**Measured at L1 (162 assets, stalled):**
+- **The completion DRAIN RUNS** (REX_LOADERPROBE [bf298]): count=4 items/frame, item0=[0,0,0x280,0x168]=640×360,
+  IDENTICAL from #28000 to #40000 — exactly like attract (cont.25). ⇒ the title is **NOT stuck on the completion
+  drain**; it renders the frontend backdrop per-frame fine. This REFINES cont.34: the "GPU-completion spin" is not
+  a stuck drain — the drain works; the title just doesn't ADVANCE.
+- **The loader is IDLE** ([ldframe]): child[0] state 0, only 1/20 children active, GPU textures/atlas/EDRAM all
+  zero. Loading is done; nothing is in flight.
+- **The transition worker fired EXACTLY ONCE** (REX_INITDIAG): sub_82250420 (tid10) → sub_8211B740 → sub_8210AF90
+  ran once each (= the menu→L1-loading transition that loaded L1). It does NOT fire again for an L1-start.
+- **The gameplay subsystem is NEVER created** (REX_GATEDIAG): sub_82292CE0 (frontend update, caller 0x8215079C)
+  is called and reads *(0x827FD56C)=0x00000000 (null), vtable=0 — every time (3 calls). A genuine NULL, NOT a
+  sentinel/not-ready guard (unlike the cont.30-31 gates). The subsystem ptr 0x827FD56C has **no literal reference
+  in the recompiled code** (grep finds none — it's accessed via computed lis+addi addressing), confirming cont.35
+  "the creator isn't a locatable direct store; it's inside the gated level-start path."
+
+**⇒ NARROWED (ruling out hypotheses): the L1 advance-gate is the L1-START gameplay-subsystem CREATION — NOT the
+completion drain (runs fine, cont.42), NOT texture-data (cont.41), NOT the menu-transition worker (fired once).**
+The frontend (sub_82292CE0) expects the gameplay subsystem to exist by now; it's null because the level-start
+(which creates it + switches frontend→gameplay) never fires after the 162-asset load completes. ⚠ HONEST: the
+advance is a CHAIN of gates (cont.30-35) and the RENDER is SEPARATELY walled (cont.32: render at L1 = same
+backdrop) — neither yields a quick visible win; this is the deep multi-week A↔B build (the spike estimate), not a
+single-iteration crack. **NEXT:** pin the L1-START trigger — what should fire the level-start (gameplay-subsystem
+creation) after loading completes (the "level loaded → start level" event/state-machine); find the
+subsystem-creation site (it allocates then stores to 0x827FD56C via a computed pointer) + its gating condition.
