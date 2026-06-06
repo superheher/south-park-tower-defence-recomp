@@ -3333,3 +3333,20 @@ gameplay builds NEW renderable EXECSEGS draw content (vs the menu backdrop) is t
 RENDERABLE state or just loads files (the renderer wall is independent — cont.30); (c) a CAREFUL render run
 (timeout -s KILL) at the Level 1 state to check for new draw content. REX_HANDLERGUARD kept GATED (needs more
 validation + only active with input) — not yet promoted to default-on.
+
+**cont.32 check (same session) — render at Level 1 + the next gate's class.** (a) **Render check (careful, foreground,
+`timeout -s KILL 40`, exit137 clean):** at the Level 1 load state (SKIPINTRO+HANDLERGUARD+REX_RENDER+EXECSEGS) the
+capture = the SAME backdrop (mean RGB 82,114,118 = cont.24/30); [esdraw] shows the SAME frontend program — prim5
+sprite / prim13 text (slot-0 still type 0/2 EMPTY) + prim8 backdrop (type-3 real verts). **⇒ loading Level 1 does
+NOT change the rendered scene — the title loads L1 DATA while the frontend/loading screen is still the render
+state; the renderer wall is confirmed INDEPENDENT of the loader advance even at the much-advanced L1 state (two
+orthogonal walls, cont.30 holds).** (b) **Next gate sub_82292CE0 (ppc_recomp.36.cpp:25795, bctrl@0x82292D08):** a
+VTABLE call `r3=*(global 0x8281D56C); (*r3)->vtable[1]()` with target=0x00000000 — a GENUINE null (an
+uninitialized subsystem object), a DIFFERENT/HARDER class than the -1 sentinel guards (cont.30/31), and the
+generic INDIRECT-NULL guard already skips it yet the title still stalls (skipping ≠ the method's effect). ⇒ **the
+two easy same-class sentinel guards are DONE (great wins: title now loads Level 1); the remaining path is either
+(i) the harder null-object-init gates or (ii) the deep renderer build (per-draw texture decode/upload + the
+level's render program) — both lower /loop-fit, mirroring the cont.24/25 inflection.** This session's durable
+deliverables: cont.30 (advance default-on, commit 4870841) + cont.31 (loads Level 1, commit b15d218). NEXT
+(cont.33): RE sub_82292CE0's null object (which subsystem at 0x8281D56C, why uninit) — or the user steers toward
+the renderer build.
