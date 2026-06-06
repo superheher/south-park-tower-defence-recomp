@@ -3698,3 +3698,30 @@ backdrop) — neither yields a quick visible win; this is the deep multi-week A�
 single-iteration crack. **NEXT:** pin the L1-START trigger — what should fire the level-start (gameplay-subsystem
 creation) after loading completes (the "level loaded → start level" event/state-machine); find the
 subsystem-creation site (it allocates then stores to 0x827FD56C via a computed pointer) + its gating condition.
+
+## cont.43 (2026-06-06, /loop "go deep renderer job") — the subsystem CREATOR is hidden behind indirection (static search for the direct-store pattern EXHAUSTED) ⇒ the level-start path is genuinely un-triggered; pivot to a runtime angle
+
+Tried to find the gameplay-subsystem CREATOR (writes *(0x827FD56C), the L1-start gate) by static search. Decoded
+the manager-access pattern from the consumer sub_82292CE0 (ppc_recomp.36): `lis r11,-32128; addi r31,r11,-10904`
+⇒ **manager struct base = 0x827FD568**, subsystem ptr = `*(base+4)` = 0x827FD56C. So the creator should compute
+that base and `PPC_STORE_U32(base+4, obj)`.
+
+**Static search result — NO direct-store creator exists:** a precise scan (manager base in a register via
+lis-32128/addi-10904 or addi-10900, still valid at a store to +4/+0) found **nothing**; a looser scan found 3
+candidates (sub_82129380/sub_82151BA8/sub_821571D8) but ALL are **false positives** — they store to a DIFFERENT
+struct's +4 (the base register was reassigned, e.g. sub_82151BA8 stores to (r31+60)+4; sub_82129380's base is a
+loaded ptr *(r30-4420); sub_821571D8's r31 is a big unrelated struct). ⇒ **the creator does NOT use the
+compute-the-constant-then-store pattern** — it writes 0x827FD56C INDIRECTLY (most likely it receives a pointer to
+the slot, e.g. `Create(&manager->sub)` storing via the passed reg, or loads the manager base from a non-constant
+pointer). Combined with REX_GATEDIAG (always reads 0), the subsystem is **genuinely never created in variant A**;
+the level-start path that constructs it is un-triggered (confirms cont.35 "no locatable direct store").
+
+**⇒ static RE is exhausted for the creator; pivot to RUNTIME.** ⚠ Honest meta: the advance-gate (cont.34/41/42/43)
+is a deep state-machine/A↔B problem — the completion drain runs (cont.42), texture-data isn't it (cont.41), and
+the subsystem creator is indirection-hidden (cont.43). This is the multi-week build; the autonomous /loop is
+producing rigorous narrowing (documented findings) but not a single-iteration crack. **NEXT (runtime angles):**
+(a) instrument the tid10 transition worker (sub_82250420) at L1 — is it still looping/polling for a NEXT transition
+(loading→running) whose condition is unmet (the gate), or has it exited?; (b) find the "level loaded → start level"
+detector (what polls the loader-done state and should fire the level-start); (c) trace the frontend state machine
+(sub_8215079C) for the gameplay-start decision point. Or redirect to visible decoder-driven render work (the
+tractable half of the renderer) — user's call.
