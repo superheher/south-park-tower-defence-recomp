@@ -3411,3 +3411,37 @@ cont.32 (bf59a2f) renderer wall independent; cont.33 (f053fe0) post-L1 gate = nu
 (this) the stall = GPU/render-completion A↔B. **TO RESUME: the deep renderer/GPU-completion build is a focused
 session (the user has chosen this before) — execute device+13568 Level-1 render segments → real fence completion →
 break the A↔B; or re-issue /loop to have me keep probing. Diags REX_GATEDIAG/REX_SPINTRACE retained.**
+
+## cont.35 (2026-06-06, autonomous — "try to break the render wall") — ruled out the TRACTABLE L1-start angles (movie, hung fetch); the gate is genuinely the GPU-resource/subsystem-init layer (deep build)
+
+User asked me to attack the render wall directly. Heeded my own meta-lesson (cont.25 wrongly called the MENU gate "deep / no shortcut" and cont.28-31 then cracked it tractably) and did NOT assume "deep build" — I tested the tractable mechanisms that cracked the menu gate. New gated diags REX_MOVIEPROBE/REX_MOVIE_EOF_ALL. Default boot unregressed (95 assets, clamp 4×, diags gated off).
+
+**Ruled out — the Level-1 cutscene (Hypothesis A, FALSIFIED with measurement).** REX_MOVIEPROBE: at L1 TWO movie
+players advance — the boot-intro-style player (g_moviePlayer, covered by REX_MOVIE_EOF) AND a second player
+(~0x619AC60, ret=0x0, NOT covered). Suspected the Level1Intro.wmv cutscene was the gate. REX_MOVIE_EOF_ALL (force
+EOS for ANY player) — **did NOT advance the title (still 162 assets).** ⇒ the cutscene is not the gate.
+
+**Ruled out — a hung resource fetch (the mechanism that made the MENU gate tractable, cont.28-31).** REX_RESID
+[be68call]: all SIX sub_8211BE68 calls at L1 RETURN (Global/structure/Walls/Character/Enemy/pickup geom — the
+meshes fully load via the cont.30 CLAMPCPY). No ENTER-without-RET, no sentinel. ⇒ the L1-start gate is NOT a
+hung fetch — qualitatively UNLIKE the menu gate. (sub_8211B740/sub_8210AF90 the menu-transition handlers run
+exactly ONCE — that's what loaded L1; the L1-START uses a different mechanism.)
+
+**The gate IS the GPU-resource/subsystem-init layer (measured, not assumed).** At L1: the loader (child[0]) is
+IDLE (state 0, CPU data loaded), GPU texture/EDRAM memory is ZERO (atlasA5004800=0, edramB0000000=0, all per-draw
+tex slots empty), and the title runs its per-frame RENDER LOOP fine (renders the frontend backdrop, cont.32) but
+won't transition to L1. cont.33's gameplay subsystem manager (*(0x827FD568) struct, object at +4 = 0x827FD56C) is
+ENTIRELY ZEROED — never initialized; its init is the L1-start transition, which is gated on the level's GPU
+resources being created (textures decoded+uploaded — the cont.25 R0 keystone that NEVER RUNS). The object pointer
+isn't written by any locatable direct-offset store; its construction is inside the level-start path that the GPU
+completion gates. So this is the cont.21 A↔B coupling from the gameplay side: no L1 render program is built
+(EXECSEGS at L1 = frontend only, cont.32) until the GPU completes, which needs the renderer.
+
+**⇒ HONEST VERDICT: breaking the render wall genuinely requires the deep GPU-resource-creation build** — Xenos
+tiled-texture decode + upload (system-mem → guest GPU texture block + fetch-const, the cont.25 R0 keystone) +
+EDRAM render targets + executing the L1 render segments with REAL fence completion (cont.22) + the gameplay
+subsystem init. The tractable force-shortcuts (movie EOS, hung-fetch guard, gate-skip) do NOT break it (gate-skip
+crashes without resources — cont.25). This is the multi-session renderer (the spike's weeks estimate), NOT a
+single-pass /loop fix. I made a genuine multi-angle attempt and pinned the wall precisely; the next concrete piece
+is the texture decode+upload (re-engage cont.25 R0 / REX_TEXWATCH + GPU-RESOURCE-BUILD-PLAN pieces 2-5). Diags
+REX_MOVIEPROBE/REX_MOVIE_EOF_ALL retained.

@@ -2320,6 +2320,19 @@ PPC_FUNC(sub_8232AAE0)
     static const char* eofEnv = getenv("REX_MOVIE_EOF");
     uint32_t player = ctx.r3.u32;                  // arg: the player object being advanced
     __imp__sub_8232AAE0(ctx, base);                // real AdvanceFrame; r3 = status on return
+    // cont.35 (REX_MOVIEPROBE / REX_MOVIE_EOF_ALL): test whether the post-Level-1 stall is a cutscene
+    // (Level1Intro.wmv) waiting via a player REX_MOVIE_EOF doesn't cover (it only forces player==g_moviePlayer).
+    // PROBE logs every AdvanceFrame (which players advance at L1); EOF_ALL=N forces EOS for ANY player after N
+    // total advances. If a non-boot-intro movie is the gate, EOF_ALL advances it.
+    static const bool s_movieprobe = getenv("REX_MOVIEPROBE") != nullptr;
+    if (s_movieprobe) { static std::atomic<int> mp{0}; int k = mp.fetch_add(1);
+        if (k < 80) fprintf(stderr, "[movieprobe] advance #%d player=0x%X ret=0x%X (cur g_moviePlayer=0x%X)\n",
+                            k, player, ctx.r3.u32, g_moviePlayer.load()); }
+    static const char* eofAllEnv = getenv("REX_MOVIE_EOF_ALL");
+    if (eofAllEnv && player) { static std::atomic<int> na{0}; int c = na.fetch_add(1), thr = atoi(eofAllEnv);
+        if (c >= thr) { ctx.r3.u64 = 0x16660026u;
+            static std::atomic<int> fe{0}; if (fe.fetch_add(1) < 6)
+                fprintf(stderr, "[movie-eof-all] advance #%d player=0x%X -> FORCING EOS 0x16660026\n", c, player); } }
     if (eofEnv && player && player == g_moviePlayer.load()) {
         static std::atomic<int> n{0};
         int c = n.fetch_add(1), thr = atoi(eofEnv);
