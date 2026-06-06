@@ -898,6 +898,14 @@ thread_local uint32_t g_lastTexBase = 0;
 struct ScreenRect { float x0, y0, x1, y1; };
 std::unordered_map<uint32_t, ScreenRect> g_texScreenRect;
 std::mutex g_texScreenMtx;
+// cont.66: persistent 1280x720 frame ACCUMULATOR — compose ALL sprite image draws (each at its screen rect) into one
+// frame to reconstruct MULTI-element scenes (title screen / menu), not just cont.65's per-base single splash. VdSwap
+// (the guest frame present) snapshots the accumulated frame -> PPM then clears it. Decoded textures are cached.
+struct CachedTex { std::vector<uint8_t> rgba; int w = 0, h = 0; };
+std::unordered_map<uint32_t, CachedTex> g_decCache;
+std::vector<uint8_t> g_frameBuf;            // 1280*720*4 RGBA on black, lazy-init
+bool g_frameDirty = false;
+std::mutex g_frameMtx;
 // PVOID MmAllocatePhysicalMemoryEx(flags r3, size r4, protect r5, min r6, max r7, align r8)
 PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
 {
@@ -2467,6 +2475,51 @@ static void ComposeRealFrame(uint32_t base, const TexHandleDims& info, const Scr
     fprintf(stderr, "[frame] %08X composed at (%d,%d) %dx%d (tex %dx%d pitch=%u) -> %s\n", base, rx0, ry0, rw, rh, ow, oh, info.pitch, fp);
 }
 
+// cont.66: decode (cached) a bound sprite texture and blit it into the persistent frame accumulator at its screen
+// rect (alpha-keyed so sprites composite over what's already there). Called per image draw; VdSwap snapshots+clears.
+static void AccumulateFrame(uint32_t base, float minx, float miny, float maxx, float maxy) {
+    bool sprite = (maxx <= 1300.f && maxy <= 730.f && minx >= -8.f && miny >= -8.f
+                   && (maxx - minx) >= 8.f && (maxy - miny) >= 8.f);   // skip the oversized full-screen quads
+    if (!sprite) return;
+    TexHandleDims info{};
+    { std::lock_guard<std::mutex> lk(g_texDimsMtx); auto it = g_texDimsByBase.find(base);
+      if (it == g_texDimsByBase.end()) return; info = it->second; }
+    std::lock_guard<std::mutex> lk(g_frameMtx);
+    const int W = 1280, H = 720;
+    if (g_frameBuf.empty()) { g_frameBuf.assign(size_t(W)*H*4, 0); for (size_t i = 0; i < size_t(W)*H; i++) g_frameBuf[i*4+3] = 255; }
+    auto cit = g_decCache.find(base);
+    if (cit == g_decCache.end()) {
+        CachedTex ct{};
+        if (rex_tex::BytesPerBlock(info.fmt) && info.w && info.h) {
+            rex_tex::Desc dd{}; dd.guestBase = base; dd.format = info.fmt; dd.width = info.w; dd.height = info.h;
+            dd.tiled = info.tiled; dd.endian = info.endian; dd.pitchTexels = (info.pitch > info.w) ? info.pitch : 0;
+            std::vector<uint8_t> r;
+            if (rex_tex::DecodeGuestToRGBA(dd, r) && !r.empty()) { ct.rgba = std::move(r); ct.w = info.w; ct.h = info.h; }
+        }
+        cit = g_decCache.emplace(base, std::move(ct)).first;
+    }
+    const CachedTex& t = cit->second; if (!t.w) return;
+    int rx0 = (int)(minx + .5f), ry0 = (int)(miny + .5f), rw = (int)(maxx - minx + .5f), rh = (int)(maxy - miny + .5f);
+    if (rw < 1) rw = t.w; if (rh < 1) rh = t.h;
+    for (int dy = 0; dy < rh; dy++) { int fy = ry0 + dy; if (fy < 0 || fy >= H) continue; int sy = (int)((long)dy * t.h / rh); if (sy >= t.h) sy = t.h - 1;
+        for (int dx = 0; dx < rw; dx++) { int fx = rx0 + dx; if (fx < 0 || fx >= W) continue; int sx = (int)((long)dx * t.w / rw); if (sx >= t.w) sx = t.w - 1;
+            const uint8_t* s = &t.rgba[(size_t(sy)*t.w + sx)*4]; if (s[3] < 8) continue;   // alpha key: keep the bg where transparent
+            memcpy(&g_frameBuf[(size_t(fy)*W + fx)*4], s, 4); } }
+    g_frameDirty = true;
+}
+// cont.66: at each guest frame present (VdSwap), snapshot the accumulated frame -> PPM (capped) then clear it.
+static void SnapshotFrameOnSwap() {
+    std::lock_guard<std::mutex> lk(g_frameMtx);
+    if (g_frameBuf.empty() || !g_frameDirty) return;
+    static std::atomic<int> fn{0}; int fi = fn.fetch_add(1);
+    if (fi < 40) { char fp[64]; snprintf(fp, sizeof fp, "/tmp/cont66_frame_%03d.ppm", fi);
+        rex_tex::WriteRGBAasPPM(fp, g_frameBuf.data(), 1280, 720);
+        fprintf(stderr, "[fcompose] frame %03d snapshot\n", fi); }
+    const int W = 1280, H = 720; std::fill(g_frameBuf.begin(), g_frameBuf.end(), (uint8_t)0);
+    for (size_t i = 0; i < size_t(W)*H; i++) g_frameBuf[i*4+3] = 255;
+    g_frameDirty = false;
+}
+
 extern "C" PPC_FUNC(__imp__sub_8242BF10);
 PPC_FUNC(sub_8242BF10)
 {
@@ -2607,6 +2660,10 @@ PPC_FUNC(sub_8242BF10)
                     else { std::lock_guard<std::mutex> lk(s_fmtx); s_framed.erase(tb); }   // no info yet -> retry later
                 }
             }
+            // cont.66: also accumulate every sprite into the persistent multi-element frame (VdSwap snapshots+clears).
+            static const bool s_fcompose = getenv("REX_FCOMPOSE") != nullptr;
+            if (s_fcompose && lr == 0x82205114u && g_lastTexBase >= 0xA2000000u && g_lastTexBase < 0xA3000000u)
+                AccumulateFrame(g_lastTexBase, minx, miny, maxx, maxy);
             static std::atomic<int> dn{0}; int i = dn.fetch_add(1);
             if (i < 48)
                 fprintf(stderr, "[drawcap] #%d lr=0x%08X tex=0x%08X dest=0x%08X vc=%u %s pos[%.1f..%.1f,%.1f..%.1f] uv[%.2f..%.2f,%.2f..%.2f] v0=(%.1f,%.1f / %.2f,%.2f)\n",
@@ -3502,6 +3559,10 @@ PPC_FUNC(__imp__VdInitializeScalerCommandBuffer)    { ctx.r3.u64 = 0; }
 // frame-pacing / is_counter fences see presents happen (real present = renderer phase).
 PPC_FUNC(__imp__VdSwap) {
     uint32_t n = g_gpuCounter.fetch_add(1) + 1;
+    // cont.66: this is the guest's frame present — snapshot the accumulated multi-element frame (sprites composited
+    // at their real screen rects since the last swap) and clear it for the next frame. Gated behind REX_FCOMPOSE.
+    static const bool s_fcompose = getenv("REX_FCOMPOSE") != nullptr;
+    if (s_fcompose) SnapshotFrameOnSwap();
     // r4 = D3D9 texture fetch constant (6 dwords, BE) describing the front buffer. Parse it (xenos
     // xe_gpu_texture_fetch_t): dword_0 bit31=tiled, bits22..30=pitch(>>5); dword_1 bits0..5=format,
     // bits6..7=endian, bits12..31=base_address(>>12, VIRTUAL); dword_2 = (w-1)|((h-1)<<13).

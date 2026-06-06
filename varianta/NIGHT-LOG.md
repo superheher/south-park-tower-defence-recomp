@@ -4369,3 +4369,33 @@ simultaneous image draws blitted into ONE 1280×720 frame, vs these per-base spl
 (sub_821F8E60, local-space) still needs its deferred transform (separate). New: `ComposeRealFrame`, `g_texScreenRect`,
 `[frame]`; `g_texDimsByBase` extended with decode params. ⚠note: the dev shell is zsh — `rm glob*` aborts on no-match
 (use `find -delete` or `*(N)`).
+
+## cont.66 (2026-06-06/07, /loop "go deep renderer job", autonomous — user asleep) — multi-element frame accumulator built (VdSwap-snapshotted); FINDING: the composed menu now needs the per-draw UVs (atlas sprites) + the text transform, NOT more image work
+
+Built the persistent 1280×720 frame ACCUMULATOR (`REX_FCOMPOSE`): every sprite image draw (lr=0x82205114) blits its
+decoded texture (cached, `g_decCache`) into `g_frameBuf` at its screen rect (alpha-keyed); `VdSwap` (the guest frame
+present) snapshots `g_frameBuf` → PPM and clears it. Goal: reconstruct MULTI-element scenes (the menu), not just
+cont.65's per-base splash.
+
+**VALIDATED:** composes correctly — headless frame 000 = the SP DIGITAL STUDIOS splash (same as cont.65, via the
+accumulator). But the passive run reaches only single-element splashes + VdSwap is sparse headless (2 dirty frames).
+
+**REX_SKIPINTRO** (START injection) advances much further (162 assets, 30 frames), but the composed frames stay
+SPARSE, and the decisive reason is a real finding:
+- The SPLASH phase = dedicated-texture, FULL-UV sprites (logo etc.) → rendered correctly (cont.65).
+- The MENU/attract phase's sprite draws are ALL the **UI ATLAS 0xA337D000 (256²)** drawn as **FULL-SCREEN quads**
+  (0,0)-(1768,1043), repeated per frame (dests A0230C80/CA0/B9480/B94A0 cycling), with **PER-DRAW UVs (atlas
+  sub-rects)** — which the position-only fill (stride-8, no UV) does NOT carry, so they can't be placed/cropped (a
+  full-UV path would just stretch the whole atlas). Plus **19 TEXT draws** (sub_821F8E60, lr=0x821F90B0, local-space).
+
+**⇒ the composed MENU is gated on TWO missing pieces, NOT more image work:** (1) the per-draw UVs for the atlas
+sprites (where each atlas sub-rect comes from — a separate UV stream / fixed-function); (2) the TEXT renderer's
+deferred World+Proj transform (the cont.23 problem). The dedicated-texture images are solved (cont.65). ⚠ REX_SKIPINTRO
+also drives toward Level 1, not a clean menu stop — cleanly reaching the main menu needs input timing.
+
+**Default boot UNREGRESSED** (gated REX_FCOMPOSE; 207k lines, 0 real crashes, `[fcompose]`/`[frame]` dormant).
+
+**⇒ NEXT (cont.67):** find the menu sprites' PER-DRAW UVs (the atlas sub-rect source — likely a second VB stream the
+sprite renderer fills, or texcoords set via a different path) so the atlas-based menu renders — OR the TEXT transform
+(cont.23: pair the local-space glyph verts with the World+Proj set later). New: `AccumulateFrame`,
+`SnapshotFrameOnSwap`, `g_frameBuf`, `g_decCache`, `REX_FCOMPOSE`, `[fcompose]`.
