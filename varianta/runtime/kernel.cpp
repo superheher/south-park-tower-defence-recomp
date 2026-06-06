@@ -2526,6 +2526,25 @@ static void AccumulateFrame(uint32_t base, float minx, float miny, float maxx, f
             memcpy(&g_frameBuf[(size_t(fy)*W + fx)*4], s, 4); } }
     g_frameDirty = true;
 }
+// cont.70: decode a texture by base (via its handle info, cont.63) with the shared cache — for the TEXT renderer to
+// sample the font atlas. Returns nullptr if the base has no captured handle info or fails to decode.
+static const CachedTex* DecodeByBase(uint32_t base) {
+    std::lock_guard<std::mutex> lk(g_frameMtx);
+    auto it = g_decCache.find(base);
+    if (it != g_decCache.end()) return it->second.w ? &it->second : nullptr;
+    TexHandleDims info{}; bool have = false;
+    { std::lock_guard<std::mutex> lk2(g_texDimsMtx); auto i2 = g_texDimsByBase.find(base);
+      if (i2 != g_texDimsByBase.end()) { info = i2->second; have = true; } }
+    CachedTex ct{};
+    if (have && rex_tex::BytesPerBlock(info.fmt) && info.w && info.h) {
+        rex_tex::Desc dd{}; dd.guestBase = base; dd.format = info.fmt; dd.width = info.w; dd.height = info.h;
+        dd.tiled = info.tiled; dd.endian = info.endian; dd.pitchTexels = (info.pitch > info.w) ? info.pitch : 0;
+        std::vector<uint8_t> r;
+        if (rex_tex::DecodeGuestToRGBA(dd, r) && !r.empty()) { ct.rgba = std::move(r); ct.w = info.w; ct.h = info.h; }
+    }
+    auto res = g_decCache.emplace(base, std::move(ct));
+    return res.first->second.w ? &res.first->second : nullptr;
+}
 // cont.66: at each guest frame present (VdSwap), snapshot the accumulated frame -> PPM (capped) then clear it.
 static void SnapshotFrameOnSwap() {
     std::lock_guard<std::mutex> lk(g_frameMtx);
@@ -2694,6 +2713,42 @@ PPC_FUNC(sub_8242BF10)
             static const bool s_fcompose = getenv("REX_FCOMPOSE") != nullptr;
             if (s_fcompose && lr == 0x82205114u && g_lastTexBase >= 0xA2000000u && g_lastTexBase < 0xA3000000u)
                 AccumulateFrame(g_lastTexBase, minx, miny, maxx, maxy);
+            // cont.70: render the TITLE'S TEXT readable — the text renderer (lr=0x821F90B0, sub_821F8E60) fills
+            // stride-16 glyph quads (pos.local + uv into the bound font atlas, cont.64). Decode the atlas (cont.68)
+            // and rasterize each 4-vert glyph (atlas-uv -> the glyph's local box) into a per-label PPM. Placement is
+            // LOCAL (the game's World+Proj transform is exec-time, cont.23) but the text CONTENT becomes readable.
+            static const bool s_textrender = getenv("REX_TEXTRENDER") != nullptr;
+            if (s_textrender && lr == 0x821F90B0u && vc >= 4 && (vc % 4) == 0 && vc <= 1024
+                && g_lastTexBase >= 0xA2000000u && g_lastTexBase < 0xB1000000u) {
+                const CachedTex* atlas = DecodeByBase(g_lastTexBase);
+                if (atlas) {
+                    float lmnx=1e9f,lmny=1e9f,lmxx=-1e9f,lmxy=-1e9f;
+                    for (uint32_t k=0;k<vc;k++){ float px=rdf(k*16),py=rdf(k*16+4); lmnx=fminf(lmnx,px);lmny=fminf(lmny,py);lmxx=fmaxf(lmxx,px);lmxy=fmaxf(lmxy,py); }
+                    int LW=(int)(lmxx-lmnx+0.5f)+8, LH=(int)(lmxy-lmny+0.5f)+8;
+                    if (LW>8 && LW<=2048 && LH>4 && LH<=512) {
+                        std::vector<uint8_t> fb(size_t(LW)*LH*4,0); for(size_t z=0;z<size_t(LW)*LH;z++) fb[z*4+3]=255;
+                        for (uint32_t g=0; g+4<=vc; g+=4) {
+                            float gx0=1e9f,gy0=1e9f,gx1=-1e9f,gy1=-1e9f,gu0=1e9f,gv0=1e9f,gu1=-1e9f,gv1=-1e9f;
+                            for(int j=0;j<4;j++){ float px=rdf((g+j)*16),py=rdf((g+j)*16+4),u=rdf((g+j)*16+8),v=rdf((g+j)*16+12);
+                                gx0=fminf(gx0,px);gy0=fminf(gy0,py);gx1=fmaxf(gx1,px);gy1=fmaxf(gy1,py);
+                                gu0=fminf(gu0,u);gv0=fminf(gv0,v);gu1=fmaxf(gu1,u);gv1=fmaxf(gv1,v); }
+                            int dx0=(int)(gx0-lmnx+4+0.5f), dy0=(int)(gy0-lmny+4+0.5f);
+                            int dw=(int)(gx1-gx0+0.5f), dh=(int)(gy1-gy0+0.5f); if(dw<1||dh<1) continue;
+                            for(int yy=0;yy<dh;yy++){ int fy=dy0+yy; if(fy<0||fy>=LH) continue; float vv=gv0+(gv1-gv0)*((float)yy/dh);
+                                int ay=(int)(vv*atlas->h); if(ay<0)ay=0; if(ay>=atlas->h)ay=atlas->h-1;
+                                for(int xx=0;xx<dw;xx++){ int fx=dx0+xx; if(fx<0||fx>=LW) continue; float uu=gu0+(gu1-gu0)*((float)xx/dw);
+                                    int ax=(int)(uu*atlas->w); if(ax<0)ax=0; if(ax>=atlas->w)ax=atlas->w-1;
+                                    const uint8_t* sp=&atlas->rgba[(size_t(ay)*atlas->w+ax)*4];
+                                    if(sp[0]<40 && sp[1]<40 && sp[2]<40) continue;   // skip the dark glyph background
+                                    uint8_t* dp=&fb[(size_t(fy)*LW+fx)*4]; dp[0]=sp[0];dp[1]=sp[1];dp[2]=sp[2];dp[3]=255; } } }
+                        static std::atomic<int> tn{0}; int ti=tn.fetch_add(1);
+                        if (ti < 40) { char fp[80]; snprintf(fp,sizeof fp,"/tmp/cont70_text_%02d_%08X.ppm", ti, g_lastTexBase);
+                            rex_tex::WriteRGBAasPPM(fp, fb.data(), LW, LH);
+                            fprintf(stderr,"[textrender] label %d: %u glyphs atlas=0x%08X %dx%d local[%.0f..%.0f,%.0f..%.0f] uv[%.2f..%.2f] -> %s\n",
+                                    ti, vc/4, g_lastTexBase, atlas->w, atlas->h, lmnx,lmxx,lmny,lmxy, minu, maxu, fp); }
+                    }
+                }
+            }
             static std::atomic<int> dn{0}; int i = dn.fetch_add(1);
             if (i < 600)   // cont.67: raised from 48 (the cap was entirely consumed by the intro phase -> the menu/legal draws were never logged)
                 fprintf(stderr, "[drawcap] #%d lr=0x%08X tex=0x%08X dest=0x%08X vc=%u %s pos[%.1f..%.1f,%.1f..%.1f] uv[%.2f..%.2f,%.2f..%.2f] v0=(%.1f,%.1f / %.2f,%.2f)\n",

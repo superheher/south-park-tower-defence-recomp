@@ -4471,3 +4471,31 @@ text-renderer + non-capturable, not simple sprites. The real menu composition is
 (pos.local + uv; capture the UVs) with the exec-time reg-0x4000 transform AND the decoded font atlas (cont.68) →
 textured readable glyphs at their placement (headless PPM, reusing cont.23's REX_UITEXT). cont.23's transform pairing
 already works (it placed a label, just off-screen); the on-screen labels would show readable menu text. New: `[menudraw]`.
+
+## cont.70 (2026-06-07, /loop "go deep renderer job", autonomous — user asleep) — ⭐⭐VARIANT A RENDERS THE TITLE'S TEXT READABLE: textured glyphs from the real glyph verts + the decoded font atlas (cont.23's deferred "readable text" step DONE)
+
+New `REX_TEXTRENDER` (kernel.cpp): the text renderer (lr=0x821F90B0, sub_821F8E60) fills stride-16 glyph quads
+(pos.local + uv into the bound font atlas, cont.64). `DecodeByBase` decodes the atlas (cont.68, A337D000 256×256
+FMT_8), then each 4-vert glyph quad is rasterized (atlas-uv → the glyph's local box, skip the dark glyph bg) into a
+per-label PPM. Guest-side, headless — no EXECSEGS/Vulkan.
+
+**RESULT** (REX_TEXTRENDER + REX_DRAWCAP + REX_SKIPINTRO, headless): the title's text renders **READABLE** — label 0
+(63 glyphs) = **"This control is used as a runtime indicator of timeline progress"** (kerned, two lines, white-on-black,
+`/tmp/cont70_label0.png`, viewed). This completes cont.23's deferred "readable text" step (cont.23 had the placed
+glyph GEOMETRY; the font atlas + UVs were the missing piece, now decoded). The full text path — glyph verts (pos+uv) +
+decoded font atlas → readable textured text — is proven end-to-end.
+
+⚠ the captured label is an internal DEBUG/tooltip string (the off-screen "63-glyph label" cont.23 found, World.y=866);
+all 40 captured frames are this one active label (redrawn). The menu's OWN option labels (PLAY/OPTIONS/level names)
+weren't captured — they're transient (REX_SKIPINTRO drives past the menu to Level 1, same as the cont.69 portraits).
+Placement is LOCAL (the game's World+Proj transform is exec-time, cont.23); the text CONTENT is readable.
+
+**Default boot UNREGRESSED** (gated REX_TEXTRENDER; 173k lines, 0 real crashes).
+
+**⇒ the rendering PRIMITIVES all work now:** SPLASHES at real positions (cont.65), menu ASSETS decode (cont.68), TEXT
+readable (cont.70). The remaining gap to the live interactive menu = reaching the menu's own draws cleanly (transient
+under SKIPINTRO) + game-accurate placement (the exec-time transform, cont.23/34 A↔B).
+
+**⇒ NEXT (cont.71):** reach the menu's OWN text/portrait labels (better input timing — pause at the menu instead of
+driving to Level 1) so the real menu options render; OR apply the cont.23 exec-time transform for game-accurate text
+placement. New: `REX_TEXTRENDER`, `DecodeByBase`, `[textrender]`.
