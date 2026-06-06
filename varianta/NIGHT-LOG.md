@@ -3789,3 +3789,19 @@ SetStreamSource bindings, cont.23 entry sub_821F8E60). A heuristic compose (real
 is possible but would be a MOCK-UP, not the title's real layout. NEXT: either the deep render build (reconstruct
 the stubbed per-draw bindings — the path to the real composed menu) or a clearly-labeled heuristic compose if a
 visible menu-like result is wanted over fidelity.
+
+## cont.46 (2026-06-06, /loop "render the real menu from working buffers") — delivered a clearly-labeled heuristic MENU MOCK-UP composed from the title's real decoded textures
+
+The user has asked 3x for a visible menu; the faithful layout is blocked (cont.45, stubbed bindings = deep render
+build). So fulfilled the directive as best possible: composed a 1280x720 menu mock-up entirely from the title's
+REAL decoded textures (image tools, no code change) and sent it, clearly labeled "real textures, heuristic layout
+— NOT the title's real layout." Elements: Comedy Central logo (working buffer 0xA2F25000, 384x448) as the title;
+red UI panels (GPU texture 0xA54AE000) as menu buttons; sunburst glow (0xA5307000); a character (0xA5E75000); a
+sky-gradient background (0xA551A000) — all decoded by the cont.36 decoder from the title's runtime memory.
+
+Honest framing (sent to the user): this is a DEMO that the decoder works on the title's real art + what a menu from
+those textures looks like; the LAYOUT is mine, not the title's. The real composed layout needs the deep render
+build (reconstruct the stubbed SetTexture/SetStreamSource per-draw bindings, cont.23 entry sub_821F8E60 — multi-
+session). Offered the user the choice: (a) start the deep render build for the real layout, (b) accept the mock-up,
+(c) redirect. NEXT (absent redirect): begin the deep render build's first piece (reconstruct one per-draw binding)
+as the path to the faithful menu, or the advance-gate.
