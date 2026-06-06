@@ -3997,3 +3997,33 @@ gameplay; the menu/attract is reached without it). ⚠ STRATEGY NOTE: cont.52 (m
 both cracked real gates via the oracle, but NEITHER is the menu RENDER blocker — the menu/attract is reached, and the
 wall is still cont.34's GPU-completion spin (the renderer proper). To actually SEE the menu, the renderer
 (GPU-completion / per-draw bind, cont.34/23-24) remains the work; the gate-cracks are gameplay-path progress.
+
+## cont.54 (2026-06-06, /loop) — REFOCUS to the menu RENDERER; fully traced the per-draw SetTexture chain to REAL code ⇒ the cont.24 "tex=0x0" dead-end REFRAMED: SetTexture is DEFERRED device-state, the gap is the draw-time FLUSH → command stream
+
+Pivoted the menu-render attack (per cont.53's insight that the gates are gameplay-path). Re-grounded by reading
+the renderer: the attract/menu loop RUNS (sub_821C6F50 = per-frame GPU-command building, NOT a spin); the wall is
+that variant A's executed draws render with **tex=0x0** (cont.45). variant A's PM4 interpreter DOES handle both
+SET_CONSTANT (0x2D) and SET_CONSTANT2 (0x55) into the fetch region (0x4800), so the binding isn't a missing PM4
+opcode.
+
+**Traced the cont.47-49 per-draw keystone end-to-end via gdb (variant A has DWARF; tools vtbl15.gdb, settex.gdb):**
+text renderer `sub_821F8E60` → (vtable[15] = `*(*(r31)+60)`) `sub_821FFB10` (per-draw SetTexture *wrapper*: gets the
+texture's GPU handle via the resource's vtable[2], redundancy-checks `r30+392`, else calls device.vtable[8]) →
+(device.vtable[8] = `*(*(r30+332)+32)`) **`sub_82204BD0`** (called with REAL texture handles 0x610feb0/0x60fee40/…,
+some 0x0 = textureless) → `sub_821BEC00` (the actual D3D SetTexture).
+
+**⭐REFRAMING of the cont.23-24 dead-end:** `sub_821BEC00` does NOT write a fetch-constant or build a SET_CONSTANT —
+it stores the texture binding into a **DEFERRED per-stage device-state structure** (descriptor fields +0/4/8/12/16/20,
+state arrays indexed by sampler stage) and sets a **DIRTY flag** (`*(r31+13732)`), then calls sub_821CAA18. So the
+ENTIRE per-draw SetTexture chain is REAL recompiled code that RUNS — the texture binding IS recorded in device state.
+The fetch-constant is written later, at a **draw-time FLUSH** (dirty device-state → SET_CONSTANT in the command
+buffer, just before DrawPrimitive). ⇒ cont.45's tex=0x0 is NOT "SetTexture stubbed/lost" (cont.24's framing) — it's
+that the **deferred-state flush doesn't reach the command stream variant A executes** (the EXECSEGS deferred segments
+device+13568 are a different/placeholder stream; the real per-frame draws+flush go elsewhere — the cont.34 "circular
+A↔B" / which-command-buffer question).
+
+**⇒ NEXT (cont.55):** find the draw-time FLUSH — where the dirty device texture-state (set by sub_821BEC00, flag
+*(r31+13732)) is applied to fetch-constants in a command buffer before DrawPrimitive. Identify WHICH command buffer/
+stream the flush + the real per-frame draws target, vs what variant A's renderer executes (EXECSEGS=device+13568 vs
+the ring). Closing that gap (execute the real per-frame draw+flush stream) is the per-draw-texture-binding fix = the
+visible menu. No code change this iteration (investigation/tracing); tools added: vtbl15.gdb, settex.gdb.
