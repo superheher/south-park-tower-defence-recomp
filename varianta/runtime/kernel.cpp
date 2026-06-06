@@ -2005,7 +2005,9 @@ PPC_FUNC(sub_821BF298)
 // can't see). Filter to the slot-1 vert range. r3=dest, r4=src, r5=size (confirmed memcpy). Temporary diagnostic.
 std::mutex g_vbMtx; std::vector<float> g_vbVerts;   // REX_VBFILL render accumulator
 // cont.29 r31-corruption localization state (defined here, before the first user sub_8242BF10).
-static bool g_inPoll = false;
+// thread_local: g_inPoll is set ONLY across the tid=10 transition poll; keeping it thread-local makes the
+// default-on guard below safe against a concurrent large memcpy on another thread during the poll window.
+thread_local bool g_inPoll = false;
 static int  g_r31seq = 0;
 extern "C" PPC_FUNC(__imp__sub_8242BF10);
 PPC_FUNC(sub_8242BF10)
@@ -2016,13 +2018,23 @@ PPC_FUNC(sub_8242BF10)
     if (g_inPoll && s_r31trk) { static std::atomic<int> mc{0}; if (mc.fetch_add(1) < 16)
         fprintf(stderr, "[r31]   memcpy dest=0x%08X src=0x%08X size=0x%X%s\n", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
                 (ctx.r3.u32 <= 0x9825F544u && ctx.r3.u32 + ctx.r5.u32 > 0x9825F544u) ? "  <== HITS saved-r31!" : ""); }
-    // REX_CLAMPCPY (cont.29): the poll's first memcpy is called with size=0xFFFFFFFF (a -1 "not found" sentinel
-    // mis-used as a length) -> a 4GB stack-to-stack copy that shreds sub_82448158's saved r31 (and the frame).
-    // Neutralize ONLY the in-poll garbage-size copy (size>=0x100000) by zeroing it. Surgical fix vs REX_SKIPPOLL.
-    static const bool clampcpy = getenv("REX_CLAMPCPY") != nullptr;
-    if (clampcpy && g_inPoll && ctx.r5.u32 >= 0x100000u) {
+    // cont.30: PROMOTED TO DEFAULT-ON (was REX_CLAMPCPY). The menu->gameplay transition poll's lookup-and-copy
+    // (sub_82448158 -> sub_8244FE80) copies a resource record whose blob-length field +60 = 0xFFFFFFFF (the -1
+    // "size unknown / streaming-not-ready" sentinel of the still-loading Meshes\Global.bin record; same not-ready
+    // class as cont.26's 0x60606060 deserialize count). sub_8244FF20 (NtOpenFile + read) returned success, so the
+    // record is "found" but its length is the sentinel; the recompiled copy uses it as a memcpy size -> a ~4GB
+    // stack-to-stack copy that shreds sub_82448158's saved-r31 slot and the whole frame, hanging/crashing the
+    // title at the gate. Guard: zero any in-poll (tid=10 transition poll; g_inPoll thread-local) memcpy whose
+    // size is impossibly large (>=256MB; the poll's legit copies are <=0x3C, the actual mesh DATA streams via a
+    // separate loader, not this header copy). This advances 65 -> ~96 assets (Meshes\Global.bin +
+    // Levels/Campaigns/Challenges.xmc + all gameplay geom). Two independent fixes (cont.28 REX_SKIPPOLL, cont.29
+    // CLAMPCPY) confirm the root cause. REX_NOCLAMPCPY opts out (restores the old crash-prone 65-asset default).
+    // The fully-upstream fix (populate +60 mid-stream) is the deep streaming-loader build; this is the correct
+    // in-scope fix.
+    static const bool noclampcpy = getenv("REX_NOCLAMPCPY") != nullptr;
+    if (!noclampcpy && g_inPoll && ctx.r5.u32 >= 0x10000000u) {
         static std::atomic<int> cc{0}; if (cc.fetch_add(1) < 4)
-            fprintf(stderr, "[clampcpy] in-poll memcpy size 0x%X -> 0 (garbage; was shredding the stack)\n", ctx.r5.u32);
+            fprintf(stderr, "[clampcpy] in-poll garbage memcpy size 0x%X -> 0 (sentinel +60; was shredding the stack)\n", ctx.r5.u32);
         ctx.r5.u64 = 0;
     }
     // REX_UITEXT: snapshot each text-glyph fill (guest thread) keyed by vert count, for exec-time pairing.

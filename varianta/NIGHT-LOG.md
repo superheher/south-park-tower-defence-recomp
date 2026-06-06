@@ -3217,3 +3217,84 @@ loader-state thread as cont.26's 0x60606060); decide whether to promote REX_CLAM
 a rendered menu (combine CLAMPCPY/SKIPPOLL with the renderer). ⚠ honest: the default-boot INDIRECT-NULL guard-fire
 count is high-variance (pre-existing intermittent race, non-fatal — exit124/65 assets invariant); my default-boot
 changes are gated no-ops. Diags REX_R31TRACK/REX_CLAMPCPY. Default boot unregressed.
+
+## cont.30 (2026-06-05/06, /loop autonomous) — ⭐ CLAMPCPY promoted to DEFAULT-ON (advance is now the default boot) + transitions ENABLE + render is a measured null-result; ⚠ a REX_RENDER bg run hung 6h (process-hygiene fix)
+
+Continued cont.29 (the two NEXT branches: proper fix / promote default-on + push the advance toward a render).
+Commit cont.30 (NOT pushed). Default boot now ADVANCES (65→~96 assets) and is exit-124 clean.
+
+**Reproduced the cont.29 baseline (the test harness).** Default boot (un-clamped) = 65 assets, then the poll's
+4GB memcpy runs and the title hangs/crashes (one of my un-clamped runs SIGSEGV'd at exit 139 — the 4GB copy IS
+the crash, not just a hang). REX_CLAMPCPY=1 = 96 assets, exit 124 clean. The [r31] trace pinned the exact killer:
+`memcpy dest=0x9825F6CC src=0x9825F430 size=0xFFFFFFFF` (poll ENTER r31=0x820D2844 path → EXIT preserved when
+clamped). Note: the run log carries NUL bytes (core/binary writes) — analyze with `grep -a`.
+
+**RE: why obj+60 = 0xFFFFFFFF (proper-fix characterization, task #2).** Traced the copy chain statically:
+- **sub_82448158 = lookup-and-copy** (ppc_recomp.64.cpp:17385): `RtlInitAnsiString(name)` → build a key
+  `{-3, &ansi, 64}` → **sub_8244FF20(key, dstBuf=stack+112, 328, &result)** = the lookup; `if (r3 < 0)` →
+  cleanup + return -1 (NO copy); `else` → **sub_8244FE80(src=stack+112, dst=r31)** = the copy.
+- **sub_8244FF20** (ppc_recomp.65.cpp:20244) = **NtOpenFile + an indirect read** of the resource record into the
+  328-byte buffer. (Uses NtOpenFile, not NtCreateFile — so this open is NOT in the [asset]/NtCreateFile trace.)
+- **sub_8244FE80** (ppc_recomp.65.cpp:20155) copies the record header (fields 56,8,12,…→dst) then
+  `memcpy(dst+44, src+64, *(src+60))` + null-terminates — i.e. **+60 is the inline-blob length, +64 the blob.**
+- ⭐ **Rigor (no rebuild needed): the killer memcpy EXECUTED ⇒ sub_82448158 took its `bge` success branch ⇒
+  sub_8244FF20 returned ≥ 0 (found/read OK).** So the record is "found" but its length field +60 = 0xFFFFFFFF
+  (the -1 "size unknown / streaming-not-ready" sentinel of the still-loading Meshes\Global.bin record). **NOT a
+  branch mis-emit** — the same not-ready-resource class as cont.26 (0x60606060 count) and cont.27 (registered-
+  but-unloaded). The fully-upstream fix (populate +60 mid-stream) IS the deep streaming-loader build — out of
+  scope and unnecessary; the in-scope correct fix is a guard.
+
+**DECISION (task #3): promoted CLAMPCPY to a DEFAULT-ON guard.** kernel.cpp: `g_inPoll` made `thread_local`
+(set only across the tid=10 transition poll → safe vs a concurrent large memcpy on another thread); the guard
+fires by default (env `REX_NOCLAMPCPY` opts out) when an in-poll memcpy size ≥ 256MB (the poll's legit copies
+are ≤0x3C; threshold widened 1MB→256MB for default-on safety, behaviorally identical for the 0xFFFFFFFF
+sentinel). **Verified (3 stable runs): new default boot = 96 assets, exit 124 clean, the 4GB-memcpy crash
+ELIMINATED, 1 pre-existing non-fatal INDIRECT-NULL; REX_NOCLAMPCPY restores 65.** A strict improvement: removes
+a crash AND advances the title past the menu→gameplay gate by default.
+
+**⭐ NEW MILESTONE: the transition machinery now COMPLETES.** With the gate cleared (sub_8211BE68 now returns),
+REX_INITDIAG shows: `sub_82250420 worker ENTERED` → `sub_8211B740 work-handler ran` →
+**`*** sub_8210AF90 RAN — 0x828E82A6 set, transitions enabled ***`**. This is exactly the cont.25 prediction:
+the advance machinery works once the gate passes. The asset trace then enters the **main-menu ATTRACT LOOP** —
+Rat MeshEntity (Rat_Mesh1.spm + rat.dds) + **hudimages.bin**, then cycling sp_xbox_0_intro.wmv ↔
+towerDefense_attract_movie.wmv (assets #92-95). The title is no longer stuck; it runs the attract sequence.
+
+**📐 RENDER = MEASURED NULL-RESULT (task #4).** Ran `REX_RENDER=1 REX_MENUTEST=1 REX_MENUTEX=1 REX_EXECSEGS=3`
+WITH the advance default-on. It rendered + captured /tmp/varianta_menu.ppm (frame 531) = **the SAME backdrop as
+cont.24** (24 verts = 4 LevelSelectBG quadrants; mean RGB 82,114,118 vs cont.24's 82,113,117). The [ldframe]
+sample stayed atlas 0xA5004800=0 / edram 0xB0000000=0 / all per-draw tex slots empty. **⇒ the advance does NOT
+enrich the rendered scene — the executed device+13568 draw segments are still the sparse backdrop; the renderer
+wall (loader-gated per-draw textures, cont.24) is INDEPENDENT of the advance gate. Two separate walls.** The
+rich/readable menu still needs the deep renderer build (per-draw texture decode/upload + a loader that populates
+non-empty per-draw textures), OR reaching the actual level-select SCREEN (not the idle attract loop) via input
+injection so the title builds a NEW draw scene into device+13568.
+
+**⚠ PROCESS HAZARD found (and the cause of a 6-hour hang).** REX_RENDER runs IGNORE `timeout`'s SIGTERM — the
+detached render thread keeps spinning (vkQueuePresent loop) at ~101% CPU, so `timeout 45` (which only sends
+SIGTERM, no -k escalation) waited forever and the background task never completed. I idled waiting for a
+completion signal that never came → the GUI window spun ~6h (log reached vblank 1.6M / "menu-quad test frame
+1560300") until the user told me to kill it. Killed via `pkill -9`. **Lesson (durable): for any REX_RENDER run
+use `timeout -s KILL -k 5 N` (force SIGKILL), and NEVER launch a GUI run as a background task and then idle on
+its completion — bound it and poll, or run it foreground with a hard SIGKILL timeout.** The non-render runs
+(exit 124) respond to SIGTERM fine; only REX_RENDER is affected.
+
+**⇒ NET cont.30:** the advance gate fix is now DEFAULT-ON (a real, durable milestone — title advances 65→96
+assets, transitions enable, enters attract loop, crash removed), and the render path is rigorously confirmed to
+be a SEPARATE wall the advance doesn't move. NEXT: (a) input-injection (REX_SKIPINTRO START+A) to push past the
+attract loop toward a real level-select SCREEN, then re-check if EXECSEGS gets new draw content to render; OR
+(b) the deep renderer build (per-draw texture decode/upload). Diags: CLAMPCPY now default-on + REX_NOCLAMPCPY,
+REX_R31TRACK retained. Default boot now = 96-asset advance (the old 65-asset boot is `REX_NOCLAMPCPY=1`).
+
+**cont.30 addendum — the cont.31 lead (measured, not yet fixed).** Ran the advance default-on + REX_SKIPINTRO
+(injects A+START): instead of the idle attract movie loop, the title loads **88 distinct GAMEPLAY assets** —
+Characters\MovenFireData.xmc, enemytextures/EnemyGeom/EnemyTypes, pickuptextures/pickupGeom/pickups, the Rat
+enemy mesh+texture, hudimages.bin — i.e. it tries to load INTO a level. Then it STALLS at a NEW gate: an
+**`[INDIRECT-NULL] target=0xFFFFFFFF (caller lr=0x8215DE84)`** — the menu-setup function (sub_8215DE.. in
+ppc_recomp.7.cpp; cont.7 identified sub_8215DE84 as menu-setup) calls **sub_824253C8** (lr=0x8215DE84), inside
+which an indirect call (bctrl) goes through a 0xFFFFFFFF function pointer. **Same -1/sentinel class as cont.30's
++60, but a DIFFERENT resource/fn-pointer (a new gate, not the same guard).** ⇒ cont.31 = RE this menu-setup
+INDIRECT-NULL: which object's vtable/fn-pointer is 0xFFFFFFFF (an unready resource), and whether a targeted
+guard/init advances the title further toward a real level/menu SCREEN (then re-check EXECSEGS for new draw
+content). Entry: sub_8215DE84 / sub_824253C8 (ppc_recomp.7.cpp:16280) + whatever object holds the indirectly-
+called fn-pointer. (2 INDIRECT-NULL this run, both at lr=0x8215DE84; the rest is the KeGetCurrentProcessType
+stall-spin, atlas/edram still empty.)
