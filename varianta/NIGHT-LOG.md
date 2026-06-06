@@ -3298,3 +3298,38 @@ guard/init advances the title further toward a real level/menu SCREEN (then re-c
 content). Entry: sub_8215DE84 / sub_824253C8 (ppc_recomp.7.cpp:16280) + whatever object holds the indirectly-
 called fn-pointer. (2 INDIRECT-NULL this run, both at lr=0x8215DE84; the rest is the KeGetCurrentProcessType
 stall-spin, atlas/edram still empty.)
+
+## cont.31 (2026-06-06, /loop autonomous) — ⭐⭐ same-class guard on the menu-setup handler advances the title to LOADING LEVEL 1 (Stan's House) — 92 → 162 assets
+
+Pursued the cont.30 addendum lead (the menu-setup INDIRECT-NULL). Same sentinel class, a clean targeted fix,
+and it advances the title MUCH further — into actual level loading. Gated diag REX_HANDLERGUARD. Commit cont.31.
+
+**The gate (RE).** sub_824253C8 (ppc_recomp.59.cpp:21119) is a **global-handler dispatch**: it reads a fn-pointer
+at *(0x828183A0), guards ONLY `r10==0` (→ return error 0x80004001), then `bctr` to the pointer. When the handler
+is **unregistered the global holds 0xFFFFFFFF** (the -1 sentinel — same class as cont.30's record+60), which
+passes the ==0 check → `bctr` to 0xFFFFFFFF → INDIRECT-NULL at the menu-setup caller (sub_8215DE84,
+ppc_recomp.7.cpp:16280). The generic INDIRECT-NULL guard skips the call but leaves r3=1 (a FALSE success, since
+r3=1 was set before the bctr), so sub_8215DE84's `if (r3<0)` check (ppc_recomp.7:16283) is not taken → it
+proceeds on bad state and stalls.
+
+**The fix (REX_HANDLERGUARD).** Treat the 0xFFFFFFFF sentinel like null → return the proper error 0x80004001
+(which IS <0 as int32) so the caller takes its "handler not ready" branch. (kernel.cpp PPC_FUNC(sub_824253C8),
+global addr computed exactly as the recomp does.) Gated — it only matters once the handler is reached (i.e. with
+REX_SKIPINTRO navigating past attract); default boot is untouched.
+
+**⭐⭐ RESULT (REX_SKIPINTRO + REX_HANDLERGUARD + the default-on advance; reproducible, 2 runs IDENTICAL): 92 → 162
+assets (118 distinct), the title LOADS LEVEL 1 — "Stan's House".** New content: all 4 character WaveBanks
+(Cartman/Kenny/Kyle/Stan), the enemy AI LuaScripts (ManBearPig, Mongolian, Gnome, Homeless — the actual TD
+enemies), mission/global/camera/audio/taunt/trigger scripts, **Stans_House.bin (the Level 1 map, referenced 8×)**,
+and **Level1Intro.wmv**. The progression is now: 65 (stuck intro) → 96 (attract loop, cont.30) → **162 (Level 1
+loading, cont.31)**. handlerguard fired 4× (the menu-setup re-dispatches). exit137 = clean SIGKILL at 42s.
+
+**Next gate + honest limits.** The title then stalls at the NEXT gate: `[INDIRECT-NULL] target=0x00000000 (caller
+lr=0x82292D08)` — a GENUINE null this time (not the -1 sentinel; sub_82292D08 is the cont.25-noted downstream
+null). So the advance is a CHAIN of not-ready-resource gates, each the same uninitialized/sentinel class. ⚠ The
+RENDERER is STILL the separate wall (atlas/edram empty all run) — loading Level 1 ≠ SEEING it; whether the level's
+gameplay builds NEW renderable EXECSEGS draw content (vs the menu backdrop) is the open render question. NEXT
+(cont.32): (a) the sub_82292D08 null gate (next in the chain); (b) whether chasing the gate chain reaches a
+RENDERABLE state or just loads files (the renderer wall is independent — cont.30); (c) a CAREFUL render run
+(timeout -s KILL) at the Level 1 state to check for new draw content. REX_HANDLERGUARD kept GATED (needs more
+validation + only active with input) — not yet promoted to default-on.

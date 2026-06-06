@@ -2657,6 +2657,33 @@ PPC_FUNC(sub_822487C8) {
 // corruptor; removed (they wrapped hot loader fns, adding per-call overhead). The root cause is now pinned to the
 // in-poll memcpy with size=*(obj+60)=0xFFFFFFFF; REX_CLAMPCPY neutralizes it (and REX_R31TRACK still logs the
 // poll ENTER/EXIT + the memcpy dest/size for re-verification).
+
+// cont.31 (REX_HANDLERGUARD, gated experiment): sub_824253C8 (ppc_recomp.59.cpp:21119) dispatches a GLOBAL
+// handler fn-pointer at *(0x828183A0): it guards only `r10==0` (-> return error 0x80004001), then `bctr` to the
+// pointer. When the handler is UNREGISTERED the global holds 0xFFFFFFFF (a -1 sentinel — same class as cont.30's
+// +60), which passes the ==0 check, so it bctr's to 0xFFFFFFFF (INDIRECT-NULL at lr=0x8215DE84, the menu-setup
+// caller). The generic INDIRECT-NULL guard then skips the call but leaves r3=1 (a FALSE success: r3=1 was set
+// before the bctr), so the menu-setup proceeds on bad state and stalls (seen with REX_SKIPINTRO: loads 88
+// gameplay assets then hangs here). Guard: treat the 0xFFFFFFFF sentinel like null -> return the proper error
+// 0x80004001 (<0 as int32), so the caller (sub_8215DE84, `if (r3<0)` at ppc_recomp.7.cpp:16283) takes its
+// "handler not ready" branch instead of a bogus success. Gated for testing; promote to default-on only if it
+// cleanly advances. (Global addr derived exactly as the recomp does: r11=lis -32126 => 0x82820000, -31840.)
+extern "C" PPC_FUNC(__imp__sub_824253C8);
+PPC_FUNC(sub_824253C8) {
+    static const bool guard = getenv("REX_HANDLERGUARD") != nullptr;
+    if (guard) {
+        uint32_t addr = (uint32_t)(-2105409536) + (uint32_t)(-31840);   // = 0x828183A0
+        uint32_t h = GLD32(addr);
+        if (h == 0xFFFFFFFFu) {                                          // unregistered-handler sentinel
+            static std::atomic<int> g{0}; if (g.fetch_add(1) < 4)
+                fprintf(stderr, "[handlerguard] handler *(0x%08X)=0xFFFFFFFF (unregistered) -> return error 0x80004001\n", addr);
+            ctx.r3.u64 = 0x80004001u;
+            return;
+        }
+    }
+    __imp__sub_824253C8(ctx, base);
+}
+
 // Diag (gated): confirm the title's own completion poster fires after a forced EOS (sub_82425BF8 EOF branch).
 extern "C" PPC_FUNC(__imp__sub_8222A9F8);
 PPC_FUNC(sub_8222A9F8)
