@@ -4499,3 +4499,28 @@ under SKIPINTRO) + game-accurate placement (the exec-time transform, cont.23/34 
 **⇒ NEXT (cont.71):** reach the menu's OWN text/portrait labels (better input timing — pause at the menu instead of
 driving to Level 1) so the real menu options render; OR apply the cont.23 exec-time transform for game-accurate text
 placement. New: `REX_TEXTRENDER`, `DecodeByBase`, `[textrender]`.
+
+## cont.71 (2026-06-07, /loop "go deep renderer job", autonomous — user asleep) — ⭐⭐the title's REAL MENU/UI TEXT renders readable: dedup unlocks the distinct labels (SELECT GAME MODE, the game description, LOADING…)
+
+cont.70 rendered text but captured only ONE label (the debug string, redrawn 40×). cont.71 adds DEDUP to
+REX_TEXTRENDER (by glyph count + first-glyph uv) so each DISTINCT label dumps once. With REX_SKIPINTRO (reaches the
+menu/level path): **24 distinct labels — the title's REAL MENU/UI TEXT, readable:**
+- **"SELECT GAME MODE"** (a menu screen title)
+- **"South Park is under attack! Help Stan, Cartman, Kyle, and Kenny save the town from being destroyed."** (the
+  game's intro description — perfectly legible, atlas ACE54000)
+- **"LOADING…"**, **"Again!"**, "SELECT", "NEXT"
+Montage `/tmp/cont71_menulabels.png` (= `/tmp/SP_cont71_menu_text.png`, viewed). Attract (no SKIPINTRO) renders only 2
+labels (the menu text needs the SKIPINTRO path).
+⚠ some labels from the **A2D76000** atlas render GARBLED — A2D76000 is a pre-rendered text-STRING atlas (cont.68), not
+a glyph grid, so the glyph-quad sampling misaligns; the glyph-atlas labels (A337D000, ACE54000) render clean. A refinement.
+
+**⇒ the title's real menu text RENDERS READABLE.** Combined: SPLASHES at real positions (cont.65), menu ASSETS decode
+(cont.68), TEXT readable incl. real menu/UI strings (cont.70–71). The rendering is comprehensive; the live composited
+interactive menu (text + portraits at game-accurate positions in ONE frame) still needs the exec-time transform +
+clean scene-reaching (cont.34 A↔B), but the CONTENT all renders.
+
+**Default boot UNREGRESSED** (gated REX_TEXTRENDER; 173k lines, 0 real crashes).
+
+**⇒ NEXT (cont.72):** (a) handle the A2D76000-style pre-rendered-string atlases (render the whole string texture, not
+glyph-quad sampling); (b) OR game-accurate placement via the cont.23 exec-time transform; (c) OR consolidate a morning
+report (the night's results: splash renders + asset inventory + readable menu text). New: dedup in REX_TEXTRENDER.

@@ -2741,11 +2741,16 @@ PPC_FUNC(sub_8242BF10)
                                     const uint8_t* sp=&atlas->rgba[(size_t(ay)*atlas->w+ax)*4];
                                     if(sp[0]<40 && sp[1]<40 && sp[2]<40) continue;   // skip the dark glyph background
                                     uint8_t* dp=&fb[(size_t(fy)*LW+fx)*4]; dp[0]=sp[0];dp[1]=sp[1];dp[2]=sp[2];dp[3]=255; } } }
-                        static std::atomic<int> tn{0}; int ti=tn.fetch_add(1);
-                        if (ti < 40) { char fp[80]; snprintf(fp,sizeof fp,"/tmp/cont70_text_%02d_%08X.ppm", ti, g_lastTexBase);
-                            rex_tex::WriteRGBAasPPM(fp, fb.data(), LW, LH);
-                            fprintf(stderr,"[textrender] label %d: %u glyphs atlas=0x%08X %dx%d local[%.0f..%.0f,%.0f..%.0f] uv[%.2f..%.2f] -> %s\n",
-                                    ti, vc/4, g_lastTexBase, atlas->w, atlas->h, lmnx,lmxx,lmny,lmxy, minu, maxu, fp); }
+                        // cont.71: dedup by (glyph count + first-glyph uv) so each DISTINCT label dumps once (not 40
+                        // copies of the same redrawn label) — to catch the menu/title-screen's own text labels.
+                        static std::mutex dmx; static std::unordered_set<uint64_t> seenLbl; static std::atomic<int> tn{0};
+                        uint64_t key = ((uint64_t)vc << 40) ^ ((uint64_t)(uint32_t)(rdf(8)*4096.f) << 16) ^ (uint32_t)(rdf(12)*4096.f);
+                        bool isnew; { std::lock_guard<std::mutex> lk(dmx); isnew = seenLbl.insert(key).second; }
+                        if (isnew) { int ti=tn.fetch_add(1);
+                            if (ti < 60) { char fp[80]; snprintf(fp,sizeof fp,"/tmp/cont71_text_%02d_%08X.ppm", ti, g_lastTexBase);
+                                rex_tex::WriteRGBAasPPM(fp, fb.data(), LW, LH);
+                                fprintf(stderr,"[textrender] label %d: %u glyphs atlas=0x%08X %dx%d local[%.0f..%.0f,%.0f..%.0f] uv[%.2f..%.2f] -> %s\n",
+                                        ti, vc/4, g_lastTexBase, atlas->w, atlas->h, lmnx,lmxx,lmny,lmxy, minu, maxu, fp); } }
                     }
                 }
             }
