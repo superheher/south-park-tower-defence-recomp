@@ -3829,3 +3829,22 @@ renderer.vtable[15]) + the TEXTURE binding (the inlined-D3D SetTexture, cont.24 
 fetch the real VB + texture. Then the advance-gate (A↔B) for the interactive menu state. **NEXT:** trace the
 renderer's vtable[15] (offset 60) — find the SetStreamSource(VB)+DrawPrimitive it should emit, and reconstruct it
 (bind slot-0 = the filled VB 0xA022FFF0 for the executed UI draws). Entry: sub_821F8E60 + renderer vtable[15].
+
+## cont.48 (2026-06-06, /loop "render the real menu" — deep render build, paced) — mapped the texture side: LOADED textures populate, GENERATED textures (font atlas / EDRAM) never do at attract
+
+Deep-build RE. Found cont.23 already renders the UI vertex GEOMETRY (count-correlation), so the keystone blocker
+is the TEXTURE side. Checked whether the text draws' FONT ATLAS is available (REX_LOADERPROBE [ldframe], 10 samples
+over the full attract run): **0xA5004800 (font atlas) = 0 and 0xB0000000 (EDRAM) = 0 the ENTIRE run** — never
+populated. Contrast cont.44: the LOADED gameplay textures (explosions/FX/UI, from files) DO populate the GPU window
+over time. ⇒ **the deep render build's texture side SPLITS:** (a) LOADED textures (file → decode → GPU) populate +
+are decodable (cont.44) — the tractable half; (b) GENERATED textures — the font atlas (TTF rasterization of the
+.ttf) and the EDRAM render-to-texture backgrounds — NEVER run (the raster/RT generation is stubbed/gated) — so
+TEXT and the EDRAM backdrop are blocked at the GENERATION step, on top of the per-draw binding + advance-gate.
+
+**⇒ deep-build map (4 blockers, all multi-week):** (1) per-draw VERTEX binding — mostly solved (count-correlation);
+(2) per-draw TEXTURE binding for LOADED textures (inlined-D3D SetTexture stubbed, cont.24) — TRACTABLE next; (3)
+GENERATED textures (font atlas TTF raster + EDRAM RT) — don't run; (4) advance-gate (A↔B) — the on-screen menu
+state (attract draws are off-screen placeholders). A visible REAL menu needs ≥ (2)+(4) (and text needs (3)). NEXT:
+push the tractable half — the per-draw TEXTURE binding for the loaded textures (find the title's SetTexture: hook
+CreateTexture sub_821BE840 → record texObj→GPU-base, then find who reads the texObj to bind it / writes the draw's
+texture fetch const). That's the path to texturing the title's real draws with the available loaded textures.
