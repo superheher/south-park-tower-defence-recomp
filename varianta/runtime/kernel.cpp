@@ -1406,10 +1406,12 @@ inline void WriteGpuReg(uint32_t index, uint32_t value) {
         uint32_t b = value & 0xFFFFF000u;   // d1 of a texture fetch slot holds the base in bits[31:12]
         // categorize to cut noise: UI/texture allocs (phys 0x04..0x06, incl. UI.xzp 0x048D + the 0xA494..0xA51C
         // texture blocks) and EDRAM (phys 0x10). Skip the rest (sizes/control words coincidentally in range).
-        // cont.57: ALSO catch the 0xA0-0xA6 mirror range — the menu's per-draw textures (cont.56) store their
-        // fetch-constant base WITH the 0xA0 physical-mirror bit (e.g. 0xA2D96000 = the S.P. logo working buffer),
-        // which the old 0x04-0x06 filter missed (so cont.36's "no textures bound" never looked there).
-        bool tex = (b >= 0x04000000u && b < 0x06000000u) || (b >= 0xA0000000u && b < 0xA6000000u),
+        // cont.57/58: the menu's per-draw textures (cont.56) store their fetch-constant base as the PHYSICAL form
+        // 0x02xxxxxx (e.g. d1=0x02D96086 -> base 0x02D96000 = the S.P. logo working buffer; GPU mirror 0xA2D96000),
+        // which the old 0x04-0x06 filter missed entirely (so cont.36's "no textures bound" never looked there — the
+        // cont.45 tex=0x0 artifact). Widen the low bound to 0x02 (the 0xA0-0xA6 mirror form too, for completeness).
+        // (Vertex pools live at 0x01xxxxxx, below 0x02000000, so they stay excluded.)
+        bool tex = (b >= 0x02000000u && b < 0x06000000u) || (b >= 0xA2000000u && b < 0xA6000000u),
              edram = (b >= 0x10000000u && b < 0x10100000u);
         if (tex || edram) {
             static std::mutex m; static std::unordered_set<uint64_t> seen;

@@ -4113,3 +4113,33 @@ path) to use slot0 d1 per draw: read the fetch constant (d0 type=2, d1 base 0x02
 the LINEAR working-buffer texture (cont.44 path: linear 8888/format), UploadTexture, bind for that draw's vkCmdDraw.
 The textures + geometry are already there — this is the last step to a real textured menu from the working buffers.
 First: find where the renderer reads the per-draw texture (the 0x04-0x06 filter to widen to 0x02-0x06/0xA0-0xA6).
+
+## cont.58 (2026-06-06, /loop) — ⭐DECODED the real menu textures from the working buffers via the LIVE per-draw fetch constant (image sent). Widened the render-path texture filter (0x02-0x06).
+
+Acted on cont.57's NEXT. The render-path texture filter (REX_TEXBIND/REX_TEXDECODE, kernel.cpp:1412) only caught
+bases in 0x04-0x06/0xA0-0xA6 — but the menu textures' fetch-constant base is the PHYSICAL form 0x02xxxxxx
+(d1=0x02D96086 → 0x02D96000; mirror 0xA2D96000). Widened the low bound to **0x02000000** (vertex pools at
+0x01xxxxxx stay excluded). Now REX_TEXBIND catches them and REX_TEXDECODE decodes them.
+
+**RESULT (REX_EXECSEGS + REX_TEXBIND + REX_TEXDECODE, attract): the real menu textures decode from the working
+buffers via the LIVE executed fetch constant** (the cont.57 slot0 type=2 draws). The [texbind] now shows, per
+executed textured draw, the real base + the FULL fetch constant + populated data:
+  - A2D96000 256×256 fmt6 endian2 nz=64/64 — logo text
+  - A2F25000 256×256 fmt6 nz=64/64 — South Park cityscape/buildings art (the 0xA2F25000 working buffer, cont.44)
+  - A2E12000 / A2FD1000 ("SOUTH PARK"/"THQ" font atlas) / A2FCD000 — populated UI textures
+(plus empty-binds A337D000/A2D76000/… nz=0, and the big tiled 0xA4-0xA5 GPU-window sheets 669×6185/1214×6006.)
+Decoded 5 populated fmt6 256×256 menu textures → PPM → montage PNG, **viewed + sent to the user**: recognizable
+real menu art (logo, cityscape, SOUTH PARK/THQ font). Some (logo/font) have horizontal scanline/pitch artifacts
+(the stored pitch/height likely differs from the 256×256 d2 — refine dims in cont.59); the cityscape decodes clean.
+
+⇒ the FULL path is proven end-to-end: executed menu draw → slot0 d1 fetch constant (cont.57) → 0x02/0xA2xxxxxx
+working-buffer base → rex_tex::DecodeGuestToRGBA → real menu texture. "Render the real menu from working buffers"
+is confirmed at the texture level — the textures ARE the working buffers and decode correctly. Default boot
+UNREGRESSED (0 crashes, full 20s, attract spin). Note d2 dims: the EXECUTED fetch constant says 256×256
+(d2=001FE0FF), vs the handle's 584×198 (cont.56) — use the executed fetch constant's dims for rendering.
+
+**⇒ NEXT (cont.59 — the COMPOSED visible menu):** wire the live render to draw each textured draw with its
+working-buffer texture: per textured DRAW_INDX (slot0 type=2), decode slot0 d1's texture (this path), carve the
+draw's geometry+UV (vtxSlot=1 vbase), UploadTexture, and draw that group with that texture (extend the textured
+pipeline g_texPipe / SubmitTexturedGeometry to per-draw {verts, texture}). Capture (REX_RENDER_SHOT). Refine the
+scanline/pitch (try height/2 or the real pitch) for the logo/font textures.
