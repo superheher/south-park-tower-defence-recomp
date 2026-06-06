@@ -423,6 +423,13 @@ PPC_FUNC(__imp__NtFreeVirtualMemory)
 PPC_FUNC(__imp__KeGetCurrentProcessType)
 {
     KTRACE("KeGetCurrentProcessType -> 1\n");
+    // cont.34 (REX_SPINTRACE): KeGetCurrentProcessType is called 100k+ times when the title stalls (a hot wait
+    // loop polls it). ctx.lr = the guest caller's return address; sampling it every 20000 calls reveals the
+    // DOMINANT caller in the late (post-Level-1) phase => the spin-loop location. Gated; default boot no-op.
+    static const bool spintrace = getenv("REX_SPINTRACE") != nullptr;
+    if (spintrace) { static std::atomic<uint64_t> n{0}; uint64_t c = n.fetch_add(1);
+        if ((c % 20000) == 0) fprintf(stderr, "[spintrace] KeGetCurrentProcessType call #%llu from lr=0x%08X\n",
+                                      (unsigned long long)c, (uint32_t)ctx.lr); }
     ctx.r3.u64 = 1;
 }
 

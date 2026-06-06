@@ -3381,3 +3381,33 @@ the Level-1 intro honor it?), (b) the uncreated gameplay subsystem, or (c) a ren
 run to sample the main-thread state distinguishes them. If it's the deep build (likely), consolidate and hand off
 for a focused renderer/transition session. Session deliverables stand: cont.30 (advance default-on) + cont.31
 (loads Level 1). Gated diag REX_GATEDIAG retained for cont.34.
+
+## cont.34 (2026-06-06, /loop autonomous) — the post-Level-1 stall is the GPU/render-COMPLETION wait (A↔B), not a CPU gate ⇒ the loader-path tractable wins are EXHAUSTED; /loop PAUSED at the Level-1 milestone
+
+Located the actual post-Level-1 stall (the KeGetCurrentProcessType spin = 100k+ calls) with a new gated diag
+REX_SPINTRACE (sample the guest caller LR; default boot no-op). Commit cont.34.
+
+**MEASURED: the spin caller is in the GPU/render sync range.** Dominant lr=0x821C6F78 (inside sub_821C6F50) +
+lr=0x821BFF64 + lr=0x821C0864 — all 0x821Bxxxx-0x821Cxxxx render code, called PER FRAME. sub_821C6F50 is a GPU op
+(touches reg 0xC0003C00). So after loading Level 1 the title is in its **per-frame render loop waiting for GPU
+completion**, exactly the cont.21 A↔B coupling / cont.22 fence-wait. The existing fence-forwards (sub_821C6E58,
+sub_821C5DF0) advanced earlier waits but do NOT cover this post-Level-1 render-sync; and cont.32 already showed
+REX_EXECSEGS at the L1 state renders only the FRONTEND program (the Level-1 render program isn't built — the
+title won't build it until the GPU completes, which needs the renderer ⇒ the circular A↔B).
+
+**⇒ ROBUST CONCLUSION: the post-Level-1 wall is the deep renderer/GPU-completion build, NOT a tractable CPU gate.**
+This is QUALITATIVELY different from the cont.30/31 wins, which were CPU-side sentinel/null bugs in the LOADER
+path (guardable). The loader path has now been taken to its end — the title LOADS Level 1 (cont.31) — and the
+remaining wall is the RENDER path (GPU completion / the A↔B coupling), which is the genuine deep multi-session
+renderer build (cont.21 PILLAR B / GPU-RESOURCE-BUILD-PLAN), poor /loop fit (established cont.22/24/25 and now
+reconfirmed from the gameplay side). The cont.33 null gameplay subsystem is downstream of this — it isn't created
+because the title is blocked on the GPU sync first.
+
+**⇒ /loop PAUSED at the Level-1 milestone (honest, rigorous — not the premature-pessimism of cont.24/25; this
+time the loader path is genuinely exhausted and the wall is measured to be the render-completion coupling).**
+Session wins (all committed, branch experimental/hle-graphics-spike, NOT pushed): cont.30 (4870841) advance
+default-on, 65→96, crash removed, transitions enable; cont.31 (b15d218) loads Level 1 "Stan's House", 162 assets;
+cont.32 (bf59a2f) renderer wall independent; cont.33 (f053fe0) post-L1 gate = null gameplay subsystem; cont.34
+(this) the stall = GPU/render-completion A↔B. **TO RESUME: the deep renderer/GPU-completion build is a focused
+session (the user has chosen this before) — execute device+13568 Level-1 render segments → real fence completion →
+break the A↔B; or re-issue /loop to have me keep probing. Diags REX_GATEDIAG/REX_SPINTRACE retained.**
