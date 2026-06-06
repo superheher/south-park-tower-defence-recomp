@@ -1406,7 +1406,11 @@ inline void WriteGpuReg(uint32_t index, uint32_t value) {
         uint32_t b = value & 0xFFFFF000u;   // d1 of a texture fetch slot holds the base in bits[31:12]
         // categorize to cut noise: UI/texture allocs (phys 0x04..0x06, incl. UI.xzp 0x048D + the 0xA494..0xA51C
         // texture blocks) and EDRAM (phys 0x10). Skip the rest (sizes/control words coincidentally in range).
-        bool tex = (b >= 0x04000000u && b < 0x06000000u), edram = (b >= 0x10000000u && b < 0x10100000u);
+        // cont.57: ALSO catch the 0xA0-0xA6 mirror range — the menu's per-draw textures (cont.56) store their
+        // fetch-constant base WITH the 0xA0 physical-mirror bit (e.g. 0xA2D96000 = the S.P. logo working buffer),
+        // which the old 0x04-0x06 filter missed (so cont.36's "no textures bound" never looked there).
+        bool tex = (b >= 0x04000000u && b < 0x06000000u) || (b >= 0xA0000000u && b < 0xA6000000u),
+             edram = (b >= 0x10000000u && b < 0x10100000u);
         if (tex || edram) {
             static std::mutex m; static std::unordered_set<uint64_t> seen;
             std::lock_guard<std::mutex> lk(m);
@@ -1569,8 +1573,8 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                 for (int s=0;s<48;s++){ uint32_t f0=GLD32(0x7FC80000u+(0x4800u+s*2)*4u);
                     if((f0&3)==3){ uint32_t f1=GLD32(0x7FC80000u+(0x4800u+s*2+1)*4u);
                         vslot=s; vbase=0xA0000000u|((f0&0xFFFFFFFCu)&0x1FFFFFFFu); vwords=(f1>>2)&0xFFFFFFu; break; } }
-                fprintf(stderr, "[esdraw] #%d op=0x%X numI=%u prim=%u | slot0 fc=%08X type=%u | vtxSlot=%d base=0x%X words=%u\n",
-                        k, op, numInd, prim, fc0, fc0&3, vslot, vbase, vwords);
+                fprintf(stderr, "[esdraw] #%d op=0x%X numI=%u prim=%u | slot0 d0=%08X type=%u texD1=%08X(base=0x%08X) | vtxSlot=%d vbase=0x%X words=%u\n",
+                        k, op, numInd, prim, fc0, fc0&3, d1, 0xA0000000u|(d1&0xFFFFF000u&0x1FFFFFFFu), vslot, vbase, vwords);
                 // For the op-0x22 sprite/text draws: src_select (init[7:6]: 0=DMA/indexed, 2=auto-index),
                 // index fmt (init[11]: 0=u16,1=u32), index buffer (data[2]=base, data[3]=size). If indexed,
                 // read the first indices + the slot-1 verts they point at — tells us how to carve these draws

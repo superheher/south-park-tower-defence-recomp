@@ -4082,3 +4082,34 @@ ExecutePM4 DRAW_INDX dequeue + inject it (WriteGpuReg the texture fetch slot) be
 cont.23 count-correlation (SetTexture order == executed-draw order). If the orders align, the menu draws bind their
 real working-buffer textures → first textured menu. Risk: SetTexture/draw correlation (stage-clears, redundant sets,
 per-frame boundaries) — verify the counts align first.
+
+## cont.57 (2026-06-06, /loop) — ⭐⭐MAJOR REFRAMING: the per-draw textures ARE BOUND in the executed draws (cont.45's "tex=0x0" was a FILTER ARTIFACT). The gap is the RENDERER decoding+displaying them, not the binding.
+
+Was about to build the queue-inject "workaround" (cont.56 NEXT). First widened REX_TEXBIND (it only flagged bases in
+0x04-0x06/EDRAM; the menu textures are elsewhere) and added the slot0 texture-base (d1) to the [esdraw] diag. The
+result OVERTURNS the 30-continuation "per-draw textures not bound / SetTexture stubbed (cont.23-24-45 dead-end)"
+premise:
+
+**The executed menu draws ARE bound to the real working-buffer textures.** [esdraw] at attract (REX_EXECSEGS):
+  - #1 op=0x22 prim=4 slot0 d0=05004802 **type=2 texD1=02D96086 → base 0xA2D96000** (South Park logo) | vtx slot1
+  - #2 op=0x22 prim=13 slot0 d0=02000002 **type=2 texD1=0337D002 → base 0xA337D000** (UI 256²) | vtx slot1
+  - across the frame: 0xA2D96000 (logo, 11 draws) + 0xA337D000 (UI, 6 draws), both type=2, real working-buffer bases.
+
+So slot0 of the executed draws holds a REAL Xenos texture fetch constant (type=2) whose **d1 base = the cont.56
+working buffer** (0xA2D96000 logo / 0xA337D000 UI). **cont.45's "sprite/text tex=0x0" was a measurement artifact:**
+the base is stored in the PHYSICAL form 0x02xxxxxx (d1=0x02D96086; mirror 0xA2D96000), which sat BELOW the 0x04-0x06
+filter that REX_TEXBIND/REX_SCENE used — so every "no textures bound" measurement (cont.36/45) silently excluded the
+actual bases. Also: the SetTexture stream count (48, capped) == the executed-draw count (48, capped); the textures
+correlate to the draws inherently (they're IN the draws' fetch constants).
+
+⇒ **the per-draw texture binding WORKS end to end** (title sets it → it's in variant A's executed buffer → slot0 d1
+= the working-buffer texture). The remaining gap is purely **variant A's RENDERER**: it must, per textured draw, read
+slot0 d1, decode the 0xA2xxxxxx LINEAR working-buffer texture (cont.44 decodes these), and bind+sample it in Vulkan.
+cont.45's renderer reported tex=0x0 because of the same 0x04-0x06 filter. Default boot UNREGRESSED (0 crashes, 22s).
+Changes: widened REX_TEXBIND filter; [esdraw] now prints slot0 d1 (texture base).
+
+**⇒ NEXT (cont.58 — the VISIBLE MENU):** fix variant A's renderer (vulkan_render.cpp REX_RENDER/REX_EXECSEGS draw
+path) to use slot0 d1 per draw: read the fetch constant (d0 type=2, d1 base 0x02/0xA2xxxxxx, d2 dims, format), decode
+the LINEAR working-buffer texture (cont.44 path: linear 8888/format), UploadTexture, bind for that draw's vkCmdDraw.
+The textures + geometry are already there — this is the last step to a real textured menu from the working buffers.
+First: find where the renderer reads the per-draw texture (the 0x04-0x06 filter to widen to 0x02-0x06/0xA0-0xA6).
