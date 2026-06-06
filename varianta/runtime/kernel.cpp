@@ -4056,7 +4056,18 @@ PPC_FUNC(__imp__XamUserReadProfileSettings)
     uint32_t bufSizePtr = ctx.r9.u32, bufPtr = ctx.r10.u32, overlapped = ctx.r11.u32;
     if (!bufPtr) {                                  // size query → need the 8-byte header
         if (bufSizePtr) PPC_STORE_U32(bufSizePtr, 8);
-        ctx.r3.u64 = overlapped ? 0u : 0x8007007Au; // ERROR_INSUFFICIENT_BUFFER (sync)
+        // The gameplay-subsystem init (sub_824C9500 -> sub_824C70A0 -> ... stores 0x827FD56C, the
+        // cont.33/53 post-L1 gate) checks this call's IMMEDIATE return `== 122` (raw Win32
+        // ERROR_INSUFFICIENT_BUFFER) even though it passes an overlapped ptr. Real XAM returns 122 for a
+        // size query; the default override returned 0 (overlapped) / 0x8007007A (sync) -> != 122 ->
+        // E_FAIL -> subsystem never created. Returning 122 CREATES the subsystem (verified: 0x827FD56C =
+        // 0x610e730). BUT that makes the subsystem's worker thread (tid10, start 0x824C6ED0) block on the
+        // still-stubbed NtCreateTimer/NtSetTimerEx, stalling default boot at frontend-init BEFORE the
+        // attract loop (the E_FAIL was previously handled gracefully -> attract reached). So gate it
+        // behind REX_SUBSYS to keep default boot unregressed. cont.54: implement the subsystem worker's
+        // timer deps, then make this default-on. (prod-oracle, cont.53.)
+        static const bool subsysFix = getenv("REX_SUBSYS") != nullptr;
+        ctx.r3.u64 = subsysFix ? 0x7Au : (overlapped ? 0u : 0x8007007Au);
         return;
     }
     PPC_STORE_U32(bufPtr + 0x00, 0);                // setting_count = 0 (none saved)

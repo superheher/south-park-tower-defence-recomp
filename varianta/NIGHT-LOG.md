@@ -3956,3 +3956,44 @@ on a call-chain → which fns are reached), `vawatch.gdb`/`vatest.gdb` (variant 
 variant A (longer timeout; the subsys write is at frontend init, later than the handler write) to see what value it
 writes and why null (allocation-fail? another import stub? a branch). That gate (not the handler) is what cont.33
 flagged as blocking post-L1 — and after it, the cont.34 GPU-completion spin is the renderer wall proper.
+
+## cont.53 (2026-06-06, /loop) — ⭐SUBSYSTEM gate 0x827FD56C ROOT-CAUSED + FIXED (XamUserReadProfileSettings returns the wrong error code); ⚠creating it exposes the timer-stub → GATED behind REX_SUBSYS
+
+Applied the prod-oracle to the subsystem gate. Traced it with gdb breakpoints + ctx-field reads (variant A has DWARF).
+
+**The factory sub_8248F4C8 (called once, r7=0x827FD56C out-slot) does 4 gated steps; only the INIT fails:**
+sub_82497720→0 ok; sub_824898C0 (OBJECT-CREATE)→0x610e730 ok; sub_8244E5C0→0xcafe0001 ok; **sub_82493F98 (INIT)
+→ E_FAIL (0x80004005)** → object torn down → stores 0 → null subsystem. So the object IS created; only its init fails.
+
+**Drilled the init 6 levels** (sub_82493F98→sub_82493EB0→sub_824C74F0→sub_824C7450→sub_824C70A0→**sub_824C9500**).
+sub_824C70A0 is a singleton component-init (alloc 1200B ok, singleton 0x82819D90 was 0 = first init ok); its 4-entry
+registration loop calls sub_824C9500 which returns E_FAIL on entry 0. Inside sub_824C9500: it calls
+**XamUserReadProfileSettings** and checks the IMMEDIATE return **`== 122`** (raw Win32 ERROR_INSUFFICIENT_BUFFER);
+`!=122` → `ori r22,16389` = 0x80004005 E_FAIL.
+
+**ROOT CAUSE:** the existing kernel.cpp override returned `overlapped ? 0 : 0x8007007A` for a size query. At this
+call (traced): bufPtr=0 (size query), **overlapped=0x82610000 (non-zero)** → returned **0** → `!=122` → E_FAIL →
+the gameplay subsystem (0x827FD56C) was NEVER created (exactly the cont.33 "post-L1 NULL subsystem" gate). Real XAM
+returns 122 (raw ERROR_INSUFFICIENT_BUFFER, NOT the HRESULT 0x8007007A) for a size query.
+
+**FIX (kernel.cpp:4057) + ✅VERIFIED:** return 122 (0x7A) for the size query → sub_82493F98 INIT now returns 0 →
+**0x827FD56C = 0x610e730 (NON-NULL, subsystem created)**. (gdb-confirmed end-to-end via the factory trace.)
+
+**⚠ BUT this REGRESSES default boot, so it's GATED behind REX_SUBSYS.** Creating the subsystem makes it spawn its
+worker thread (tid10, start 0x824C6ED0) which then blocks on the still-stubbed NtCreateTimer/NtSetTimerEx →
+default boot stalls at frontend-init (654 lines) BEFORE the attract loop. KEY insight: the E_FAIL was previously
+handled GRACEFULLY (the title reached the attract spin WITHOUT the subsystem) ⇒ **the subsystem is a GAMEPLAY
+subsystem (post-L1), NOT on the menu/attract path.** So the fix advances gameplay, not the menu. Gated:
+`static bool subsysFix = getenv("REX_SUBSYS"); r3 = subsysFix ? 0x7A : (overlapped?0:0x8007007A);`. ✅ default boot
+UNREGRESSED (no flag: 400k lines, attract spin, 0 crashes, full 30s); REX_SUBSYS=1: subsystem created, 0 crashes.
+
+Tools: varianta/tools/{subsys.gdb (factory 4-step trace), subsys2.gdb (sub_824C70A0 branch trace), profread.gdb
+(XamUserReadProfileSettings args/return)}.
+
+**⇒ NEXT (cont.54):** the subsystem worker (tid10, start 0x824C6ED0) blocks on NtCreateTimer/NtSetTimerEx — implement
+a real timer primitive (host timer thread signaling the guest event) so the worker runs, then make REX_SUBSYS
+default-on. THEN reassess whether the created subsystem changes anything on the MENU path (likely not — it's
+gameplay; the menu/attract is reached without it). ⚠ STRATEGY NOTE: cont.52 (menu handler) + cont.53 (subsystem)
+both cracked real gates via the oracle, but NEITHER is the menu RENDER blocker — the menu/attract is reached, and the
+wall is still cont.34's GPU-completion spin (the renderer proper). To actually SEE the menu, the renderer
+(GPU-completion / per-draw bind, cont.34/23-24) remains the work; the gate-cracks are gameplay-path progress.
