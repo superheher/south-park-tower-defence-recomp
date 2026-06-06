@@ -2650,6 +2650,17 @@ PPC_FUNC(sub_8242BF10)
     static const bool s_drawcap = getenv("REX_DRAWCAP") != nullptr;
     if (s_drawcap) {
         uint32_t d = ctx.r3.u32, s = ctx.r4.u32, sz = ctx.r5.u32, lr = (uint32_t)ctx.lr;
+        // cont.69: log fills whose last-bound texture is a MENU texture (0xAC-0xB0 portraits/panels) regardless of the
+        // VB-range/stride filter below — they bind LATE (level-select) and the main 600-cap is intro-exhausted, so
+        // this finds HOW the portraits are drawn (lr + dest + size) to place them.
+        if (g_lastTexBase >= 0xAC000000u && g_lastTexBase < 0xB1000000u && sz >= 8 && sz < 0x20000) {
+            static std::atomic<int> mn{0}; int mi = mn.fetch_add(1);
+            if (mi < 80) {
+                auto rf = [&](uint32_t o){ float f; uint32_t w = GLD32(s + o); memcpy(&f, &w, 4); return f; };
+                fprintf(stderr, "[menudraw] #%d lr=0x%08X tex=0x%08X dest=0x%08X sz=%u v0=(%.1f,%.1f,%.1f,%.1f)\n",
+                        mi, lr, g_lastTexBase, d, sz, rf(0), rf(4), rf(8), rf(12));
+            }
+        }
         if (d >= 0xA01F0000u && d < 0xA0300000u && sz >= 16 && sz < 0x20000 && (sz % 16) == 0) {
             uint32_t vc = sz / 16;
             auto rdf = [&](uint32_t off){ float f; uint32_t w = GLD32(s + off); memcpy(&f, &w, 4); return f; };

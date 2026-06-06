@@ -4451,3 +4451,23 @@ ComposeRealFrame filter, so they're decoded but not yet placed.
 **⇒ NEXT (cont.69):** widen ComposeRealFrame/AccumulateFrame to the 0xAC–0xB0 menu textures + capture their sprite
 draw rects (the portraits/panels' positions) → compose the real menu/level-select screen (character portraits at
 their real positions). New: `REX_TEXDUMP`, `[texdump]`.
+
+## cont.69 (2026-06-07, /loop "go deep renderer job", autonomous — user asleep) — widening the composite to 0xAC–0xB0 WON'T compose the menu: its content goes through the TEXT renderer (transform-walled) + non-sprite paths. Points to the EXECSEGS-transform text render.
+
+cont.68 decoded the menu assets (portraits, text); cont.69 checked HOW to place them. New `REX_DRAWCAP` `[menudraw]`
+log (fills whose last-bound texture is 0xAC–0xB0, independent of the VB-range/cap). With REX_SKIPINTRO:
+- The menu TEXT atlases (e.g. ACE54000) are drawn by the **TEXT renderer** (lr=0x821F90B0, sub_821F8E60) in LOCAL
+  space (v0=(0.5,21.5,…)) — the transform-walled path (cont.23/34), NOT the screen-space sprite renderer.
+- The CHARACTER PORTRAITS (ADB63000 etc.) do NOT appear in any sub_8242BF10 fill — bound (cont.68 SetTexture) but
+  their draw frames are transient/missed (REX_SKIPINTRO drives toward Level 1, past the level-select).
+- The other `[menudraw]` hits are descriptor/data copies (dest 0x00/0x06/0x700F, not geometry).
+⇒ widening cont.65's 0xA2 ComposeRealFrame filter to 0xAC–0xB0 would NOT place the menu — its content is
+text-renderer + non-capturable, not simple sprites. The real menu composition is gated on the TEXT-renderer transform
+(cont.23 EXECSEGS pairing) — the same cont.34 A↔B path — not on the sprite filter.
+
+**Default boot UNREGRESSED** (gated REX_DRAWCAP `[menudraw]`; 175k lines, 0 real crashes).
+
+**⇒ NEXT (cont.70):** RENDER the menu TEXT via the cont.23 EXECSEGS-transform path — pair the text fill's glyph verts
+(pos.local + uv; capture the UVs) with the exec-time reg-0x4000 transform AND the decoded font atlas (cont.68) →
+textured readable glyphs at their placement (headless PPM, reusing cont.23's REX_UITEXT). cont.23's transform pairing
+already works (it placed a label, just off-screen); the on-screen labels would show readable menu text. New: `[menudraw]`.
