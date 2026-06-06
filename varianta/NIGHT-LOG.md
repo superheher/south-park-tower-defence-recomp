@@ -3805,3 +3805,27 @@ build (reconstruct the stubbed SetTexture/SetStreamSource per-draw bindings, con
 session). Offered the user the choice: (a) start the deep render build for the real layout, (b) accept the mock-up,
 (c) redirect. NEXT (absent redirect): begin the deep render build's first piece (reconstruct one per-draw binding)
 as the path to the faithful menu, or the advance-gate.
+
+## cont.47 (2026-06-06, /loop "render the real menu") — USER CHOSE THE DEEP RENDER BUILD (AskUserQuestion); started it: traced the per-draw binding keystone (sub_821F8E60 text renderer → vtable[15])
+
+After delivering the achievable (decoder + real textures + menu mock-up, cont.44-46) and establishing the faithful
+menu is doubly-blocked, I asked the user (AskUserQuestion) how to proceed. **They chose "Глубокий render-билд"
+(the deep render build)** — explicit authorization for the multi-week effort toward the title's real interactive
+menu. Pacing it across iterations.
+
+**First step — picked up cont.23's left-off point (the stubbed per-draw bind+draw).** REX_UITRACE: the text
+renderer sub_821F8E60 Locks/fills a dynamic VB (obj 0x000E36A0, vtable 0x820E0B10 → 0xA022FFF0) via vtable[30]
+(sub_822052B0) and "Unlock/submits" via **vtable[31] = sub_822052F8** — which cont.24 found is TRIVIAL (device
+bookkeeping, not a draw). So the bind+draw is NOT in the Unlock. Read sub_821F8E60 (ppc_recomp.21:22604+) AFTER
+the Unlock: it checks the VB ptr (r30, the fill result) then calls the RENDERER object's **vtable[15]**
+(`*(*(r31)+60)`, args r3=r31, r4=0) and returns — the filled VB (r30) is NOT explicitly SetStreamSource'd/drawn in
+this function. ⇒ **the actual bind+draw is the renderer's vtable[15] (offset 60)** — the next link to trace. So
+the chain is: sub_821F8E60 (fill VB) → renderer.vtable[15](this,0) → (the real SetStreamSource + DrawPrimitive,
+which is where the binding is stubbed/lost).
+
+**⇒ DEEP-BUILD plan (authorized), keystone = the per-draw binding:** the decoder + texture-decode are DONE
+(cont.36/44); the keystone is reconstructing the stubbed per-draw VERTEX binding (this chain: sub_821F8E60 →
+renderer.vtable[15]) + the TEXTURE binding (the inlined-D3D SetTexture, cont.24 dead-end) so the executed draws
+fetch the real VB + texture. Then the advance-gate (A↔B) for the interactive menu state. **NEXT:** trace the
+renderer's vtable[15] (offset 60) — find the SetStreamSource(VB)+DrawPrimitive it should emit, and reconstruct it
+(bind slot-0 = the filled VB 0xA022FFF0 for the executed UI draws). Entry: sub_821F8E60 + renderer vtable[15].
