@@ -3509,3 +3509,37 @@ disk data is **LINEAR**, so the title TILES at GPU-upload time (the missing step
 the tiler's hardware-confirmation gap — that still needs live tiled guest data (A↔B). The same DDS/8888 format is
 what the title uploads, so the decoder + this container parse are the building blocks for BOTH the disk-resource
 render and the live path. Artifacts: /tmp/HudImages.dec (decompressed), /tmp/hud_256.dds.
+
+## cont.37 (2026-06-06, /loop "go deep renderer job" — user: "continue, but first SHOW the render of real HUD textures") — the decoder goes LIVE: the title's REAL HUD textures rendered on the Vulkan swapchain
+
+User asked to SEE real HUD textures rendered before continuing. Wired the cont.36 decoder into the render path and
+rendered the title's own texture data — the first on-screen render of the **title's REAL textures** (vs cont.24's
+external LevelSelectBG.png stand-in). Commit + image sent. Default boot UNREGRESSED (96 assets, exit137, 0 crash,
+clamp 4×; all new code gated behind REX_HUDSHEET/REX_RENDER).
+
+**WHAT (REX_HUDSHEET, vulkan_render.cpp):** the disk-resource render of the title's HUD textures, end-to-end:
+- `InflateAll` (zlib streaming) inflates `Textures/HudImages.bin` (13.8 MB -> 80.4 MB) in-process.
+- walk the DDS entries -> decode each via the cont.36 `rex_tex::DecodeBytesToRGBA` (8888 linear) -> composite the
+  first 48 into a **1280x720 contact sheet** (8x6 grid, aspect-fit, alpha-composited over a subtle checker so the
+  HUD art's transparency shows) -> `rex_render::UploadTexture` -> drawn as a full-screen quad through the existing
+  textured pipeline (cont.23 `g_texPipe` + SPTextured FS). `rex_texture.h` now included in the renderer TU too;
+  CMake links `ZLIB::ZLIB`.
+- Wiring: reuses the REX_TEXTEST upload+draw branch (now `g_textest || g_hudsheet`), full-screen quad for hudsheet,
+  menu validation rects skipped for a clean shot. CreateTexturedPipeline also fires for g_hudsheet.
+
+**RESULT** (`DISPLAY=:0 REX_RENDER=1 REX_MENUTEST=1 REX_HUDSHEET=<HudImages.bin> REX_RENDER_SHOT=30` + run-base,
+`timeout -s KILL -k 5 35`, AMD RADV POLARIS11): `[hudsheet] 13784311 -> 80458708`, `decoded + composited 48 HUD
+textures (scanned 52 DDS) into a 1280x720 sheet`, `texture 1280x720 uploaded`. `/tmp/varianta_menu.ppm` ->
+`/tmp/hudsheet_render.png` = **48 recognizable South Park HUD textures** (character portraits Cartman/Stan/Kyle/
+Kenny, arrows, shields, medals, the sun icon, gems, the "RB" button prompt, health bars, coins) rendered cleanly,
+**0 Vulkan errors**, image sent to the user. => the cont.36 decoder is LIVE in the render path on the title's real
+texture data; the decode->upload->render pipeline works end-to-end.
+
+**⚠ HONEST scope:** this textures the DISK container (linear A8R8G8B8 DDS, the 8888 path — NOT the tiler, which
+needs live tiled data, cont.36). It's a contact-sheet demo of the title's real textures, NOT the title's live menu
+layout (still A<->B-gated). But it (1) proves the decoder + the upload+render plumbing end-to-end on real game art,
+(2) is reusable for the live path (same UploadTexture/textured pipeline), and (3) gives a real visible result. Run
+hygiene respected: REX_RENDER in the FOREGROUND with `timeout -s KILL -k 5` (never bg+idle — the cont.30 6h-hang
+lesson). New gated flag REX_HUDSHEET. NEXT: (a) map the contact-sheet approach toward the title's actual menu
+composition, or render OTHER containers (Character/Enemy/Particle textures); (b) the live wire-up (decode the
+title's tiled guest textures when a draw binds one); (c) the deep A<->B work.

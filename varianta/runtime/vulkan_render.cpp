@@ -10,7 +10,10 @@
 #include "test_shaders.h"   // GPU-build piece 1: embedded SPIR-V for the test-triangle pipeline
 #include "menu_shaders.h"   // GPU-build piece 3b: float2-position menu-quad pipeline (mvp/color push const)
 #include "menutex_shaders.h" // disk-resource path (cont.23): textured UI pipeline (pos.xy+uv.xy + sampler2D)
+#include "rex_texture.h"    // cont.36: Xenos texture decoder — used to decode the title's real DDS textures
 #include <png.h>            // disk-resource path: decode media/Assets/*.png menu art (libpng simplified API)
+#include <zlib.h>           // cont.37: inflate the title's zlib'd Textures/*.bin DDS containers
+#include <algorithm>        // std::min
 #include <vulkan/vulkan.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
@@ -86,6 +89,9 @@ std::atomic<int>    g_menuGeomVerts{0};              // vertex count currently s
 // Bypasses the stuck loader: loads shaders (media/shaders/*.updb HLSL -> menutex_shaders.h) + textures
 // (media/Assets/*.png) from disk. REX_TEXTEST validates the pipeline with a procedural checkerboard quad.
 const bool g_textest = (getenv("REX_TEXTEST") != nullptr);
+// cont.37: REX_HUDSHEET — decode the title's REAL HUD textures (the zlib'd DDS container) via the cont.36
+// decoder + render them as a contact sheet. The disk-resource render of the title's own texture data.
+const bool g_hudsheet = (getenv("REX_HUDSHEET") != nullptr);
 VkPipelineLayout      g_texLayout    = VK_NULL_HANDLE;
 VkPipeline            g_texPipe      = VK_NULL_HANDLE;
 VkDescriptorSetLayout g_texSetLayout = VK_NULL_HANDLE;
@@ -633,7 +639,7 @@ bool Init() {
     if (!CreateSwapchain()) return false;
     if (g_drawtest) CreateGraphicsPipeline();   // GPU build (piece 1): render pass already made in CreateSwapchain
     if (g_menutest) CreateMenuPipeline();       // GPU build (piece 3b): the menu-quad pipeline
-    if (g_textest || g_menutex) CreateTexturedPipeline();   // disk-resource path: the textured UI pipeline
+    if (g_textest || g_menutex || g_hudsheet) CreateTexturedPipeline();   // disk-resource path: the textured UI pipeline
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -770,6 +776,87 @@ bool LoadBackgroundOnce() {
     return g_bgLoaded;
 }
 
+// cont.37: inflate a whole zlib stream into `out` (streaming — the DDS containers decompress to tens of MB).
+static bool InflateAll(const uint8_t* src, size_t srcLen, std::vector<uint8_t>& out) {
+    z_stream zs{}; if (inflateInit(&zs) != Z_OK) return false;
+    zs.next_in = (Bytef*)src; zs.avail_in = (uInt)srcLen;
+    out.clear(); std::vector<uint8_t> chunk(1u << 20); int ret;
+    do {
+        zs.next_out = chunk.data(); zs.avail_out = (uInt)chunk.size();
+        ret = inflate(&zs, Z_NO_FLUSH);
+        if (ret != Z_OK && ret != Z_STREAM_END) { inflateEnd(&zs); return false; }
+        out.insert(out.end(), chunk.data(), chunk.data() + (chunk.size() - zs.avail_out));
+    } while (ret != Z_STREAM_END);
+    inflateEnd(&zs);
+    return true;
+}
+
+// cont.37 (REX_HUDSHEET): the disk-resource render of the title's REAL HUD textures. Reads the zlib'd
+// Textures/HudImages.bin container, inflates it, walks its DDS entries, decodes each via the cont.36 Xenos
+// decoder (rex_tex), and composites the first N into a contact sheet uploaded as the textured-pipeline image.
+// REX_HUDSHEET=<path> overrides the container; the default is HudImages.bin (cwd = varianta/).
+bool LoadHudSheetOnce() {
+    if (g_texImg) return true;
+    if (!g_texSetLayout) return false;
+    const char* env = getenv("REX_HUDSHEET");
+    const char* path = (env && env[0] && strcmp(env, "1") != 0) ? env
+        : "../private/extracted/media/Assets/Global/Textures/HudImages.bin";
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[hudsheet] open FAILED: %s\n", path); return false; }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> comp(n > 0 ? n : 0);
+    size_t rd = comp.empty() ? 0 : fread(comp.data(), 1, comp.size(), f); fclose(f);
+    std::vector<uint8_t> dec;
+    if (rd < 2 || !InflateAll(comp.data(), comp.size(), dec)) { fprintf(stderr, "[hudsheet] inflate FAILED\n"); return false; }
+    fprintf(stderr, "[hudsheet] %s: %ld compressed -> %zu decompressed\n", path, n, dec.size());
+
+    const uint32_t SW = 1280, SH = 720; const int COLS = 8, ROWS = 6;
+    const int CW = SW / COLS, CH = SH / ROWS;     // 160x120 cells, 48 textures
+    std::vector<uint8_t> sheet((size_t)SW * SH * 4, 0);
+    // subtle grey checker background so transparent (alpha) regions of the HUD art are visible
+    for (uint32_t y = 0; y < SH; y++) for (uint32_t x = 0; x < SW; x++) {
+        uint8_t g = (((x >> 4) ^ (y >> 4)) & 1) ? 54 : 40; uint8_t* p = &sheet[((size_t)y * SW + x) * 4];
+        p[0] = p[1] = p[2] = g; p[3] = 255; }
+
+    size_t pos = 0; int placed = 0, scanned = 0; const int MAXCELLS = COLS * ROWS;
+    while (placed < MAXCELLS && pos + 128 <= dec.size()) {
+        size_t j = SIZE_MAX;
+        for (size_t k = pos; k + 4 <= dec.size(); k++)
+            if (dec[k] == 'D' && dec[k+1] == 'D' && dec[k+2] == 'S' && dec[k+3] == ' ') { j = k; break; }
+        if (j == SIZE_MAX || j + 128 > dec.size()) break;
+        const uint8_t* h = &dec[j];
+        uint32_t H = h[12] | (h[13]<<8) | (h[14]<<16) | (h[15]<<24);
+        uint32_t W = h[16] | (h[17]<<8) | (h[18]<<16) | (h[19]<<24);
+        uint32_t bitcount = h[88] | (h[89]<<8) | (h[90]<<16) | (h[91]<<24);
+        uint32_t fourcc = h[84] | (h[85]<<8) | (h[86]<<16) | (h[87]<<24);
+        pos = j + 4; scanned++;
+        if (W == 0 || H == 0 || W > 2048 || H > 2048 || fourcc != 0 || bitcount != 32) continue;  // 32bpp uncompressed only (this container)
+        if (j + 128 + (size_t)W * H * 4 > dec.size()) break;
+        rex_tex::Desc d{}; d.format = rex_tex::FMT_8_8_8_8; d.width = W; d.height = H; d.tiled = 0; d.endian = rex_tex::END_NONE;
+        std::vector<uint8_t> rgba;
+        if (!rex_tex::DecodeBytesToRGBA(&dec[j + 128], d, rgba)) { continue; }
+        // place into the cell, scaled to fit (nearest), aspect-preserved, alpha-composited over the checker
+        int cx = (placed % COLS) * CW, cy = (placed / COLS) * CH, pad = 6;
+        int aw = CW - 2 * pad, ah = CH - 2 * pad;
+        float s = std::min((float)aw / (float)W, (float)ah / (float)H);
+        int dw = (int)(W * s), dh = (int)(H * s), ox = cx + pad + (aw - dw) / 2, oy = cy + pad + (ah - dh) / 2;
+        for (int yy = 0; yy < dh; yy++) for (int xx = 0; xx < dw; xx++) {
+            int sx = (int)(xx / s), sy = (int)(yy / s); if (sx >= (int)W || sy >= (int)H) continue;
+            const uint8_t* sp = &rgba[((size_t)sy * W + sx) * 4];
+            uint8_t* dp = &sheet[((size_t)(oy + yy) * SW + (ox + xx)) * 4];
+            float a = sp[3] / 255.0f;
+            dp[0] = (uint8_t)(sp[0] * a + dp[0] * (1 - a));
+            dp[1] = (uint8_t)(sp[1] * a + dp[1] * (1 - a));
+            dp[2] = (uint8_t)(sp[2] * a + dp[2] * (1 - a));
+        }
+        placed++;
+        pos = j + 128 + (size_t)W * H * 4;
+    }
+    fprintf(stderr, "[hudsheet] decoded + composited %d HUD textures (scanned %d DDS) into a %ux%u sheet\n", placed, scanned, SW, SH);
+    if (placed == 0) return false;
+    return UploadTexture(sheet.data(), SW, SH);
+}
+
 void PumpEvents() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -816,12 +903,15 @@ bool PresentOnce() {
             if (g_texGeoVBMap) memcpy(g_texGeoVBMap, g_texGeom.data(), g_texGeom.size()*sizeof(float)); }
         // disk-resource path (REX_TEXTEST): one-time texture upload + textured-quad VB, BEFORE the render pass
         // (the upload uses its own command buffer + a blocking wait, which must not be nested in g_cmd's pass).
-        if (g_textest && g_texPipe && !g_texVB) {
+        if ((g_textest || g_hudsheet) && g_texPipe && !g_texVB) {
             const char* texfile = getenv("REX_TEXFILE");   // a real .png to load; else the procedural checker
-            if (texfile ? LoadPNGToTexture(texfile) : CreateTestTexture()) {
-                static const float tq[] = {                          // pos.xy + uv.xy, 2 tris, clip-space quad
-                    0.1f,0.1f, 0.0f,0.0f,  0.9f,0.1f, 1.0f,0.0f,  0.9f,0.9f, 1.0f,1.0f,
-                    0.1f,0.1f, 0.0f,0.0f,  0.9f,0.9f, 1.0f,1.0f,  0.1f,0.9f, 0.0f,1.0f };
+            // cont.37: REX_HUDSHEET decodes the title's real HUD DDS container into a contact sheet; else
+            // REX_TEXFILE=<png> or the procedural checker (REX_TEXTEST).
+            if (g_hudsheet ? LoadHudSheetOnce() : (texfile ? LoadPNGToTexture(texfile) : CreateTestTexture())) {
+                const float fs = g_hudsheet ? 0.98f : 0.9f, lo = g_hudsheet ? -0.98f : 0.1f;
+                const float tq[] = {                                 // pos.xy + uv.xy, 2 tris, clip-space quad
+                    lo,lo, 0.0f,0.0f,  fs,lo, 1.0f,0.0f,  fs,fs, 1.0f,1.0f,
+                    lo,lo, 0.0f,0.0f,  fs,fs, 1.0f,1.0f,  lo,fs, 0.0f,1.0f };
                 VkBufferCreateInfo bvi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                 bvi.size = sizeof(tq); bvi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT; bvi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
                 if (vkCreateBuffer(g_device, &bvi, nullptr, &g_texVB) == VK_SUCCESS) {
@@ -868,15 +958,15 @@ bool PresentOnce() {
                 vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
                 vkCmdDraw(g_cmd, 6, 1, q * 6, 0);
             }
-        } else {                                                 // REX_MENUTEST: hardcoded validation rects
+        } else if (!g_hudsheet) {                                // REX_MENUTEST: hardcoded validation rects
             const float cols[3][4] = {{1.0f,0.2f,0.2f,0.6f},{0.2f,1.0f,0.2f,0.6f},{0.3f,0.4f,1.0f,0.8f}};
             for (int q = 0; q < 3; q++) { memcpy(pc.color, cols[q], 16);
                 vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
                 vkCmdDraw(g_cmd, 6, 1, q * 6, 0); }
         }
-        // disk-resource path (REX_TEXTEST): draw the textured quad — validates the textured pipeline end to end
-        // (pos+uv vertex input + the sampler2D descriptor set + the SPTextured FS = texture(diffuse,uv)*color).
-        if (g_textest && g_texPipe && g_texSet && g_texVB) {
+        // disk-resource path (REX_TEXTEST / cont.37 REX_HUDSHEET): draw the textured quad — validates the
+        // textured pipeline end to end (pos+uv input + sampler2D descriptor + SPTextured FS = tex(diffuse,uv)*color).
+        if ((g_textest || g_hudsheet) && g_texPipe && g_texSet && g_texVB) {
             vkCmdBindPipeline(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_texPipe);
             VkDeviceSize to = 0; vkCmdBindVertexBuffers(g_cmd, 0, 1, &g_texVB, &to);
             vkCmdBindDescriptorSets(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_texLayout, 0, 1, &g_texSet, 0, nullptr);

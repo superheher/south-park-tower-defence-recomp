@@ -36,6 +36,7 @@ find_package(Threads REQUIRED)   # std::thread (ExCreateThread / vblank pump)
 # Minimal from-scratch Vulkan renderer (vulkan_render.cpp): host window + present. Active only at
 # runtime under REX_RENDER=1, but always linked.
 find_package(Vulkan REQUIRED)
+find_package(ZLIB REQUIRED)   # cont.37: inflate the title's zlib'd Textures/*.bin DDS containers
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED sdl2)
 target_include_directories(sp_td_varianta PRIVATE ${SDL2_INCLUDE_DIRS})
@@ -47,4 +48,5 @@ target_link_libraries(sp_td_varianta PRIVATE
     Threads::Threads
     Vulkan::Vulkan
     ${SDL2_LIBRARIES}
-    png)   # disk-resource path (cont.23): decode media/Assets/*.png menu art -> textures
+    png            # disk-resource path (cont.23): decode media/Assets/*.png menu art -> textures
+    ZLIB::ZLIB)    # cont.37: inflate the title's zlib'd DDS containers (HudImages.bin etc.)
