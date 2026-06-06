@@ -879,6 +879,13 @@ std::mutex g_texCreateMtx;
 // bound texture for each menu draw to its decoded GPU data (the per-draw texture-binding ground truth).
 std::unordered_map<uint32_t, uint32_t> g_texObjToBlock;   // texObj -> GPU block addr
 std::mutex g_texObjMtx;
+// cont.63: the EXECUTED draw's fetch constant carries a 256x256 PLACEHOLDER size (cont.59); the title's texture
+// HANDLE (sub_821BEC00, handle+0x1C, cont.56) carries the REAL content dims (measured: SP 584x198, COMEDY CENTRAL
+// 374x446). Map base -> handle (w,h) so REX_TEXDECODE uses the real HEIGHT (the d0 pitch field already fixes the
+// width, cont.62) -> the full splash decodes instead of being cut at row 256.
+struct TexHandleDims { uint16_t w, h; };
+std::unordered_map<uint32_t, TexHandleDims> g_texDimsByBase;
+std::mutex g_texDimsMtx;
 // PVOID MmAllocatePhysicalMemoryEx(flags r3, size r4, protect r5, min r6, max r7, align r8)
 PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
 {
@@ -1440,7 +1447,7 @@ inline void WriteGpuReg(uint32_t index, uint32_t value) {
                     static std::atomic<int> s_n{0};
                     int n = s_n.fetch_add(1);
                     if (n < 16) {
-                        uint32_t outW = w_;
+                        uint32_t outW = w_, outH = h_;
                         rex_tex::Desc d{}; d.guestBase = ga; d.format = fmt; d.width = w_; d.height = h_;
                         d.tiled = tiled; d.endian = endian; d.pitchTexels = 0;
                         // cont.62: the title's boot/menu splash textures (SOUTH PARK DIGITAL STUDIOS, COMEDY CENTRAL,
@@ -1458,15 +1465,31 @@ inline void WriteGpuReg(uint32_t index, uint32_t value) {
                                         ga, w_, h_, d0, pf, truePitch, w_);
                             }
                         }
+                        // cont.63: the executed draw's d2 size is a 256x256 PLACEHOLDER (cont.59); the title's texture
+                        // HANDLE (sub_821BEC00, handle+0x1C, cont.56) carries the REAL content dims (SP 584x198, COMEDY
+                        // CENTRAL 374x446, doublesix 875x314). Use the handle HEIGHT (extends CC past the 256 cut, crops
+                        // SP's padding) and — when the pitch/stride is known (pitch fix applied above) — the handle
+                        // WIDTH (crops the right padding); the d0 pitch field stays the row STRIDE. => tight full splashes.
+                        {
+                            std::lock_guard<std::mutex> lk(g_texDimsMtx);
+                            auto it = g_texDimsByBase.find(ga);
+                            if (it != g_texDimsByBase.end()) {
+                                uint32_t hw = it->second.w, hh = it->second.h;
+                                if (hh >= 1 && hh <= 2048u) { d.height = hh; outH = hh; }
+                                if (d.pitchTexels != 0 && hw >= 16 && hw <= d.pitchTexels) { d.width = hw; outW = hw; }
+                                fprintf(stderr, "[dimfix] %08X: handle %ux%u (d2 %ux%u) -> out %ux%u stride=%u\n",
+                                        ga, hw, hh, w_, h_, outW, outH, d.pitchTexels ? d.pitchTexels : outW);
+                            }
+                        }
                         std::vector<uint8_t> rgba;
                         if (rex_tex::DecodeGuestToRGBA(d, rgba) && !rgba.empty()) {
-                            char path[96]; snprintf(path, sizeof path, "/tmp/texdec_%02d_%08X_%ux%u_f%02X.ppm", n, ga, outW, h_, fmt);
-                            rex_tex::WriteRGBAasPPM(path, rgba.data(), outW, h_);
+                            char path[96]; snprintf(path, sizeof path, "/tmp/texdec_%02d_%08X_%ux%u_f%02X.ppm", n, ga, outW, outH, fmt);
+                            rex_tex::WriteRGBAasPPM(path, rgba.data(), outW, outH);
                             fprintf(stderr, "[texdecode] wrote %s (tiled=%u endian=%u pitch=%u)\n", path, tiled, endian, d.pitchTexels ? d.pitchTexels : w_);
                             // cont.60: composite the live menu textures (the 0xA2 working buffers) into the
                             // render-side contact sheet for REX_MENULIVE (the working-buffer -> live render proof).
                             if (ga >= 0xA2000000u && ga < 0xA3000000u)
-                                rex_render::BlitMenuCell(rgba.data(), (int)outW, (int)h_, ga);
+                                rex_render::BlitMenuCell(rgba.data(), (int)outW, (int)outH, ga);
                         }
                     }
                 }
@@ -2320,8 +2343,10 @@ extern "C" PPC_FUNC(__imp__sub_821BEC00);
 PPC_FUNC(sub_821BEC00)
 {
     static const bool s_texseq = getenv("REX_TEXSEQ") != nullptr;
-    if (s_texseq) {
-        uint32_t h = ctx.r5.u32, dev = ctx.r3.u32, stage = ctx.r6.u32;
+    // cont.63: also capture handle dims when REX_TEXDECODE is on (the decode uses the real HEIGHT), not only TEXSEQ.
+    static const bool s_capdims = s_texseq || getenv("REX_TEXDECODE") != nullptr;
+    if (s_capdims) {
+        uint32_t h = ctx.r5.u32, stage = ctx.r6.u32;
         // cont.56: the Xenos 2D texture FETCH CONSTANT lives at handle+0x1C (d0=GLD32(h+0x1C): bits[1:0]=2=texture;
         // d1=+0x20: base in bits[31:12]; d2=+0x24: width-1 in [12:0], height-1 in [25:13]; format=d1 bits[5:0],
         // endian=d1 bits[7:6]). The base is in the 0xA2xxxxxx-0xA3xxxxxx WORKING-BUFFER range (cont.44's decompressed
@@ -2332,11 +2357,18 @@ PPC_FUNC(sub_821BEC00)
             uint32_t type = d0 & 3, baseRaw = d1 & 0xFFFFF000u, fmt = d1 & 0x3F, endian = (d1 >> 6) & 3;
             uint32_t w = (d2 & 0x1FFF) + 1, ht = ((d2 >> 13) & 0x1FFF) + 1;
             uint32_t gbase = (baseRaw >= 0xA0000000u) ? baseRaw : (0xA0000000u | baseRaw);
-            static std::atomic<int> n{0}; int i = n.fetch_add(1);
-            if (i < 48)
-                fprintf(stderr, "[texseq] #%d stage=0x%08X H=0x%08X fc@+1C{type=%u base=0x%08X fmt=0x%X end=%u %ux%u} d0=%08X d1=%08X d2=%08X\n",
-                        i, stage, h, type, gbase, fmt, endian, w, ht, d0, d1, d2);
-        } else {
+            // cont.63: record the handle's REAL content dims (base -> w,h) so REX_TEXDECODE uses the true HEIGHT.
+            if (type == 2 && w > 1 && ht > 1) {
+                std::lock_guard<std::mutex> lk(g_texDimsMtx);
+                g_texDimsByBase[gbase] = { (uint16_t)(w > 4096 ? 4096 : w), (uint16_t)(ht > 4096 ? 4096 : ht) };
+            }
+            if (s_texseq) {
+                static std::atomic<int> n{0}; int i = n.fetch_add(1);
+                if (i < 48)
+                    fprintf(stderr, "[texseq] #%d stage=0x%08X H=0x%08X fc@+1C{type=%u base=0x%08X fmt=0x%X end=%u %ux%u} d0=%08X d1=%08X d2=%08X\n",
+                            i, stage, h, type, gbase, fmt, endian, w, ht, d0, d1, d2);
+            }
+        } else if (s_texseq) {
             static std::atomic<int> nc{0}; int i = nc.fetch_add(1);
             if (i < 4) fprintf(stderr, "[texseq] stage-clear/other texH=0x%08X\n", h);
         }

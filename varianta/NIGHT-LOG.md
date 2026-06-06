@@ -4273,3 +4273,33 @@ is a placeholder). That remains the deep multi-week build.
 (b) the composition GEOMETRY — the one remaining wall: hook `sub_821F8E60` DIRECTLY (the cont.55 trick used on
 sub_821BEC00) to read the renderer's real VB pointer + fill, OR apply the prod-oracle to the cont.34 A↔B (execute the
 real frame WITH geometry instead of the placeholder).
+
+## cont.63 (2026-06-06, /loop "go deep renderer job", autonomous — user asleep until 10:00 MSK) — ⭐SPLASH DECODE COMPLETED: real handle dims (height + content width); COMEDY CENTRAL now full
+
+cont.62 fixed the splash WIDTH via the d0 pitch field but left the HEIGHT as the executed draw's 256×256 placeholder
+(COMEDY CENTRAL cut at row 256). **Root:** the EXECUTED draw's fetch constant carries a 256×256 PLACEHOLDER size
+(cont.59 — the executed segment is a placeholder), while the title's texture HANDLE (sub_821BEC00, handle+0x1C,
+cont.56) carries the REAL content dims. Measured this run ([texseq]): **A2D96000 584×198, A2F25000 374×446,
+A2E12000 875×314** — the handle's d2 holds the true dims, unlike the executed d2 (all 256×256).
+
+**FIX (kernel.cpp):** (1) a base→(w,h) map `g_texDimsByBase`, populated in the `sub_821BEC00` hook (gated
+`s_capdims = REX_TEXSEQ||REX_TEXDECODE`) from the handle's handle+0x1C fetch constant. (2) In REX_TEXDECODE, look up
+the executed base and use the handle HEIGHT (extends CC 256→446, crops SP 256→198) and — when the d0 pitch field gave
+a real STRIDE — the handle content WIDTH (crops the right padding: SP 640→584, CC 384→374, doublesix 896→875); the
+pitch stays the row stride. `[dimfix]` logs each.
+
+**RESULT** (REX_RENDER+MENULIVE+TEXBIND+TEXDECODE+TEXSEQ+EXECSEGS + run-base, `timeout -s KILL -k 5 60`): the three
+boot splashes decode as tight, full images — **SP DIGITAL STUDIOS 584×198** (Cartman+logo), **COMEDY CENTRAL 374×446**
+(FULL — the cityscape mark + "COMEDY CENTRAL" text, no longer cut at 256), **doublesix 875×314**. Montage
+`/tmp/cont63_splash_final.png` (viewed). The texture-decode half is now fully correct (pitch = row stride, handle =
+content dims).
+
+**Default boot UNREGRESSED:** plain headless boot = 393,211 lines, 0 real crash markers (the 1 grep hit is the benign
+`[stub] ExTerminateThread`), `[dimfix]` absent (gated code dormant), normal fence-forward at the end. All changes are
+behind REX_TEXDECODE/REX_TEXSEQ.
+
+**⇒ NEXT (cont.64):** the texture half is DONE; attack the remaining wall = the **COMPOSITION GEOMETRY**
+(cont.34/22-23/59). Plan: hook `sub_821F8E60` DIRECTLY (the cont.55 `sub_821BEC00` trick) to read the renderer's real
+VB pointer + vertex fill at the textured menu draws (cont.61 found the dynamic VB 0xA022FFF0 EMPTY at those draws — the
+real geometry source is elsewhere). First verify a direct override of `sub_821F8E60` FIRES (gdb; cont.55 lesson: only
+directly-called fns fire, vtable/dispatch-table calls bypass a weak-alias override). New: `g_texDimsByBase`, `[dimfix]`.
