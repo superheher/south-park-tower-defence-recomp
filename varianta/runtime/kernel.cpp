@@ -844,6 +844,11 @@ uint32_t g_texWatchAddr = 0;
 struct TexAlloc { uint32_t addr, size, lr; };
 std::vector<TexAlloc> g_texAllocs;
 std::mutex g_texAllocsMtx;
+// cont.44: CreateTexture(sub_821BE840) records each GPU block's dims (w,h) so REX_TEXSCAN can decode the
+// (tiled) texture correctly — the real menu/attract textures populate the GPU window over time at attract.
+struct TexDims { uint32_t w, h; };
+std::unordered_map<uint32_t, TexDims> g_texCreate;   // GPU block addr -> dims
+std::mutex g_texCreateMtx;
 // PVOID MmAllocatePhysicalMemoryEx(flags r3, size r4, protect r5, min r6, max r7, align r8)
 PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
 {
@@ -1920,7 +1925,7 @@ void VblankPump() {
         // tiled!) -> PPM = the live-tiled-texture render + the tiler's hardware confirmation. Once, at steady state.
         static const bool s_texscan = getenv("REX_TEXSCAN") != nullptr;
         static int s_scanDone = 0;
-        if (s_texscan && (vbc % 300) == 60 && s_scanDone < 3) {
+        if (s_texscan && (vbc % 300) == 60 && s_scanDone < 9) {
             s_scanDone++;
             auto rd = [&](uint32_t a){ uint32_t b; memcpy(&b, g_base + a, 4); return __builtin_bswap32(b); };
             std::lock_guard<std::mutex> lk(g_texAllocsMtx);
@@ -1933,21 +1938,58 @@ void VblankPump() {
                 if (i < 28)
                     fprintf(stderr, "[texscan] block#%zu 0x%08X sz=0x%X nz=%u/%u %s first=%08X %08X\n",
                             i, a, sz, nz, samples, pop ? "POPULATED" : "zero", rd(a), rd(a + 4));
-                // decode-attempt: if the block looks like an 8888 image (size <=8MB, pixel count = a clean
-                // common width), decode it as linear 8888 -> PPM, to SEE the title's in-memory texture data.
-                if (pop && sz <= 0x800000u) {
-                    uint32_t px = sz / 4, w = 0;
-                    if (px % 1280 == 0 && px / 1280 <= 1200) w = 1280;
-                    else if (px % 1024 == 0 && px / 1024 <= 1200) w = 1024;
-                    else if (px % 512 == 0 && px / 512 <= 1200) w = 512;
-                    else if (px % 256 == 0 && px / 256 <= 1200) w = 256;
-                    if (w) { uint32_t hh = px / w;
+                // cont.43->44: render the title's real working-buffer images. (1) detect a DDS CONTAINER (scan
+                // for "DDS " magic — the title's decompressed texture archives, like cont.37's HudImages). (2) else
+                // try MULTIPLE candidate widths and write a PPM for each clean one, so the correct (un-sheared)
+                // dims can be picked by eye. (Working buffers are raw linear 8888; their true dims aren't headered.)
+                if (pop && sz <= 0x900000u) {
+                    // DDS-container scan (first 256KB)
+                    uint32_t ddsOff = 0xFFFFFFFFu, scanLim = sz < 0x40000u ? sz : 0x40000u;
+                    for (uint32_t o = 0; o + 4 <= scanLim; o += 4) {
+                        const uint8_t* q = g_base + a + o;
+                        if (q[0]=='D'&&q[1]=='D'&&q[2]=='S'&&q[3]==' ') { ddsOff = o; break; }
+                    }
+                    if (ddsOff != 0xFFFFFFFFu)
+                        fprintf(stderr, "[texscan] block 0x%08X = DDS CONTAINER (first 'DDS ' @+0x%X)\n", a, ddsOff);
+                    // cont.44: if this block has a CreateTexture entry, decode at the CORRECT dims + the format
+                    // inferred from bytes-per-pixel; GPU-window (0xA4-0xA5) blocks are TILED (test the tiler!),
+                    // working buffers (0xA2) are linear. This renders the title's real menu/attract textures.
+                    TexDims td{}; bool haveCt = false;
+                    { std::lock_guard<std::mutex> lk(g_texCreateMtx); auto it = g_texCreate.find(a);
+                      if (it != g_texCreate.end()) { td = it->second; haveCt = true; } }
+                    if (haveCt && td.w && td.h) {
+                        static std::atomic<int> ctn{0};
+                        if (ctn.fetch_add(1) < 28) {
+                            uint64_t area = (uint64_t)td.w * td.h; double bpp = area ? (double)sz / (double)area : 0;
+                            uint32_t fmt = bpp < 0.75 ? rex_tex::FMT_DXT1 : bpp < 1.5 ? rex_tex::FMT_DXT4_5
+                                          : bpp < 3.0 ? rex_tex::FMT_5_6_5 : rex_tex::FMT_8_8_8_8;
+                            // write BOTH tiled and linear decodes to disambiguate (the GPU-window data may be
+                            // tiled — testing the cont.36 tiler — or stored linear).
+                            for (uint32_t tiled = 0; tiled <= 1; tiled++) {
+                                rex_tex::Desc dd{}; dd.guestBase = a; dd.format = fmt; dd.width = td.w; dd.height = td.h; dd.tiled = tiled; dd.endian = rex_tex::END_NONE;
+                                std::vector<uint8_t> rgba;
+                                if (rex_tex::DecodeGuestToRGBA(dd, rgba) && !rgba.empty()) {
+                                    char p[112]; snprintf(p, sizeof p, "/tmp/texct_%08X_%ux%u_f%u_t%u.ppm", a, td.w, td.h, fmt, tiled);
+                                    rex_tex::WriteRGBAasPPM(p, rgba.data(), td.w, td.h);
+                                }
+                            }
+                            fprintf(stderr, "[texscan] block 0x%08X CREATETEX %ux%u bpp=%.2f fmt=%u (wrote tiled+linear)\n", a, td.w, td.h, bpp, fmt);
+                        }
+                    }
+                    uint32_t px = sz / 4;
+                    static const uint32_t cand[] = {1280,384,448,1024,800,768,720,640,576,512,480,320,256,128};
+                    int wrote = 0;
+                    for (uint32_t w : cand) {
+                        if (wrote >= 4) break;
+                        if (px % w != 0) continue; uint32_t hh = px / w;
+                        if (hh < 16 || hh > 2048) continue;
                         rex_tex::Desc dd{}; dd.guestBase = a; dd.format = rex_tex::FMT_8_8_8_8; dd.width = w; dd.height = hh; dd.tiled = 0; dd.endian = rex_tex::END_NONE;
                         std::vector<uint8_t> rgba;
                         if (rex_tex::DecodeGuestToRGBA(dd, rgba) && !rgba.empty()) {
                             char p[96]; snprintf(p, sizeof p, "/tmp/texblk_%08X_%ux%u.ppm", a, w, hh);
                             rex_tex::WriteRGBAasPPM(p, rgba.data(), w, hh);
-                            fprintf(stderr, "[texscan] block 0x%08X decoded as %ux%u 8888 -> %s\n", a, w, hh, p);
+                            fprintf(stderr, "[texscan] block 0x%08X candidate %ux%u 8888 -> %s\n", a, w, hh, p);
+                            wrote++;
                         }
                     }
                 }
@@ -2176,6 +2218,12 @@ PPC_FUNC(sub_821BE840)
              r8 = ctx.r8.u32, r9 = ctx.r9.u32, r10 = ctx.r10.u32, lr = (uint32_t)ctx.lr;
     g_tl_lastGpuAlloc = 0;
     __imp__sub_821BE840(ctx, base);
+    if ((s_texscan || s_texfill) && g_tl_lastGpuAlloc && r3 && r4 && r3 <= 4096 && r4 <= 4096) {
+        // cont.44: record this texture's dims (r3=width, r4=height) keyed by its GPU block, so REX_TEXSCAN can
+        // decode the (tiled) data at the correct dims when the title populates it over time.
+        std::lock_guard<std::mutex> lk(g_texCreateMtx);
+        g_texCreate[g_tl_lastGpuAlloc] = {r3, r4};
+    }
     if (s_texscan && g_tl_lastGpuAlloc) {
         static std::atomic<int> n{0}; int i = n.fetch_add(1);
         if (i < 20) {

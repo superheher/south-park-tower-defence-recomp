@@ -3725,3 +3725,39 @@ producing rigorous narrowing (documented findings) but not a single-iteration cr
 detector (what polls the loader-done state and should fire the level-start); (c) trace the frontend state machine
 (sub_8215079C) for the gameplay-start decision point. Or redirect to visible decoder-driven render work (the
 tractable half of the renderer) — user's call.
+
+## cont.44 (2026-06-06, /loop "go deep renderer job — render the real menu from working buffers") — ⭐ user redirected to the render path; MAJOR CORRECTION: the GPU texture window POPULATES over time at attract; decoded the title's REAL menu/attract textures
+
+User explicitly redirected: "рендери реальное меню из working-буферов." Pivoted to the render path. Two images
+sent. Default boot UNREGRESSED (96 assets, exit137, 0 crash, clamp 4×; all gated behind REX_TEXSCAN).
+
+**(1) Working buffers (0xA2x) at attract = the title's INTRO LOGOS, not a menu.** Improved REX_TEXSCAN (DDS-container
+scan + multi-candidate-width decode). The populated 0xA27-0xA2F blocks decode (correct dims by size-match) to the
+title's real **frontend logo sequence**: 0xA2FF9000 = Microsoft Game Studios splash (1280×720), 0xA2F25000 =
+Comedy Central logo (384×448) — both clean, 1:1, decoded by my decoder from the title's runtime memory (image sent).
+A few other blocks are pitch-padded/odd-factor (sheared, unresolved). ⇒ the working buffers hold the boot/intro
+logos; the interactive MENU is composed at runtime (attract-movie + HUD sprites) and is behind the advance-gate,
+so it's NOT a static working-buffer image at this state.
+
+**(2) ⭐⭐ MAJOR CORRECTION — the GPU texture window POPULATES OVER TIME at attract.** Sampling REX_TEXSCAN at
+multiple vbc (60→1860) shows the populated tex-alloc count GROWS: 8→158 allocations, **5→103 POPULATED** over ~30s,
+INCLUDING GPU-window blocks (0xA51xxxxx-0xA5Exxxxx). **cont.38/42 sampled TOO EARLY (vbc 60-660) and wrongly
+concluded "GPU window zero" — the title DOES tile+upload its textures at attract, just later.** This also softens
+the cont.41 framing (the populate DOES run at attract; the L1 stall is a separate, earlier gate).
+
+**(3) ⭐ Decoded the title's REAL textures (CreateTexture-correlated).** Recorded each GPU block's dims from the
+CreateTexture hook (sub_821BE840, cont.40) → for each populated GPU-window block, decoded at the CORRECT dims +
+format inferred from bytes/px → **the title's real menu/attract/gameplay textures**: a radial **sunburst**
+background, **tornado / lightning / fire** effect sprites, **character sprite-sheets** (bright-green = chroma/alpha
+key), rings, orbs, red UI panels (256×256 & 512×512 8888; a 1920×1080 DXT1 backdrop). Image sent. ⇒ FIRST decode
+of the title's real GAMEPLAY/menu texture set from its GPU memory.
+
+**(4) ⚠ TILER status — the GPU-window textures are stored LINEAR, not tiled.** Decoding them as TILED (my cont.36
+XGAddress2DTiledOffset) gives a **honeycomb scramble**; decoding LINEAR gives the coherent real textures (above).
+So these are linear surfaces, and **the cont.36 tiler remains UNCONFIRMED against real tiled data** — cont.36's
+honest caveat (round-trip proves inversion, NOT hardware-layout) stands; the honeycomb is the first real-data
+signal and would be the test bed IF a genuinely tiled texture is found. New gated diags under REX_TEXSCAN:
+[texscan] DDS-container scan, multi-width candidates, CreateTexture-correlated decode (texct_*, tiled+linear),
+late multi-vbc sampling. **NEXT:** (a) compose the real textures into the actual menu LAYOUT (needs the per-draw
+mapping / the draw stream — cont.24's open problem); (b) find a genuinely TILED texture to fix/confirm the tiler;
+(c) the advance-gate (deep A↔B) for the live interactive menu.
