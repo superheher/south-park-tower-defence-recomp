@@ -3636,3 +3636,34 @@ POPULATE — how it writes data into the texture object (0x06xxxxxx) / its GPU b
 — and why it doesn't run; then implement it (I have dims/format/dest from CreateTexture; need to bind the source
 working buffer) OR confirm it's GPU-deferred. Entry: sub_821BE840 (the texture object 0x06xxxxxx + its GPU block) +
 the caller 0x8232D488.
+
+## cont.41 (2026-06-06, /loop "go deep renderer job") — EXPERIMENT: filling the texture data does NOT advance the title ⇒ texture data-presence is NOT the gate; the L1 gate is the GPU-completion wait (cont.34), UPSTREAM of texture-uploads
+
+Instead of climbing further, tested cont.35's hypothesis directly (cont.35: the advance is "gated on the level's
+GPU resources being created (textures decoded+uploaded)"). REX_TEXFILL: in the sub_821BE840 (CreateTexture) hook,
+after the create, eagerly fill the just-allocated GPU texture block with non-zero data (make it "present"), then
+measure whether the title advances. Default boot UNREGRESSED (96 assets, exit137, 0 crash, clamp 4×; REX_TEXFILL
+gated, the thread-local alloc-tracking is behavior-neutral).
+
+**RESULT — filling textures does NOT advance the title:**
+- ATTRACT (default boot + REX_TEXFILL): 97 assets ≈ baseline 96 (within run noise). 8 textures filled (the
+  frontend textures, 1280×720 + 640×360, fmt=0x28000002). No advance.
+- L1 (REX_SKIPINTRO + REX_HANDLERGUARD + REX_TEXFILL): **162 assets = the L1 baseline exactly, ZERO new asset
+  opens.** Same 8 frontend texture fills (the L1-specific textures are NOT created — the title stalls BEFORE
+  reaching them). No advance.
+
+**⇒ DECISIVE: texture data-presence is NOT the advance gate.** Refines cont.35: the L1-start gate is **cont.34's
+GPU-completion wait (the A↔B coupling)** — and it is **UPSTREAM of the texture-uploads** (only the 8 frontend
+textures get created at L1; the title stalls in the render-completion spin BEFORE it creates/uploads the level's
+textures). So the texture-create/upload keystone (cont.25 R0 / cont.39-40, sub_821BE840) is a **real but DOWNSTREAM
+piece** — the title never reaches it because it's stuck waiting for GPU completion. ⚠ Caveat (rigor): the fill is
+garbage data; if the gate were a per-texture readiness FLAG (not the pixels), filling pixels wouldn't set it — but
+the L1 result (the level textures aren't even created) independently shows the stall is upstream of texture work.
+
+**⇒ REDIRECT the deep build to cont.34's GPU-completion wait** (the root A↔B gate, characterized since cont.10):
+the title's per-frame render-completion spin at L1 (REX_SPINTRACE: KeGetCurrentProcessType caller lr=0x821C6F78 in
+sub_821C6F50 + 0x821BFF64/0x821C0864, all render-range) waits for a GPU completion variant A's present-only CP
+never produces; the existing fence-forwards (sub_821C6E58/sub_821C5DF0) don't cover it. New gated diag REX_TEXFILL.
+**NEXT:** attack the GPU-completion directly — pin the exact completion object/fence the L1 spin polls (sub_821C6F50
++ the 0x821BFF64/0x821C0864 sites) and produce it (execute the device+13568 L1 render segments → a real fence, or
+forward the specific fence the spin waits on). This is the cont.34 "focused renderer session" core.

@@ -2108,10 +2108,10 @@ PPC_FUNC(sub_824495D8)
     static const bool s_texscan = getenv("REX_TEXSCAN") != nullptr;
     uint32_t caller = static_cast<uint32_t>(ctx.lr);
     __imp__sub_824495D8(ctx, base);
-    if (s_texscan) {
-        uint32_t result = ctx.r3.u32;
-        if (result >= 0xA4000000u && result < 0xA6000000u) {
-            g_tl_lastGpuAlloc = result;   // cont.40: let the sub_821B0F18 hook know a GPU block was just allocated
+    uint32_t result = ctx.r3.u32;
+    if (result >= 0xA4000000u && result < 0xA6000000u) {
+        g_tl_lastGpuAlloc = result;   // unconditional: REX_TEXFILL (cont.41) reads this without REX_TEXSCAN
+        if (s_texscan) {
             static std::mutex m; static std::unordered_map<uint32_t,int> seen;
             std::lock_guard<std::mutex> lk(m);
             if (seen[caller]++ == 0)
@@ -2171,9 +2171,10 @@ extern "C" PPC_FUNC(__imp__sub_821BE840);
 PPC_FUNC(sub_821BE840)
 {
     static const bool s_texscan = getenv("REX_TEXSCAN") != nullptr;
+    static const bool s_texfill = getenv("REX_TEXFILL") != nullptr;   // cont.41 experiment
     uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32, r7 = ctx.r7.u32,
              r8 = ctx.r8.u32, r9 = ctx.r9.u32, r10 = ctx.r10.u32, lr = (uint32_t)ctx.lr;
-    if (s_texscan) g_tl_lastGpuAlloc = 0;
+    g_tl_lastGpuAlloc = 0;
     __imp__sub_821BE840(ctx, base);
     if (s_texscan && g_tl_lastGpuAlloc) {
         static std::atomic<int> n{0}; int i = n.fetch_add(1);
@@ -2182,6 +2183,19 @@ PPC_FUNC(sub_821BE840)
                     i, g_tl_lastGpuAlloc, lr, ctx.r3.u32, r3, r4, r5, r6, r7, r8, r9, r10);
             DumpDesc("r3", r3); DumpDesc("r4", r4);
         }
+    }
+    // cont.41 EXPERIMENT (REX_TEXFILL): cont.35 claims the title's advance is gated on "GPU resources being
+    // created". Test it — eagerly fill the just-created texture's GPU block with a non-zero gradient (make the
+    // data "present") and watch whether the title advances past attract. Advance => data-presence gate (a
+    // tractable CPU populate); no advance => the gate is a GPU fence/flag (A↔B). For these formats the surface is
+    // ~1 byte/texel (1280×720 -> 0xE1000 block), so width*height bytes fits within the block.
+    if (s_texfill && g_tl_lastGpuAlloc >= 0xA4000000u && g_tl_lastGpuAlloc < 0xA6000000u) {
+        uint32_t w = r3, h = r4, bytes = (w && h && w <= 4096 && h <= 4096) ? w * h : 0x40000u;
+        if (bytes > 0x100000u) bytes = 0x100000u;   // safety cap (don't run past the block)
+        uint8_t* p = g_base + g_tl_lastGpuAlloc;
+        for (uint32_t k = 0; k < bytes; k++) p[k] = (uint8_t)(((k >> 5) ^ (k >> 11)) | 0x40);   // non-zero, varied
+        static std::atomic<int> fn{0};
+        if (fn.fetch_add(1) < 8) fprintf(stderr, "[texfill] filled 0x%08X %u bytes (%ux%u fmt=%08X)\n", g_tl_lastGpuAlloc, bytes, w, h, r8);
     }
 }
 
