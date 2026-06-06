@@ -795,6 +795,31 @@ PPC_FUNC(__imp__KeQuerySystemTime)
 // BOOL XexCheckExecutablePrivilege(DWORD privilege) — title has no special privileges during bring-up.
 PPC_FUNC(__imp__XexCheckExecutablePrivilege) { ctx.r3.u64 = 0; }
 
+// ---- runtime XEX-module loading: XexLoadImage / XexGetProcedureAddress ------------------------------
+// Variant A hosts NO loadable XEX modules — the title's xam/xboxkrnl imports are resolved at COMPILE
+// time (the __imp__* host stubs). The title calls XexLoadImage("xam.xex") + XexGetProcedureAddress(ord)
+// only to FEATURE-DETECT optional functions: sub_82425480 resolves XAM Party/Community UI ordinals
+// (0xAFF XamPartyGetUserList, 0xB00 SendGameInvites, 0xB0B SetCustomData, 0xB10 GetBandwidth,
+// 0x305 XamShowPartyUI, 0x30B XamShowCommunitySessionsUI) into the table at 0x828183A0. The faithful
+// emulation of "this console/dashboard lacks those functions" is to return a FAILURE status (<0): the
+// title then gracefully disables Party (table left zero).
+//   BUG these replace (prod-oracle, cont.52): the generated weak stubs return r3=0 (=STATUS_SUCCESS)
+// WITHOUT writing the caller's out-param. The wrappers sub_8244E290/sub_8244E250 check `bge` (status>=0
+// => success) and then read the un-written out buffer = uninitialised stack = 0xFFFFFFFF, filling the
+// Party table with garbage pointers and hanging the title. Returning a negative status routes those
+// wrappers to their clean failure path (they `li r3,0` and return without reading the out buffer).
+// Verified against prod: prod loads xam.xex (handle 0x3000b000) and resolves these ords to real IAT
+// thunks 0x825f0c18..2c; variant A has no such module, so not-found is correct. Replaces the
+// REX_HANDLERGUARD workaround for the 0x828183A0 sentinel.
+PPC_FUNC(__imp__XexLoadImage) {
+    static bool w=false; if(!w){w=true; fprintf(stderr,"[xex] XexLoadImage -> not-found (variant A hosts no loadable XEX modules)\n");}
+    ctx.r3.u64 = 0xFFFFFFFFu;   // negative NTSTATUS: wrapper sub_8244E290 takes its failure path -> returns handle 0
+}
+PPC_FUNC(__imp__XexGetProcedureAddress) {
+    static bool w=false; if(!w){w=true; fprintf(stderr,"[xex] XexGetProcedureAddress -> not-found\n");}
+    ctx.r3.u64 = 0xFFFFFFFFu;   // negative NTSTATUS: wrapper sub_8244E250 takes its failure path -> returns proc 0
+}
+
 // ---- video mode (goal step: video) -----------------------------------------------------------------
 // void XGetVideoMode(X_VIDEO_MODE* mode) — report a fixed 1280x720 widescreen hi-def NTSC mode.
 // Layout (rexglue X_VIDEO_MODE): display_width@0x0, display_height@0x4, is_interlaced@0x8,

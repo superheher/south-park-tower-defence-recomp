@@ -3887,3 +3887,72 @@ watchpoint (mprotect + SIGSEGV-catch, no gdb [cont.25: gdb impractical for the r
 variant A stubs. ⚠ HONEST: this needs prod's guest g_base (to compute the host watch address) + careful SIGSEGV
 handling = a significant tooling effort (focused session). The deep-build advance-gate is genuinely autonomously-
 hard; the achievable renders (decoder + real textures + mock-up) are delivered (cont.44-46).
+
+## cont.51 (2026-06-06, /loop) — PROD-ORACLE ENABLED: prod runs autonomously; prod g_base=0x100000000; gdb IS usable
+
+The pivot's prerequisites, all SOLVED (correcting cont.25's "gdb impractical" assumption):
+- **prod runs autonomously.** Launch invocation (from `gamectl.sh`): cwd = `out/build/linux-amd64-release`,
+  `SDL_VIDEODRIVER=x11 LD_LIBRARY_PATH=. DISPLAY=:0 setsid ./south_park_td --game_data_root=<root>/private/extracted
+  --user_data_root=<root>/private/userdata --license_mask=1 --mnk_mode=true --always_win=true --window_width=960
+  --window_height=540 --log_file=run.log`. prod reaches the title (run.log: `swaps 60.0/s loading=false`).
+- ⚠⚠ **CRITICAL LESSON: kill prod with `pkill -x south_park_td` (exact name), NEVER `pkill -f south_park_td`.**
+  `-f` matches the *full cmdline*, which includes my OWN bash command containing "south_park_td" → it kills my own
+  shell → every prod launch attempt returned "exit 1, no output". I misdiagnosed this for ~5 attempts as "prod won't
+  run / advance-gate autonomously-blocked." It was the self-kill. Use `-x`.
+- **prod guest memory = Xenia-style /dev/shm**, mapped at host **g_base = 0x100000000** (so guest 0x82XXXXXX → host
+  0x182XXXXXX). 970 mappings; main = 1.75GB rw-s /dev/shm/xenia_memory_*. Deterministic (MAP_FIXED) across runs.
+- **gdb 17.1 IS available and prod is NOT stripped (32915 syms, same `sub_XXXXXXXX` guest-addr naming as variant A).**
+  ⇒ a gdb **hardware** watchpoint (debug-register, near-native speed — not the slow software-watchpoint cont.25
+  feared) on the host gate-global address gives a fully-SYMBOLIZED writer backtrace. prod↔variant A map 1:1 by sub_.
+
+## cont.52 (2026-06-06, /loop) — ⭐BREAKTHROUGH: the menu-handler gate is XAM PARTY-FEATURE DETECTION; XexLoadImage/XexGetProcedureAddress stub bug FIXED (proper, replaces REX_HANDLERGUARD)
+
+Ran the prod-oracle end-to-end and CRACKED + FIXED the menu-handler gate (0x828183A0). Method + findings:
+
+**1. Premise validated (prod populates the gate globals).** Read prod's live guest memory at the title:
+0x827FD568=0x820e6b0c, **0x827FD56C=0x45fe78b0** (heap obj; variant A=NULL), **0x828183A0=0x825f0c18** (variant A=
+0xFFFFFFFF sentinel). prod sets what variant A leaves null/sentinel — the gate is real.
+
+**2. prod watchpoint → exact writer call-chains** (gdb HW watchpoint armed at `rex::ReXApp::OnPreLaunchModule`, the
+moment guest memory is mapped but the guest thread hasn't run):
+  - 0x828183A0 ← 0x825f0c18 : `xstart → sub_82450350 → sub_825906D0 → sub_82425480` (store)
+  - 0x827FD56C ← 0x45fe78b0 : `xstart → sub_82249638 → sub_82249678 → sub_8214FFD0 → sub_82292B10 → sub_8248F4C8`
+
+**3. variant A reaches ALL of them** (gdb breakpoints on the 8 chain fns, variant A boot): every fn incl. both leaf
+writers HIT. ⇒ the divergence is INSIDE the writers (value/branch), NOT reachability. (Corrects cont.43/50's "writer
+never runs / indirection-hidden" — it runs; the static WRITER search failed because the store is `stw r3,0(r31)`
+with r31 = the *passed-in* struct ptr 0x828183A0, not a `lis/addi`-built constant address.)
+
+**4. variant A watchpoint → the exact bug.** variant A writes 0x828183A0 = **0xFFFFFFFF** at `sub_82425480`
+(ppc_recomp.59.cpp:21281, the `stw r3,0(r31)` of `sub_8244E250(handle,2815)`'s result). Decoding sub_82425480:
+it's **optional XAM Party/Community feature-detection** — `handle = sub_8244E290 = XexLoadImage("xam.xex")` (name
+@guest 0x82068808), then `sub_8244E250 = XexGetProcedureAddress(handle, ord)` for ords **0xAFF XamPartyGetUserList,
+0xB00 XamPartySendGameInvites, 0xB0B XamPartySetCustomData, 0xB10 XamPartyGetBandwidth, 0x305 XamShowPartyUI,
+0x30B XamShowCommunitySessionsUI**, filling the table 0x828183A0..B4 (+0xB8 = handle). prod resolves these to real
+IAT thunks 0x825f0c18..2c (handle 0x3000b000); the title's main XEX has NO export table (exportTable VA=0) — these
+are RUNTIME-resolved xam imports.
+
+**5. ROOT CAUSE.** variant A's generated weak stubs `__imp__XexLoadImage` / `__imp__XexGetProcedureAddress` return
+`r3=0` (=STATUS_SUCCESS) WITHOUT writing the caller's out-param. The wrappers check `bge` (status≥0 ⇒ success) then
+read the **un-written out buffer = uninitialised stack = 0xFFFFFFFF** → the Party table fills with garbage pointers
+→ the title thinks Party is available with bogus fn-ptrs → hang (the cont.31 sentinel `REX_HANDLERGUARD` was a
+band-aid over this).
+
+**6. FIX (kernel.cpp:805-823, commit this cont.).** Strong overrides:
+`PPC_FUNC(__imp__XexLoadImage){ ctx.r3.u64=0xFFFFFFFF; }` and same for `__imp__XexGetProcedureAddress` — return a
+NEGATIVE status (module/ordinal NOT found). variant A hosts no loadable XEX modules (all imports compile-time), so
+not-found is the FAITHFUL result (a console/dashboard lacking Party). The wrappers' `bge` now fails → their clean
+failure path (`li r3,0`, no out-buffer read) → `sub_82425480` early-outs → table stays 0 → the title gracefully
+disables Party. VERIFIED (gdb): override resolves to kernel.cpp:815 (not the weak stub) and IS hit; 0x828183A0 no
+longer becomes 0xFFFFFFFF (stays 0); the title reaches the cont.34 L1 GPU-completion spin **WITHOUT** REX_HANDLERGUARD.
+**Default boot UNREGRESSED** (0 crashes, full 30s, 407k lines). ⇒ proper fix; REX_HANDLERGUARD no longer needed.
+
+**Tools added** (varianta/tools/): `prod_read.py` (read guest globals from running prod via /proc/pid/mem at
+g_base 0x100000000), `oracle.gdb` (prod HW-watchpoint → symbolized writer bt), `diverge.gdb` (variant A breakpoints
+on a call-chain → which fns are reached), `vawatch.gdb`/`vatest.gdb` (variant A base-relative HW watchpoint).
+
+**⇒ NEXT (cont.53): apply the SAME oracle to the SUBSYSTEM gate 0x827FD56C** (the cont.33 post-L1 gate; prod chain
+`sub_82292B10 → sub_8248F4C8` writes a HEAP object 0x45fe78b0). variant A reaches sub_8248F4C8 — watch 0x827FD56C in
+variant A (longer timeout; the subsys write is at frontend init, later than the handler write) to see what value it
+writes and why null (allocation-fail? another import stub? a branch). That gate (not the handler) is what cont.33
+flagged as blocking post-L1 — and after it, the cont.34 GPU-completion spin is the renderer wall proper.
