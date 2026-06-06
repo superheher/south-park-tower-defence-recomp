@@ -22,10 +22,12 @@
    **портреты Cartman / Stan / Kyle** (215×110), пре-рендер текст-строки, лого, иконки, баннер — 19 текстур, все
    декодятся чисто.
 
-5. **⭐⭐ Текст титла рисуется ЧИТАЕМО (cont.70–71).** `REX_TEXTRENDER` растеризует глиф-квады текстового рендерера
-   (pos+uv) по декодированному font-атласу. Реальный текст меню/UI читаем: **«SELECT GAME MODE»**, **«South Park is
-   under attack! Help Stan, Cartman, Kyle, and Kenny save the town from being destroyed.»**, **«LOADING…»**, «Again!»,
-   «SELECT», «NEXT».
+5. **⭐⭐ Текст титла рисуется ЧИТАЕМО (cont.70–71, cont.74).** `REX_TEXTRENDER` растеризует глиф-квады текстового
+   рендерера (pos+uv) по декодированному font-атласу. Реальные опции/кнопки меню читаемы: **«START GAME», «OPTIONS»,
+   «LOBBY», «JOIN», «DIFFICULTY», «AUDIO BRIEFING», «BACK», «NEXT», «START»**, плюс описание игры **«South Park is
+   under attack! Help Stan, Cartman, Kyle, and Kenny save the town from being destroyed.»** и **«LOADING…»**.
+   (cont.74 нашёл что font-атласы ДИНАМИЧЕСКИЕ — титл перезаполняет их по каждому лейблу — и декодит свежо на каждый
+   лейбл, что и сделало кнопки читаемыми.)
 
 ## Честное состояние
 

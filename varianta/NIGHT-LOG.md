@@ -4562,3 +4562,20 @@ positions is the cont.34 A↔B wall (the title gates its real frame on GPU compl
 executed segment is a placeholder), genuinely multi-week. **⇒ NEXT (cont.74+):** the deep menu work has reached its
 wall — shift to refinement/consolidation (slower cadence), or the multi-week A↔B build (execute the real frame). New:
 `g_textXform`, `[placed]`.
+
+## cont.74 (2026-06-07, /loop "go deep renderer job", autonomous, refinement) — fix the garbled menu-text labels: the font/glyph atlas is DYNAMIC; decode it fresh per label → the real menu BUTTONS render readable
+
+cont.71's garbled A2D76000 labels root-caused: the 256² font/glyph atlases are **DYNAMIC** — the title refills each
+per-label with exactly the glyphs that label needs (decoded A2D76000 = a grid of specific chars: _ © & ( P ) 2 0 9 M
+C R O S F T C A N . A L R …). `DecodeByBase` (cont.70) CACHED the decode, so later labels sampled stale glyphs. **FIX:**
+DecodeByBase always re-decodes (overwrites the cache slot) so the live atlas content matches each label's uvs.
+
+**RESULT** (REX_TEXTRENDER+DRAWCAP+SKIPINTRO, headless): the real menu BUTTONS/options now render **READABLE** —
+**START GAME, LOBBY, OPTIONS, JOIN, BACK, NEXT, DIFFICULTY, AUDIO BRIEFING, START** (+ the game description, LOADING).
+30 distinct labels; montage `/tmp/cont74_labels.png`. (A few grid-like labels stay garbled = the title rendering the
+glyph-atlas SHEET itself, a separate case.) Refreshed the deliverable `/tmp/SP_night_results.png` with the improved text.
+
+**Default boot UNREGRESSED** (DecodeByBase only called from gated REX_TEXTRENDER; 164k lines, 0 real crashes).
+
+**⇒ NEXT (cont.75+):** the menu text now renders the real navigation options readable; the live composited menu remains
+the cont.34 A↔B wall (cont.73). Continue light refinement / consolidation at a slow cadence. New: DecodeByBase fresh re-decode.

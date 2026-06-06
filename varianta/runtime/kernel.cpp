@@ -2544,8 +2544,9 @@ static void AccumulateFrame(uint32_t base, float minx, float miny, float maxx, f
 // sample the font atlas. Returns nullptr if the base has no captured handle info or fails to decode.
 static const CachedTex* DecodeByBase(uint32_t base) {
     std::lock_guard<std::mutex> lk(g_frameMtx);
-    auto it = g_decCache.find(base);
-    if (it != g_decCache.end()) return it->second.w ? &it->second : nullptr;
+    // cont.74: ALWAYS re-decode (no cache-hit shortcut). The font/glyph atlas is DYNAMIC — the title refills these
+    // 256² buffers per-label with exactly the glyphs that label needs, so a cached decode gives STALE glyphs for a
+    // later label (= the cont.71 garbled A2D76000 labels). Decoding fresh at each text fill matches the live content.
     TexHandleDims info{}; bool have = false;
     { std::lock_guard<std::mutex> lk2(g_texDimsMtx); auto i2 = g_texDimsByBase.find(base);
       if (i2 != g_texDimsByBase.end()) { info = i2->second; have = true; } }
@@ -2556,8 +2557,9 @@ static const CachedTex* DecodeByBase(uint32_t base) {
         std::vector<uint8_t> r;
         if (rex_tex::DecodeGuestToRGBA(dd, r) && !r.empty()) { ct.rgba = std::move(r); ct.w = info.w; ct.h = info.h; }
     }
-    auto res = g_decCache.emplace(base, std::move(ct));
-    return res.first->second.w ? &res.first->second : nullptr;
+    g_decCache[base] = std::move(ct);          // overwrite with the fresh decode
+    auto& slot = g_decCache[base];
+    return slot.w ? &slot : nullptr;
 }
 // cont.66: at each guest frame present (VdSwap), snapshot the accumulated frame -> PPM (capped) then clear it.
 static void SnapshotFrameOnSwap() {
