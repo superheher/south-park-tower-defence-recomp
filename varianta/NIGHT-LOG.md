@@ -4303,3 +4303,36 @@ behind REX_TEXDECODE/REX_TEXSEQ.
 VB pointer + vertex fill at the textured menu draws (cont.61 found the dynamic VB 0xA022FFF0 EMPTY at those draws — the
 real geometry source is elsewhere). First verify a direct override of `sub_821F8E60` FIRES (gdb; cont.55 lesson: only
 directly-called fns fire, vtable/dispatch-table calls bypass a weak-alias override). New: `g_texDimsByBase`, `[dimfix]`.
+
+## cont.64 (2026-06-06, /loop "go deep renderer job", autonomous — user asleep) — ⭐⭐GEOMETRY FOUND: the textured IMAGE draws are SCREEN-SPACE quads (sprite renderer lr=0x82205114), directly renderable; cont.62's "hook sub_821F8E60" targeted the wrong (TEXT) renderer
+
+The cont.22–61 "the textured menu draws' vertex source is unfindable / placeholder / needs the A↔B deep build" wall is
+substantially CRACKED for the IMAGE draws. New `REX_DRAWCAP` (kernel.cpp): correlate each dynamic-VB fill
+(`sub_8242BF10`) with the texture bound just before it (`g_lastTexBase`, set in the `sub_821BEC00` hook on the same
+guest thread) — the texture↔geometry pairing cont.23's vert capture lacked (the texture side was only cracked in
+cont.56–57).
+
+**MEASURED (REX_DRAWCAP, headless, run-base) — TWO distinct renderers:**
+- **lr=0x821F90B0 (`sub_821F8E60`) = the TEXT renderer:** vc=252 (~63 glyphs×4), font atlas 0xA337D000, NORMALIZED
+  uv[0,1], small top-left box (pos[16.5..458.5, -0.5..76.5]) = LOCAL space (what cont.23 found needs the deferred
+  transform). ⇒ cont.62's NEXT-b "hook sub_821F8E60 for the real VB ptr" targeted the TEXT renderer, NOT the images.
+- **lr=0x82205114 (a SEPARATE sprite renderer) = the IMAGE draws:** SCREEN-SPACE position-only quads. Decoded raw:
+  - SP logo (A2D96000): 12 floats = **6 (x,y) verts, stride-8** = (348,261)(932,261)(932,459) + (348,261)(932,459)(348,459)
+    = **2 triangles**, rect **584×198 CENTERED** on 1280×720 — EXACTLY the logo's cont.63 content dims.
+  - doublesix (A2E12000): rect **875×314 centered** = exactly its cont.63 dims.
+  - a full-coverage quad (0,0)-(1768,1043), 4 verts, with various textures (a background/overscan element).
+  - **No UV in the buffer** (stride 8, pos.xy only) ⇒ implicit **FULL-TEXTURE UV** (the texture IS the sprite, 1:1).
+
+**⇒ DECISIVE:** the textured IMAGE menu draws are SCREEN-SPACE (1280×720) quads at the texture's native size, captured
+LIVE on the guest thread, with the texture correlated. They are **DIRECTLY RENDERABLE** — no deferred transform (that
+applies only to the TEXT renderer). This overturns cont.61's "vertex source unfindable" (cont.61 checked the executed
+placeholder + the text VB 0xA022FFF0 at SetTexture time — both the wrong place/time) and narrows the wall.
+
+**Default boot UNREGRESSED** (gated REX_DRAWCAP; plain headless: 240k lines, 0 real crashes, `[drawcap]` dormant).
+
+**⇒ NEXT (cont.65, COMPOSED MENU AT REAL POSITIONS):** render each image draw as a screen-space textured quad —
+capture its 6 verts (lr=0x82205114) → NDC (x/640−1, 1−y/360), bind `g_lastTexBase` decoded via cont.63 (handle dims),
+full UV (0,0)-(1,1) → draw per-draw (extend cont.60 REX_MENULIVE / g_texPipe to per-draw {screen quad, texture}).
+Result = the real boot splashes (logo/doublesix centered) and, when the menu's image draws fire, the composed menu
+images at real positions. The TEXT (`sub_821F8E60`, local-space) remains a separate sub-problem (its deferred
+transform). New: `REX_DRAWCAP`, `g_lastTexBase`, `[drawcap]`.

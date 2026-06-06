@@ -886,6 +886,11 @@ std::mutex g_texObjMtx;
 struct TexHandleDims { uint16_t w, h; };
 std::unordered_map<uint32_t, TexHandleDims> g_texDimsByBase;
 std::mutex g_texDimsMtx;
+// cont.64: the last real 0xA2 working-buffer texture bound (set in the sub_821BEC00 hook). Thread-local because the
+// textured-element renderer sub_821F8E60 binds a texture then fills its dynamic VB on the SAME guest thread — so at
+// the VB fill (sub_8242BF10 from 0x821F90B0) this holds the draw's texture, pairing GEOMETRY with TEXTURE (the data
+// cont.23's vert capture lacked; the texture side was only cracked in cont.56-57). REX_DRAWCAP reads it.
+thread_local uint32_t g_lastTexBase = 0;
 // PVOID MmAllocatePhysicalMemoryEx(flags r3, size r4, protect r5, min r6, max r7, align r8)
 PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
 {
@@ -2344,7 +2349,8 @@ PPC_FUNC(sub_821BEC00)
 {
     static const bool s_texseq = getenv("REX_TEXSEQ") != nullptr;
     // cont.63: also capture handle dims when REX_TEXDECODE is on (the decode uses the real HEIGHT), not only TEXSEQ.
-    static const bool s_capdims = s_texseq || getenv("REX_TEXDECODE") != nullptr;
+    // cont.64: REX_DRAWCAP also needs this hook to fire (it sets g_lastTexBase to pair the texture with the VB fill).
+    static const bool s_capdims = s_texseq || getenv("REX_TEXDECODE") != nullptr || getenv("REX_DRAWCAP") != nullptr;
     if (s_capdims) {
         uint32_t h = ctx.r5.u32, stage = ctx.r6.u32;
         // cont.56: the Xenos 2D texture FETCH CONSTANT lives at handle+0x1C (d0=GLD32(h+0x1C): bits[1:0]=2=texture;
@@ -2359,6 +2365,7 @@ PPC_FUNC(sub_821BEC00)
             uint32_t gbase = (baseRaw >= 0xA0000000u) ? baseRaw : (0xA0000000u | baseRaw);
             // cont.63: record the handle's REAL content dims (base -> w,h) so REX_TEXDECODE uses the true HEIGHT.
             if (type == 2 && w > 1 && ht > 1) {
+                g_lastTexBase = gbase;   // cont.64: pair this texture with the next VB fill (sub_821F8E60 -> sub_8242BF10)
                 std::lock_guard<std::mutex> lk(g_texDimsMtx);
                 g_texDimsByBase[gbase] = { (uint16_t)(w > 4096 ? 4096 : w), (uint16_t)(ht > 4096 ? 4096 : ht) };
             }
@@ -2522,6 +2529,41 @@ PPC_FUNC(sub_8242BF10)
             // this VB is recycled to zeros). Rendering them needs the transform, which only coexists with the
             // verts if the stubbed vertex-stream binding is restored (the deep build). Left as the [text] dump
             // (measurement only); no submit — a local-space quad render lands off-screen in the top-left corner.
+        }
+    }
+    // cont.64: correlate the textured menu draws' GEOMETRY with their TEXTURE. The textured-element renderer
+    // sub_821F8E60 binds a texture (sub_821BEC00 -> g_lastTexBase) then fills its dynamic VB HERE (the bl at
+    // 0x821F90B0, stride-16 pos.xy+uv.xy verts). cont.23 captured these verts but had NO texture pairing (the
+    // texture side was only cracked in cont.56-57). Capturing both answers the decisive question: are the
+    // logo/cityscape verts in SCREEN space (directly renderable with their texture = real composed menu) or LOCAL
+    // space (need the deferred transform reg0x4000, which cont.23 measured = zeros at fill time = the wall)?
+    static const bool s_drawcap = getenv("REX_DRAWCAP") != nullptr;
+    if (s_drawcap) {
+        uint32_t d = ctx.r3.u32, s = ctx.r4.u32, sz = ctx.r5.u32, lr = (uint32_t)ctx.lr;
+        if (d >= 0xA01F0000u && d < 0xA0300000u && sz >= 16 && sz < 0x20000 && (sz % 16) == 0) {
+            uint32_t vc = sz / 16;
+            auto rdf = [&](uint32_t off){ float f; uint32_t w = GLD32(s + off); memcpy(&f, &w, 4); return f; };
+            float minx=1e9f,maxx=-1e9f,miny=1e9f,maxy=-1e9f,minu=1e9f,maxu=-1e9f,minv=1e9f,maxv=-1e9f;
+            for (uint32_t i=0;i<vc;i++){ float x=rdf(i*16),y=rdf(i*16+4),u=rdf(i*16+8),v=rdf(i*16+12);
+                minx=fminf(minx,x);maxx=fmaxf(maxx,x);miny=fminf(miny,y);maxy=fmaxf(maxy,y);
+                minu=fminf(minu,u);maxu=fmaxf(maxu,u);minv=fminf(minv,v);maxv=fmaxf(maxv,v); }
+            // classify pos range: SCREEN ~ [0..1280]x[0..720]; CLIP ~ [-1..1]; LOCAL ~ small box near origin.
+            const char* space = (maxx>2.f && maxx<=1300.f && maxy<=730.f && minx>=-8.f && miny>=-8.f) ? "SCREEN?"
+                              : (minx>=-1.5f && maxx<=1.5f && miny>=-1.5f && maxy<=1.5f) ? "CLIP?" : "LOCAL?";
+            static std::atomic<int> dn{0}; int i = dn.fetch_add(1);
+            if (i < 48)
+                fprintf(stderr, "[drawcap] #%d lr=0x%08X tex=0x%08X dest=0x%08X vc=%u %s pos[%.1f..%.1f,%.1f..%.1f] uv[%.2f..%.2f,%.2f..%.2f] v0=(%.1f,%.1f / %.2f,%.2f)\n",
+                        i, lr, g_lastTexBase, d, vc, space, minx,maxx,miny,maxy, minu,maxu,minv,maxv, rdf(0),rdf(4),rdf(8),rdf(12));
+            // cont.64: raw float dump of the IMAGE-renderer fills (lr=0x82205114) to decode the exact vertex format
+            // (the uv==pos artifact means stride-16 pos+uv is wrong here). Dump the whole small fill as floats + ints.
+            if (lr == 0x82205114u && i < 10) {
+                uint32_t nf = sz / 4; if (nf > 24) nf = 24;
+                fprintf(stderr, "   raw[%u floats] tex=0x%08X:", nf, g_lastTexBase);
+                for (uint32_t k=0;k<nf;k++) fprintf(stderr, " %.2f", rdf(k*4));
+                fprintf(stderr, "\n   hex:");
+                for (uint32_t k=0;k<nf;k++) fprintf(stderr, " %08X", GLD32(s+k*4));
+                fprintf(stderr, "\n");
+            }
         }
     }
     __imp__sub_8242BF10(ctx, base);
