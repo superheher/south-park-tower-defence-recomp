@@ -5,6 +5,7 @@
 #include "ppc_recomp_shared.h"
 #include "kernel.h"
 #include "rex_render.h"   // minimal Vulkan renderer (VdSwap present), active under REX_RENDER=1
+#include "rex_texture.h"  // Xenos tiled-texture decode (GPU-RESOURCE-BUILD-PLAN piece 2 / cont.25 R0)
 #include <xex.h>     // getOptHeaderPtr, XEX_HEADER_*
 #include <cstdint>
 #include <cstdio>
@@ -718,6 +719,9 @@ uint32_t SetupEnvironment(const uint8_t* xexFile, uint32_t stackBase, uint32_t s
         "rawAddr=0x%X rawSize=0x%X dyn=0x%X)\n", P, T, K, kTlsAddr, tlsSlots, tlsDataSize, tlsRawAddr,
         tlsRawSize, tlsDynamic);
     StartTimestampPump();   // advance KeTimeStampBundle->TickCount so GetTickCount()-timed waits expire
+    // GPU-RESOURCE-BUILD-PLAN piece 2: verify the Xenos texture decoder (tiler round-trip + BC1 vector +
+    // rat.dds 8888 -> /tmp/rat_decoded.ppm). Gated, default-off; no effect on the boot path.
+    if (getenv("REX_TEXSELFTEST")) rex_tex::SelfTest();
     return K;
 }
 } // namespace kernel
@@ -1359,10 +1363,31 @@ inline void WriteGpuReg(uint32_t index, uint32_t value) {
                 // d1 holds base[31:12]+data_format(5:0), d2 holds (width-1)[12:0]+(height-1)[25:13]. Capture the
                 // FULL constant for POPULATED textures so I can decode them (format+dims+tiled → untile → RGBA).
                 uint32_t d0 = GLD32(0x7FC80000u + (index-1u)*4u), d2 = GLD32(0x7FC80000u + (index+1u)*4u);
-                uint32_t fmt = value & 0x3Fu, w_ = (d2 & 0x1FFFu)+1u, h_ = ((d2>>13)&0x1FFFu)+1u, tiled = (d0>>2)&1u;
-                fprintf(stderr, "[texbind] %s slot %u d1=0x%08X -> texBase=0x%08X (%s) %ux%u fmt=0x%X tiled=%u d0=%08X d2=%08X | DATA nz=%u/64 varied=%u/63 first=%08X %08X\n",
+                uint32_t fmt = value & 0x3Fu, w_ = (d2 & 0x1FFFu)+1u, h_ = ((d2>>13)&0x1FFFu)+1u;
+                // Documented xe_gpu_texture_fetch_t: tiled = dword0 bit31 (NOT bit2 — that's sign_x; the
+                // old (d0>>2)&1 was wrong), endianness = dword1[7:6]. Matches the movie-frame parse below.
+                uint32_t tiled = (d0>>31)&1u, endian = (value>>6)&3u;
+                fprintf(stderr, "[texbind] %s slot %u d1=0x%08X -> texBase=0x%08X (%s) %ux%u fmt=0x%X tiled=%u endian=%u d0=%08X d2=%08X | DATA nz=%u/64 varied=%u/63 first=%08X %08X\n",
                         tl_execsegs ? "SEG " : "RING", (index - 0x4800u) / 6u, value, ga, edram ? "EDRAM-RT" : "texture",
-                        w_, h_, fmt, tiled, d0, d2, nz, vr, GLD32(ga), GLD32(ga+4));
+                        w_, h_, fmt, tiled, endian, d0, d2, nz, vr, GLD32(ga), GLD32(ga+4));
+                // REX_TEXDECODE: when a POPULATED texture binds, run the new decoder (untile + format-convert)
+                // and dump a PPM — the real-data proof of GPU-RESOURCE-BUILD-PLAN piece 2. Capped + de-duped
+                // (the outer `seen` set already dedups by reg+base). Default-off; no effect on the boot path.
+                static const bool s_texdecode = getenv("REX_TEXDECODE") != nullptr;
+                if (s_texdecode && !edram && nz >= 8 && rex_tex::BytesPerBlock(fmt) != 0) {
+                    static std::atomic<int> s_n{0};
+                    int n = s_n.fetch_add(1);
+                    if (n < 16) {
+                        rex_tex::Desc d{}; d.guestBase = ga; d.format = fmt; d.width = w_; d.height = h_;
+                        d.tiled = tiled; d.endian = endian; d.pitchTexels = 0;
+                        std::vector<uint8_t> rgba;
+                        if (rex_tex::DecodeGuestToRGBA(d, rgba) && !rgba.empty()) {
+                            char path[96]; snprintf(path, sizeof path, "/tmp/texdec_%02d_%08X_%ux%u_f%02X.ppm", n, ga, w_, h_, fmt);
+                            rex_tex::WriteRGBAasPPM(path, rgba.data(), w_, h_);
+                            fprintf(stderr, "[texdecode] wrote %s (tiled=%u endian=%u)\n", path, tiled, endian);
+                        }
+                    }
+                }
             }
         }
     }

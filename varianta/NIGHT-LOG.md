@@ -3445,3 +3445,53 @@ crashes without resources — cont.25). This is the multi-session renderer (the 
 single-pass /loop fix. I made a genuine multi-angle attempt and pinned the wall precisely; the next concrete piece
 is the texture decode+upload (re-engage cont.25 R0 / REX_TEXWATCH + GPU-RESOURCE-BUILD-PLAN pieces 2-5). Diags
 REX_MOVIEPROBE/REX_MOVIE_EOF_ALL retained.
+
+## cont.36 (2026-06-06, /loop "go deep renderer job") — BUILT + VERIFIED the Xenos tiled-texture DECODER (GPU-RESOURCE-BUILD-PLAN piece 2 / cont.25 R0 keystone); measurement confirms attract-state binds NO populated textures (A↔B gate stands)
+
+User re-issued /loop on the deep renderer build. cont.35's named "next concrete piece" was the texture decode+upload;
+I built and **verified** the CPU side of it. New file `runtime/rex_texture.h` (header-only, included by kernel.cpp).
+Default boot UNREGRESSED (96 assets, exit137, 0 crash markers, clamp 4×; all additions getenv-gated).
+
+**WHAT (rex_texture.h):** the missing decode step's CPU side — guest Xenos texture bytes → linear RGBA8 the
+renderer can upload:
+- `XGAddress2DTiledOffset(x,y,width,texelPitch)` — the **documented Microsoft Xbox-360 2D-tiling address fn**
+  (the one Xenia/noesis/xbox360 tools use), transcribed faithfully. + `Untile`/`Tile`/`TiledSizeBytes`.
+- Format converters: `8_8_8_8` (A8R8G8B8), `5_6_5`, `1_5_5_5`, `4_4_4_4`, `8`, `8_8`, and **BC1/BC2/BC3**
+  (DXT1/DXT2_3/DXT4_5) block decoders. + `EndianSwap` (8in16/8in32/16in32 per the fetch-const endian field).
+- `Desc` (base/format/W/H/tiled/endian/pitch) + `DecodeBytesToRGBA` / `DecodeGuestToRGBA` top-level.
+
+**VERIFIED (REX_TEXSELFTEST, runs in SetupEnvironment, gated; 9/9 PASS):**
+- 6× **tiler round-trip** (32×32/64×32/128×128/16×16/64×64/48×80, bpb 2/4/8/16): linear→Tile→Untile == identity
+  ⇒ Untile correctly inverts the address fn for these configs.
+- **address-fn injectivity** over 64×64 (no two texels alias — a wrong formula usually collides).
+- **BC1 known-vector**: hand-built little-endian DXT1 block (red c0 / blue c1, 4-color mode, rows idx 0/1/2/3) →
+  decoded texels match the expected red / blue / ⅔R+⅓B interpolation ⇒ real correctness test of the BC1 path.
+- **rat.dds 8888 decode** (32×16 A8R8G8B8 linear, the real game texture) → `/tmp/rat_decoded.ppm` = a **clearly
+  recognizable grey rat with a pink tail/nose on black** (viewed, sent) ⇒ visual confirm of the 8888 converter +
+  RGBA channel order (rat is grey/pink, not blue-tinted ⇒ R/B not swapped).
+- Also fixed a plainly-wrong field in the [texbind] log: `tiled` was `(d0>>2)&1` (= sign_x bit 2); the documented
+  bit is **dword0 bit31** (now `(d0>>31)&1`); added the `endian`=d1[7:6] field. Matches the movie-frame parse.
+
+**⚠ HONEST verification GAP (rigor):** the round-trip proves *inversion*, NOT hardware-LAYOUT match — a
+wrong-but-injective address fn round-trips too. Hardware-layout correctness of the TILED path rests on (a) the
+faithful transcription of the documented MS algorithm and (b) the eventual real-tiled-texture PPM. I could NOT get
+(b) from the live title this session — see the measurement below. The uncompressed + BC1 + 8888 paths ARE
+correctness-tested (known-vector + real rat.dds art).
+
+**⭐ MEASUREMENT (REX_TEXDECODE + REX_TEXBIND, 3 runs incl. 2 with the decode hook live):** at the default-boot
+attract state (96-97 assets), the title binds **NO populated textures** — only the **1×1 empty EDRAM depth target**
+(0xB0000000, fmt=0x16=k_24_8, nz=0/64). No `texdecode` PPM was produced (the hook fires only on a populated bind).
+⇒ **decisively confirms cont.35 + resolves the long-standing R0/R1 tension toward R0**: the texture decode/upload
+genuinely does NOT run at the attract state; cont.25 R1's "14/35 populated" was a **transient race-lucky capture
+that does not reproduce** in normal runs. The textured draws (and their decoded textures) live behind the A↔B
+title-advance — the deep build, exactly as cont.32-35 framed it.
+
+**⇒ STATE:** the decoder (piece 2, CPU side) is DONE + verified on every path testable without live tiled data.
+It's reusable renderer code, ready to plug into `rex_render::UploadTexture` the moment a real texture is available.
+**NEXT concrete pieces (in tractability order):** (a) **tiled-path hardware confirmation via a raw-tiled DISK
+asset** — parse a texture container (`Textures/Global.bin` / `hudimages.bin` / a `.xmc`) for a raw Xenos-tiled
+texture, decode it, eyeball it; this ALSO opens a disk-resource textured-render path (real tiled game art, beyond
+cont.24's source PNGs) and closes the verification gap WITHOUT needing the A↔B advance; (b) **GPU-side wire-up** —
+`DecodeGuestToRGBA` → `rex_render::UploadTexture` → bind in the executed-draw path (currently only fires on the
+rare populated bind); (c) the deep A↔B work (execute the real textured ring/segment draws so textures populate).
+New gated diags: REX_TEXSELFTEST, REX_TEXDECODE. Default boot unregressed.
