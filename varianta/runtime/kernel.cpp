@@ -2684,6 +2684,24 @@ PPC_FUNC(sub_824253C8) {
     __imp__sub_824253C8(ctx, base);
 }
 
+// cont.33 (REX_GATEDIAG): the gate AFTER Level 1 loads (reached with REX_SKIPINTRO+REX_HANDLERGUARD) =
+// sub_82292CE0 (a frontend teardown/update at caller 0x8215079C). It reads a subsystem object *(0x827FD56C) and
+// calls its vtable[1]; the INDIRECT-NULL shows that target is 0. Dump obj/vtable/vtable[1] to classify the gate:
+// obj==0 => the subsystem was NEVER created (uninit); obj!=0,vt==0 => object exists but vtable null; the vtable
+// addr (if non-zero) identifies the class (=> is it GPU/render = deep build, or a CPU subsystem = maybe tractable).
+extern "C" PPC_FUNC(__imp__sub_82292CE0);
+PPC_FUNC(sub_82292CE0) {
+    static const bool diag = getenv("REX_GATEDIAG") != nullptr;
+    if (diag) { static std::atomic<int> g{0}; if (g.fetch_add(1) < 3) {
+        uint32_t obj = GLD32(0x827FD56Cu);
+        uint32_t vt  = obj ? GLD32(obj) : 0;
+        uint32_t m1  = vt  ? GLD32(vt + 4) : 0;
+        fprintf(stderr, "[gatediag] sub_82292CE0: obj *(0x827FD56C)=0x%08X vtable=0x%08X vtable[1]=0x%08X struct+824=0x%08X\n",
+                obj, vt, m1, GLD32(0x827FD568u + 824));
+    }}
+    __imp__sub_82292CE0(ctx, base);
+}
+
 // Diag (gated): confirm the title's own completion poster fires after a forced EOS (sub_82425BF8 EOF branch).
 extern "C" PPC_FUNC(__imp__sub_8222A9F8);
 PPC_FUNC(sub_8222A9F8)

@@ -3350,3 +3350,34 @@ level's render program) — both lower /loop-fit, mirroring the cont.24/25 infle
 deliverables: cont.30 (advance default-on, commit 4870841) + cont.31 (loads Level 1, commit b15d218). NEXT
 (cont.33): RE sub_82292CE0's null object (which subsystem at 0x8281D56C, why uninit) — or the user steers toward
 the renderer build.
+
+## cont.33 (2026-06-06, /loop autonomous) — the post-Level-1 gate is a NULL (uncreated) gameplay subsystem, NOT a sentinel guard ⇒ confirms the deep-build inflection
+
+RE'd the next gate after Level 1 loads. New gated diag REX_GATEDIAG (kept; default boot untouched). No commit of
+a fix — the finding is that this gate is NOT a tractable guard.
+
+**Corrected address + structure.** The base register is `lis -32128` = 0x82800000 (earlier note's 0x82820000 was
+an arithmetic slip); subsystem struct base r31 = 0x82800000-10904 = **0x827FD568**, the object pointer = *(0x827FD56C).
+sub_82292CE0 (caller 0x8215079C, the frontend range) reads `r3=*(0x827FD56C)`, calls `(*r3)->vtable[1]()`, then
+loops over 4 sub-entries (r31+860, stride 36) doing cleanup (sub_8244E598/sub_82582F60/sub_82448B50).
+
+**⭐ MEASURED (REX_GATEDIAG, with SKIPINTRO+HANDLERGUARD): the object is NULL — `*(0x827FD56C)=0x00000000`,
+vtable=0, vtable[1]=0, struct+824=0** (the whole subsystem struct is zeroed). So this gate is NOT a -1 sentinel
+(cont.30/31 class) — it is a **gameplay/transition subsystem that was NEVER CREATED**. The title loads Level 1
+DATA (cont.31) but the subsystem that would PROCESS it isn't initialized.
+
+**⇒ NOT a tractable guard.** The generic INDIRECT-NULL guard ALREADY tolerates the null vtable call (skips it),
+yet the title still doesn't progress (stalls after Level 1, KeGetCurrentProcessType-spins) — so guarding harder
+won't help; the fix requires the subsystem to be CREATED (or whatever gates its creation to run). Finding the
+creation site statically is noisy (the global's offset -10904 appears at 100s of sites with different lis bases).
+This is the deeper transition/subsystem-init work — consistent with cont.21's A↔B coupling and cont.32's
+"renderer is the independent wall". **⇒ CONFIRMS the cont.32 inflection: the tractable sentinel-guard wins
+(cont.30/31, which got the title to LOAD Level 1) are EXHAUSTED; the remaining path is the deep build (create the
+gameplay subsystem / fix the frontend→gameplay transition / the renderer — all multi-session, poor /loop fit).**
+
+**NEXT (cont.34, bounded):** characterize WHAT the post-Level-1 stall waits for — is the frontend update spinning
+on (a) the Level1Intro.wmv cutscene (loaded #160; variant A has no VC-1 decoder, REX_MOVIE_EOF forces EOS — does
+the Level-1 intro honor it?), (b) the uncreated gameplay subsystem, or (c) a render/GPU result (A↔B)? One diag
+run to sample the main-thread state distinguishes them. If it's the deep build (likely), consolidate and hand off
+for a focused renderer/transition session. Session deliverables stand: cont.30 (advance default-on) + cont.31
+(loads Level 1). Gated diag REX_GATEDIAG retained for cont.34.
