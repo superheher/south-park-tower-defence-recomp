@@ -4197,3 +4197,30 @@ GEOMETRY wall (cont.59: the executed segment is a placeholder with no valid vert
 pitch / height) for cleaner cells; (b) the real composition = the geometry (cont.34): find the real menu draws'
 vertex source (dynamic VBs 0xA022FFF0+, cont.47) to place the textures, or break the cont.34 A↔B so the real frame
 (geometry+textures) executes. New: rex_render::BlitMenuCell + LoadMenuSheetLive + REX_MENULIVE.
+
+## cont.61 (2026-06-06, /loop) — geometry source still blocked (cont.47 VB empty); the logo/font SCANLINE artifact is a per-texture PITCH mismatch (pitch=512 makes the logo readable). Texture-polish + geometry-block confirmation.
+
+Two tracks from cont.60:
+- (b) GEOMETRY: checked the cont.47 dynamic VB 0xA022FFF0 at the textured draws (gdb, vbcheck.gdb) — it's **all
+  zeros** at SetTexture time. So 0xA022FFF0 is NOT the geometry source for the logo/cityscape draws (it's the text
+  renderer's VB, empty here). The geometry source for the textured menu draws remains unfindable (the cont.22-23/34/59
+  wall stands; the executed segment is a placeholder, the live VB guess is empty).
+- (a) TEXTURE POLISH: the cont.58/60 logo/font scanline artifact is a ROW-PITCH mismatch. Experiment (REX_PITCHTEST,
+  re-decode at pitch ∈ {2w, w/2, 512, 1024}): the logo A2D96000 at **pitch=512** is READABLE yellow text (vs heavy
+  scanlines at pitch=256=width). So the real row pitch ≠ width for some textures, and it VARIES per texture: the
+  cityscape A2F25000 is clean at pitch=256, the logo A2D96000 needs ~512. ⇒ a global pitch won't work; the per-texture
+  pitch must come from the fetch-constant d0 field — NOT yet cracked (d0: A2D96000=0x05004802 [needs 512], A2F25000=
+  0x03004802 [256 clean], A2E12000=0x07004802, A2FD1000=0x00804802; bits[26:24]=5/3/7/0 don't map cleanly to 512/256
+  yet). Diagnostic only; REX_MENULIVE unchanged (left at pitch=width). Default boot UNREGRESSED.
+
+**⇒ Honest session state (cont.52-61):** "render the real menu FROM WORKING BUFFERS" is delivered at the TEXTURE
+level — the menu's per-draw textures ARE the 0xA2 working buffers, decoded + bound + rendered LIVE in variant A's
+Vulkan (cont.60, image sent); cont.61 shows they can be made cleaner (per-texture pitch). The COMPOSED menu (real
+per-draw positions) is the remaining wall = the cont.34/22-23 GEOMETRY (the textured draws' vertex source is
+unfindable — executed segment is a placeholder, the live VBs don't hold it). That's the deep multi-week renderer
+build (cont.21-49 territory); /loop iterations narrow it but haven't cracked it.
+
+**⇒ NEXT (cont.62):** crack the d0 pitch field (decode each menu texture at the d0-derived pitch → clean cells →
+cleaner live render); OR the geometry (the real composition): trace the textured draws' ACTUAL vertex source (hook
+sub_821F8E60 directly if it's directly-called, to read the renderer's VB pointer + the fill), or apply the prod-oracle
+to the cont.34 A↔B (why the real frame with geometry isn't executed). New diag: REX_PITCHTEST; tool vbcheck.gdb.

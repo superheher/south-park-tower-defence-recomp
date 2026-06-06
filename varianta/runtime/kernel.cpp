@@ -1451,6 +1451,18 @@ inline void WriteGpuReg(uint32_t index, uint32_t value) {
                             // render-side contact sheet for REX_MENULIVE (the working-buffer -> live render proof).
                             if (ga >= 0xA2000000u && ga < 0xA3000000u)
                                 rex_render::BlitMenuCell(rgba.data(), (int)w_, (int)h_, ga);
+                            // cont.61: scanline experiment — some menu textures (logo/font) decode with horizontal
+                            // scanlines at pitch=width (cont.58/60); the real row pitch likely differs. Re-decode at
+                            // a few candidate pitches/widths under REX_PITCHTEST to find the clean one.
+                            if (ga >= 0xA2000000u && ga < 0xA3000000u && getenv("REX_PITCHTEST")) {
+                                for (uint32_t pw : { w_*2u, w_/2u ? w_/2u : w_, 512u, 1024u }) {
+                                    rex_tex::Desc dp = d; dp.pitchTexels = pw; std::vector<uint8_t> r2;
+                                    if (rex_tex::DecodeGuestToRGBA(dp, r2) && !r2.empty()) {
+                                        char p2[110]; snprintf(p2, sizeof p2, "/tmp/pt_%08X_pitch%u_%ux%u.ppm", ga, pw, w_, h_);
+                                        rex_tex::WriteRGBAasPPM(p2, r2.data(), w_, h_);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
