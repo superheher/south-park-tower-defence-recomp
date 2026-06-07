@@ -1863,6 +1863,28 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                     uint32_t d1 = GLD32(0x7FC80000u + (0x4800u + s*2u + 1u)*4u);
                     gv = 0xA0000000u | ((d0 & 0xFFFFFFFCu) & 0x1FFFFFFFu); vbBytes = ((d1 >> 2) & 0xFFFFFFu) * 4u; }   // cont.111: take the LAST type-3 slot (= vf95; the first is a stale slot)
                 if (gv) {
+                    // cont.123: discover the FONT ATLAS address dynamically. cont.122 proved the cont.115 hardcode
+                    // 0xA337D000 is run-specific (empty this run) — the glyph cache is dynamically allocated. The
+                    // prim-13 text draw BINDS the atlas as a texture fetch const (cont.115: type-2, 256x256, fmt=2
+                    // FMT_8; 6 dwords/slot at 0x4800; base = d1[31:12]). Scan for it + publish its phys offset to the
+                    // renderer (LoadFontAtlasOnce uploads from g_base + this). Only the text draws bind the font atlas.
+                    if (prim == 13) {
+                        for (uint32_t sl = 0; sl < 32; sl++) {
+                            uint32_t fb = 0x7FC80000u + (0x4800u + sl*6u)*4u;
+                            uint32_t td0 = GLD32(fb), td1 = GLD32(fb+4), td2 = GLD32(fb+8);
+                            if ((td0 & 3u) != 2u) continue;                                  // type-2 = texture
+                            uint32_t tbase = ((td1 >> 12) & 0xFFFFFu) << 12;
+                            if (!tbase) continue;
+                            uint32_t tw = (td2 & 0x1FFFu)+1, th = ((td2 >> 13) & 0x1FFFu)+1, tfmt = td1 & 0x3Fu;
+                            if (tw == 256u && th == 256u && tfmt == 2u) {                    // the 256x256 FMT_8 font atlas
+                                rex_render::SetFontAtlasAddr(tbase & 0x1FFFFFFFu);           // publish the PHYS offset
+                                static std::atomic<uint32_t> s_last{0}; uint32_t po = tbase & 0x1FFFFFFFu;
+                                if (g_ktrace && s_last.exchange(po) != po)
+                                    fprintf(stderr, "[fontaddr] prim13 bound font atlas: phys=0x%X (gpu 0xA%07X) %ux%u fmt=%u\n", po, po, tw, th, tfmt);
+                                break;
+                            }
+                        }
+                    }
                     uint32_t stride = (numInd && vbBytes >= numInd*8u) ? vbBytes / numInd : 8u;   // bytes/vertex
                     static thread_local float vb[512*2];
                     uint32_t nr = numInd < 512 ? numInd : 512;

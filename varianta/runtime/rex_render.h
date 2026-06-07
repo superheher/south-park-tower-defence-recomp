@@ -36,4 +36,10 @@ void SubmitTexturedGeometry(const float* posUV, int vertCount);
 // The render thread (PresentOnce) uploads + draws the sheet, proving the working-buffer texture -> live
 // Vulkan render path on-screen. Gated behind REX_MENULIVE (no-op otherwise).
 void BlitMenuCell(const uint8_t* rgba, int w, int h, uint32_t base);
+
+// cont.123: the font glyph atlas (256x256 FMT_8) is a DYNAMIC cache whose guest address VARIES per run
+// (cont.122: the cont.115 hardcode 0xA337D000 was empty this run). The kernel carve reads the prim-13 text
+// draw's bound texture fetch const (the live atlas base) and publishes its PHYS offset here; LoadFontAtlasOnce
+// uploads from g_base + this offset instead of the stale hardcode. physOffset = base & 0x1FFFFFFF.
+void SetFontAtlasAddr(uint32_t physOffset);
 }

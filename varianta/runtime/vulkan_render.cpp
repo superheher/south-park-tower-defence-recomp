@@ -780,9 +780,11 @@ bool LoadBackgroundOnce() {
 // cont.117: load the menu FONT ATLAS (cont.115/116: 256x256 FMT_8 8bpp glyph alpha mask @ GPU 0xA337D000,
 // phys 0x337D000) from guest memory into g_tex — the textured pipeline samples it for the menu text glyphs.
 // 8bpp -> RGBA: white glyph, alpha = the 8-bit coverage (so the text color tints + the blend masks the letter).
+std::atomic<uint32_t> g_fontAtlasPhys{0x337D000u};   // cont.123: live atlas phys offset published by the kernel carve (default = the cont.115 hardcode). SetFontAtlasAddr (the external API) is defined below, OUTSIDE this anonymous namespace.
+
 bool LoadFontAtlasOnce() {
     if (g_bgLoaded || !g_base) return g_bgLoaded;
-    const uint8_t* atlas = g_base + 0x337D000u;          // phys of the GPU aperture addr 0xA337D000
+    const uint8_t* atlas = g_base + g_fontAtlasPhys.load();   // cont.123: the LIVE atlas address (the cont.115 0x337D000 was run-specific)
     // cont.122 FIX: the atlas at 0xA337D000 is a DYNAMIC glyph cache (cont.116) the title populates over time.
     // cont.121 PROVED uploading at the first text submit captures an EMPTY (0/65536 non-zero) atlas => the text
     // samples a transparent texture => invisible. Defer the (single) upload until the cache has populated: require
@@ -790,7 +792,7 @@ bool LoadFontAtlasOnce() {
     // forever. UploadTexture is NOT re-entrant (it leaks the old image/descriptor each call), so upload exactly once.
     uint32_t nz = 0;
     for (uint32_t i = 0; i < 256u * 256u; i++) if (atlas[i]) nz++;
-    { static int s_dbg = 0; if ((s_dbg++ % 120) == 0) fprintf(stderr, "[fontwait] check #%d: atlas nz=%u/65536 @ g_base+0x337D000\n", s_dbg, nz); }   // cont.122: confirm whether 0x337D000 ever populates this run
+    { static int s_dbg = 0; if ((s_dbg++ % 120) == 0) fprintf(stderr, "[fontwait] check #%d: atlas nz=%u/65536 @ g_base+0x%X\n", s_dbg, nz, g_fontAtlasPhys.load()); }   // cont.122/123: confirm the LIVE atlas populates
     static uint32_t s_lastNz = 0; static int s_stable = 0, s_waited = 0;
     s_waited++;
     if (nz == s_lastNz) s_stable++; else { s_stable = 0; s_lastNz = nz; }
@@ -1241,6 +1243,11 @@ void SubmitTexturedGeometry(const float* posUV, int vertCount) {
     static int s_logged = 0;
     if (s_logged++ < 3) fprintf(stderr, "[render] disk-resource: textured geometry submitted (%d verts)\n", vertCount);
 }
+
+// cont.123: external API — the kernel carve publishes the LIVE font-atlas phys offset here (see rex_render.h).
+// Defined OUTSIDE the anonymous namespace above so it has EXTERNAL linkage; g_fontAtlasPhys (in that anon
+// namespace) is still reachable by unqualified name from the enclosing rex_render namespace.
+void SetFontAtlasAddr(uint32_t physOffset) { if (physOffset) g_fontAtlasPhys.store(physOffset); }
 
 // cont.60: composite a live-decoded per-draw menu texture into the contact sheet (see rex_render.h).
 void BlitMenuCell(const uint8_t* rgba, int w, int h, uint32_t base) {
