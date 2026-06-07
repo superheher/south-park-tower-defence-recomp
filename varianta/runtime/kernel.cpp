@@ -1951,6 +1951,8 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                                     float t[24] = {   // 2 tris (0,1,2)+(0,2,3): pos.xy(clip) + uv.xy
                                         tcx(vb[i*2]),tcy(vb[i*2+1]),u[0],w[0], tcx(vb[(i+1)*2]),tcy(vb[(i+1)*2+1]),u[1],w[1], tcx(vb[(i+2)*2]),tcy(vb[(i+2)*2+1]),u[2],w[2],
                                         tcx(vb[i*2]),tcy(vb[i*2+1]),u[0],w[0], tcx(vb[(i+2)*2]),tcy(vb[(i+2)*2+1]),u[2],w[2], tcx(vb[(i+3)*2]),tcy(vb[(i+3)*2+1]),u[3],w[3] };
+                                    if (i == 0) { static std::atomic<bool> cd{false}; bool e=false; if (cd.compare_exchange_strong(e,true))   // cont.131: the ACTUAL clip pos of glyph0 (post-transform) — resolve the render-vs-carve layout discrepancy
+                                        fprintf(stderr, "[clippos] glyph0 clip TL(%.3f,%.3f) BR(%.3f,%.3f) uv(%.3f,%.3f) | textcenter=%d (authoring p0=%.1f,%.1f)\n", t[0],t[1], t[8],t[9], u[0],w[0], (int)s_textcenter, vb[0],vb[1]); }
                                     if (tl_esTexVerts.size() < 120000) tl_esTexVerts.insert(tl_esTexVerts.end(), t, t+24); }
                             }
                         } else { for (uint32_t i = 0; i + 4 <= nr; i += 4) {     // quad-list -> 2 tris (flat color)

@@ -1254,7 +1254,12 @@ void SubmitTexturedGeometry(const float* posUV, int vertCount) {
     g_texGeom.assign(posUV, posUV + (size_t)vertCount * 4);   // pos.xy + uv.xy per vertex
     g_texGeomVerts.store(vertCount);
     static int s_logged = 0;
-    if (s_logged++ < 3) fprintf(stderr, "[render] disk-resource: textured geometry submitted (%d verts)\n", vertCount);
+    if (s_logged++ < 3) {   // cont.131: dump the clip-pos bbox of what the render actually draws (resolve the layout discrepancy)
+        float mnx=1e9f,mxx=-1e9f,mny=1e9f,mxy=-1e9f;
+        for (int v = 0; v < vertCount; v++) { float x=posUV[v*4], y=posUV[v*4+1]; if(x<mnx)mnx=x; if(x>mxx)mxx=x; if(y<mny)mny=y; if(y>mxy)mxy=y; }
+        fprintf(stderr, "[render] disk-resource: textured geometry submitted (%d verts) clip-bbox=(%.3f,%.3f)-(%.3f,%.3f) v0=(%.3f,%.3f uv %.3f,%.3f)\n",
+                vertCount, mnx,mny, mxx,mxy, posUV[0],posUV[1],posUV[2],posUV[3]);
+    }
 }
 
 // cont.123: external API — the kernel carve publishes the LIVE font-atlas phys offset here (see rex_render.h).
