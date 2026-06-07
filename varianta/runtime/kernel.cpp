@@ -3646,18 +3646,26 @@ PPC_FUNC(sub_821C6E58)
             fprintf(stderr, "[drawscan] #%d p5(strip)=%d p13(quad)=%d p8(rect)=%d p4(list)=%d other=%d | sprites @[0x%X..0x%X] firstInit=0x%X\n",
                     (int)dsn.load(), p5, p13, p8, p4, pother, firstSprite, lastSprite, firstSpriteInit);
             if (firstSprite) {
-                // cont.105: dump the 20 dwords bracketing the first sprite draw (is it a standalone IB? what type-3 packets bracket it?)
-                char buf[256]; int bp = snprintf(buf, sizeof buf, "[drawscan]   bracket 0x%X:", firstSprite);
-                for (int i = -6; i < 14 && bp < 230; i++) bp += snprintf(buf+bp, sizeof(buf)-bp, " %08X", GLD32(firstSprite + i*4));
+                // cont.107: widen the bracket dump (find the buffer's start/header) + CONTAINS-search + raw-pointer search.
+                char buf[512]; int bp = snprintf(buf, sizeof buf, "[drawscan]   bracket 0x%X[-16..+16]:", firstSprite);
+                for (int i = -16; i <= 16 && bp < 470; i++) bp += snprintf(buf+bp, sizeof(buf)-bp, " %08X", GLD32(firstSprite + i*4));
                 fprintf(stderr, "%s\n", buf);
-                // scan for an INDIRECT_BUFFER (op 0x3F) whose target lands in the sprite region — the link variant A may not be following
-                uint32_t lo = (firstSprite & ~0xFFFu) - 0x4000u, hi = (lastSprite & ~0xFFFu) + 0x4000u; int ibhit = 0;
-                for (uint32_t a = 0xA0000000u; a + 12 <= 0xA0600000u && ibhit < 8; a += 4) {
+                // CONTAINS-search: which IB's range [target, target+len*4) actually CONTAINS the sprite (not just near)?
+                uint32_t phys = firstSprite & 0x1FFFFFFFu; int ibhit = 0, ptrhit = 0;
+                for (uint32_t a = 0xA0000000u; a + 12 <= 0xA0600000u && ibhit < 12; a += 4) {
                     uint32_t h = GLD32(a); if ((h >> 30) != 3u || ((h >> 8) & 0x7Fu) != 0x3Fu) continue;
-                    uint32_t tgt = GLD32(a + 4), tg = 0xA0000000u | (tgt & 0x1FFFFFFFu), len = GLD32(a + 8);
-                    if (tg >= lo && tg <= hi) { fprintf(stderr, "[drawscan]   IB@0x%X -> 0x%X len=%u (targets sprite region)\n", a, tg, len & 0xFFFFFu); ibhit++; }
+                    uint32_t tg = 0xA0000000u | (GLD32(a + 4) & 0x1FFFFFFFu), len = GLD32(a + 8) & 0xFFFFFu;
+                    if (len && len < 0x8000u && tg <= firstSprite && firstSprite < tg + len*4u)
+                        { fprintf(stderr, "[drawscan]   CONTAINS-IB@0x%X -> [0x%X..0x%X) len=%u\n", a, tg, tg + len*4u, len); ibhit++; }
                 }
-                if (!ibhit) fprintf(stderr, "[drawscan]   NO INDIRECT_BUFFER targets the sprite region [0x%X..0x%X]\n", lo, hi);
+                if (!ibhit) fprintf(stderr, "[drawscan]   NO IB range contains the sprite 0x%X (phys 0x%X) — non-IB submission\n", firstSprite, phys);
+                // raw-pointer search: any dword anywhere == the sprite addr / its phys — a reference in a struct or a non-standard IB.
+                for (uint32_t a = 0xA0000000u; a + 4 <= 0xA0600000u && ptrhit < 8; a += 4) {
+                    if (a >= firstSprite - 0x80u && a <= firstSprite + 0x80u) continue;   // skip self-region
+                    uint32_t v = GLD32(a);
+                    if (v == firstSprite || v == phys) { fprintf(stderr, "[drawscan]   PTR@0x%X = 0x%X (-> sprite)\n", a, v); ptrhit++; }
+                }
+                if (!ptrhit) fprintf(stderr, "[drawscan]   NO raw pointer to 0x%X/phys 0x%X found\n", firstSprite, phys);
             }
         }}
         // cont.106 (THE FIX): the sprite/text draws (prim 5/13) are linked into the MAIN RING (0xA0002000) via
