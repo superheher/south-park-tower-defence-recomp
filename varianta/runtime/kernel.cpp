@@ -3700,6 +3700,22 @@ PPC_FUNC(__imp__VdSwap) {
     // at their real screen rects since the last swap) and clear it for the next frame. Gated behind REX_FCOMPOSE.
     static const bool s_fcompose = getenv("REX_FCOMPOSE") != nullptr;
     if (s_fcompose) SnapshotFrameOnSwap();
+    // cont.75: one-shot decode of the MICROSOFT GAME STUDIOS platform splash (0xA2FF9000, 1280x720 8888 linear; the
+    // intro-logo working buffer, cont.38/44) — it opens the real boot sequence but is shown via a path that never
+    // binds it through SetTexture, so the texdump/compose paths miss it. Decode it directly to complete the sequence.
+    static const bool s_msdump = getenv("REX_MSSPLASH") != nullptr;
+    if (s_msdump) { static std::atomic<int> done{0};
+        for (uint32_t e = 0; e <= 2 && done.load() < 1; e += 2) {     // try endian 0 then 2
+            rex_tex::Desc d{}; d.guestBase = 0xA2FF9000u; d.format = 6; d.width = 1280; d.height = 720;
+            d.tiled = 0; d.endian = e; d.pitchTexels = 0;
+            std::vector<uint8_t> r; uint32_t nz = 0; for (int i=0;i<256;i++) if (GLD32(0xA2FF9000u + i*4)) nz++;
+            if (nz >= 32 && rex_tex::DecodeGuestToRGBA(d, r) && !r.empty() && done.fetch_add(1) == 0) {
+                char p[48]; snprintf(p, sizeof p, "/tmp/ms_splash_e%u.ppm", e);
+                rex_tex::WriteRGBAasPPM(p, r.data(), 1280, 720);
+                fprintf(stderr, "[mssplash] dumped %s (nz=%u/256 at swap %u)\n", p, nz, n);
+            }
+        }
+    }
     // r4 = D3D9 texture fetch constant (6 dwords, BE) describing the front buffer. Parse it (xenos
     // xe_gpu_texture_fetch_t): dword_0 bit31=tiled, bits22..30=pitch(>>5); dword_1 bits0..5=format,
     // bits6..7=endian, bits12..31=base_address(>>12, VIRTUAL); dword_2 = (w-1)|((h-1)<<13).

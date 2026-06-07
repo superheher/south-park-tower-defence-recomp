@@ -4579,3 +4579,12 @@ glyph-atlas SHEET itself, a separate case.) Refreshed the deliverable `/tmp/SP_n
 
 **⇒ NEXT (cont.75+):** the menu text now renders the real navigation options readable; the live composited menu remains
 the cont.34 A↔B wall (cont.73). Continue light refinement / consolidation at a slow cadence. New: DecodeByBase fresh re-decode.
+
+## cont.75 (2026-06-07, /loop "go deep renderer job", autonomous, refinement) — decode the Microsoft Game Studios splash (0xA2FF9000) → the COMPLETE real boot sequence
+
+The platform splash (Microsoft Game Studios, 1280×720 8888) opens the real boot sequence but is shown via a path that
+never binds it through SetTexture (so the texdump/compose paths missed it). New `REX_MSSPLASH` decodes 0xA2FF9000
+directly (the stable intro-logo working buffer, cont.38/44) → `/tmp/ms_splash_e0.ppm` = the Microsoft Game Studios logo
+on its blue gradient, clean (endian 0, nz=256/256 at swap 1). **The complete real boot sequence now renders: Microsoft
+Game Studios → SP DIGITAL STUDIOS → Comedy Central → doublesix.** Refreshed the deliverable `/tmp/SP_night_results.png`.
+Default boot UNREGRESSED (gated REX_MSSPLASH; 130k lines, 0 real crashes). New: `REX_MSSPLASH`, `[mssplash]`.
