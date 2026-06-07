@@ -1413,6 +1413,13 @@ thread_local std::vector<float> tl_esVerts;
 // backdrop renders as real art instead of debug-colored rects. Same per-frame lifetime as tl_esVerts.
 thread_local std::vector<float> tl_esTexVerts;
 thread_local uint32_t tl_s1cursor = 0;   // REX_SPRITECARVE: byte cursor into the slot-1 vert pool, per frame
+// cont.120: per-frame DEDUP of re-rendered text blocks. cont.119 proved the directory exec replays the SAME
+// 63-glyph 2-line block ~20x/frame (all carved copies identical), which overlaps into mush. tl_textSeen holds a
+// content key (FNV hash over sampled verts + numInd) per unique block carved THIS frame; a draw whose key is
+// already present is skipped. Distinct text items (different content) hash differently and are all kept. Reset
+// where tl_esTexVerts is cleared (the EXECSEGS per-frame boundary). tl_textTotal counts all text draws seen.
+thread_local std::vector<uint64_t> tl_textSeen;
+thread_local int tl_textTotal = 0;
 // T2b-step-5: the VS microcode loaded by the most-recent IM_LOAD_IMMEDIATE (op 0x2B) during execution — so a
 // DRAW can decode the VS's OWN vfetch (which fetch slot + dword offset it reads). The sprite/text VS's slot
 // 0 is a texture, so their verts come from a different slot/offset that only the vfetch instruction names.
@@ -1900,13 +1907,22 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                     else {   // prim 13 = quad-list (text glyphs)
                         static const bool s_textglyph = getenv("REX_TEXTGLYPH") != nullptr;
                         if (s_textglyph && stride >= 16) {   // cont.117: TEXTURED text — pos.xy->clip + uv.zw (font atlas @0xA337D000)
-                            for (uint32_t i = 0; i + 4 <= nr; i += 4) {
-                                float u[4], w[4]; for (int j = 0; j < 4; j++) {
-                                    uint32_t au=GLD32(gv+(i+j)*stride+8), aw=GLD32(gv+(i+j)*stride+12); memcpy(&u[j],&au,4); memcpy(&w[j],&aw,4); }
-                                float t[24] = {   // 2 tris (0,1,2)+(0,2,3): pos.xy(clip) + uv.xy
-                                    cx(vb[i*2]),cy(vb[i*2+1]),u[0],w[0], cx(vb[(i+1)*2]),cy(vb[(i+1)*2+1]),u[1],w[1], cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]),u[2],w[2],
-                                    cx(vb[i*2]),cy(vb[i*2+1]),u[0],w[0], cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]),u[2],w[2], cx(vb[(i+3)*2]),cy(vb[(i+3)*2+1]),u[3],w[3] };
-                                if (tl_esTexVerts.size() < 120000) tl_esTexVerts.insert(tl_esTexVerts.end(), t, t+24); }
+                            tl_textTotal++;   // cont.120: count every text draw reaching the carve (deduped or not)
+                            uint64_t key = 1469598103934665603ull ^ (uint64_t)numInd;   // cont.120: FNV-1a over sampled verts + numInd = this block's content signature
+                            uint32_t kstep = nr/8 ? nr/8 : 1;
+                            for (uint32_t s = 0; s < nr; s += kstep) { uint32_t bx, by; memcpy(&bx,&vb[s*2],4); memcpy(&by,&vb[s*2+1],4);
+                                key = (key ^ bx) * 1099511628211ull; key = (key ^ by) * 1099511628211ull; }
+                            bool seen = false; for (uint64_t k : tl_textSeen) if (k == key) { seen = true; break; }
+                            if (!seen) {   // cont.120: carve each UNIQUE text block once/frame (skip the ~20x re-rendered duplicates that overlapped into mush)
+                                tl_textSeen.push_back(key);
+                                for (uint32_t i = 0; i + 4 <= nr; i += 4) {
+                                    float u[4], w[4]; for (int j = 0; j < 4; j++) {
+                                        uint32_t au=GLD32(gv+(i+j)*stride+8), aw=GLD32(gv+(i+j)*stride+12); memcpy(&u[j],&au,4); memcpy(&w[j],&aw,4); }
+                                    float t[24] = {   // 2 tris (0,1,2)+(0,2,3): pos.xy(clip) + uv.xy
+                                        cx(vb[i*2]),cy(vb[i*2+1]),u[0],w[0], cx(vb[(i+1)*2]),cy(vb[(i+1)*2+1]),u[1],w[1], cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]),u[2],w[2],
+                                        cx(vb[i*2]),cy(vb[i*2+1]),u[0],w[0], cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]),u[2],w[2], cx(vb[(i+3)*2]),cy(vb[(i+3)*2+1]),u[3],w[3] };
+                                    if (tl_esTexVerts.size() < 120000) tl_esTexVerts.insert(tl_esTexVerts.end(), t, t+24); }
+                            }
                         } else { for (uint32_t i = 0; i + 4 <= nr; i += 4) {     // quad-list -> 2 tris (flat color)
                             float q[12] = { cx(vb[i*2]),cy(vb[i*2+1]), cx(vb[(i+1)*2]),cy(vb[(i+1)*2+1]), cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]),
                                             cx(vb[i*2]),cy(vb[i*2+1]), cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]), cx(vb[(i+3)*2]),cy(vb[(i+3)*2+1]) };
@@ -4263,6 +4279,7 @@ PPC_FUNC(__imp__VdSwap) {
             tl_execsegs = true;   // T2b-step-1: let DRAW_INDX capture each executed draw's live fetch slot-0
             tl_esVerts.clear();   // T2b-step-2: fresh per-frame geometry accumulator
             tl_esTexVerts.clear();// Task #8: fresh per-frame textured-backdrop accumulator
+            tl_textSeen.clear(); tl_textTotal = 0;   // cont.120: reset the per-frame text-block dedup set + counter
             tl_s1cursor = 0;      // REX_SPRITECARVE: rescan the slot-1 dense start each frame
             // REX_UITEXT: take this frame's accumulated text snapshots (drain the guest-thread buffer); the
             // prim-13 DRAW handler consumes them by matching count, applying the live reg-0x4000 transform.
@@ -4324,6 +4341,11 @@ PPC_FUNC(__imp__VdSwap) {
             // Task #8: hand the textured backdrop (pos.xy+uv.xy quadrants) to the textured pipeline.
             if (rex_render::Enabled() && !tl_esTexVerts.empty())
                 rex_render::SubmitTexturedGeometry(tl_esTexVerts.data(), (int)(tl_esTexVerts.size() / 4));
+            // cont.120: report the per-frame text dedup effect (unique blocks kept vs total draws seen). Gated on
+            // REX_TEXTGLYPH (independent of KTRACE so it survives REX_KTRACE=0); capped to the first frames.
+            if (getenv("REX_TEXTGLYPH") && tl_textTotal > 0) { static std::atomic<int> dn{0}; if (dn.fetch_add(1) < 12)
+                fprintf(stderr, "[textdedup] frame: %d text draws -> %zu unique kept (tl_esTexVerts=%zu verts)\n",
+                        tl_textTotal, tl_textSeen.size(), tl_esTexVerts.size()/4); }
             uint32_t slot0After = GLD32(0xA2000000u);
             // BUILD step (REX_S1SCAN, one-shot): map the slot-1 (0xA01FE0FC) vert layout — the title generated the
             // sprite/text verts here, but the draws read the (empty) slot 0. Find every dense run of plausible
