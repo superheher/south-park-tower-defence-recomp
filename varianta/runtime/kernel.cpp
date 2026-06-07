@@ -1968,9 +1968,16 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                             auto tcy = [&](float v){ return s_textcenter ? v/100.0f - 0.4f : v/360.0f - 1.0f; };
                             if (!seen) {   // cont.120: carve each UNIQUE text block once/frame (skip the ~20x re-rendered duplicates that overlapped into mush)
                                 tl_textSeen.push_back(key);
+                                // cont.139: FIX the cont.135 striping via a v-shift. cont.135 found the atlas has a STRIPED
+                                // band at the top (v~0-0.137) above the glyph rows; menu glyphs with v≈0.008 sampled it (striped).
+                                // CONFIRMED (cont.139): the band is a variant-A-specific EXTRA top row — the glyphs rasterized
+                                // one row LOWER than the title's UVs expect; +0.148 in v maps the UVs down onto the real rows.
+                                // Result: "This control is used as a runtime indicator of timeline progress" renders FULLY
+                                // LEGIBLE at the game-accurate top-left position. Default 0.148 (measured band height); REX_VSHIFT overrides.
+                                static const float s_vshift = []{ const char* e=getenv("REX_VSHIFT"); return e?(float)atof(e):0.148f; }();
                                 for (uint32_t i = 0; i + 4 <= nr; i += 4) {
                                     float u[4], w[4]; for (int j = 0; j < 4; j++) {
-                                        uint32_t au=GLD32(gv+(i+j)*stride+8), aw=GLD32(gv+(i+j)*stride+12); memcpy(&u[j],&au,4); memcpy(&w[j],&aw,4); }
+                                        uint32_t au=GLD32(gv+(i+j)*stride+8), aw=GLD32(gv+(i+j)*stride+12); memcpy(&u[j],&au,4); memcpy(&w[j],&aw,4); w[j] += s_vshift; }
                                     float t[24] = {   // 2 tris (0,1,2)+(0,2,3): pos.xy(clip) + uv.xy
                                         tcx(vb[i*2]),tcy(vb[i*2+1]),u[0],w[0], tcx(vb[(i+1)*2]),tcy(vb[(i+1)*2+1]),u[1],w[1], tcx(vb[(i+2)*2]),tcy(vb[(i+2)*2+1]),u[2],w[2],
                                         tcx(vb[i*2]),tcy(vb[i*2+1]),u[0],w[0], tcx(vb[(i+2)*2]),tcy(vb[(i+2)*2+1]),u[2],w[2], tcx(vb[(i+3)*2]),tcy(vb[(i+3)*2+1]),u[3],w[3] };
