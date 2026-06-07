@@ -3660,6 +3660,25 @@ PPC_FUNC(sub_821C6E58)
                 if (!ibhit) fprintf(stderr, "[drawscan]   NO INDIRECT_BUFFER targets the sprite region [0x%X..0x%X]\n", lo, hi);
             }
         }}
+        // cont.106 (THE FIX): the sprite/text draws (prim 5/13) are linked into the MAIN RING (0xA0002000) via
+        // INDIRECT_BUFFER, but variant A executes the build-cursor segments (backdrop) not the ring. The existing
+        // ExecuteRing only does the incremental [lastWptr..wptr] window (and the guest builds IBs past WPTR /
+        // already-consumed). Here: at the per-frame sync, scan a GENEROUS span of the ring for INDIRECT_BUFFER
+        // (op 0x3F) packets and ExecutePM4 each IB target — which follows into the sprite DRAW_INDX. Gated, capped.
+        static const bool s_ringexec = getenv("REX_RINGEXEC") != nullptr;
+        if (s_ringexec) { static std::atomic<int> rxn{0}; if (rxn.fetch_add(1) < 60) { GpuLock _glrx;
+            uint32_t ringBase = 0xA0002000u, wptr = GLD32(0x7FC80714u);          // CP_RB base / WPTR (dword idx)
+            uint32_t span = (wptr > 4u && wptr < 4096u) ? wptr + 16u : 1024u;     // generous span (catch IBs near/past WPTR)
+            int ibn = 0;
+            for (uint32_t i = 0; i + 2u < span && ibn < 64; i++) {
+                uint32_t a = ringBase + i*4u, h = GLD32(a);
+                if ((h >> 30) != 3u || ((h >> 8) & 0x7Fu) != 0x3Fu) continue;     // INDIRECT_BUFFER (op 0x3F)
+                uint32_t ibAddr = GLD32(a + 4u), ibLen = GLD32(a + 8u) & 0xFFFFFu;
+                if (ibLen == 0u || ibLen >= 0x8000u) continue;
+                ExecutePM4(TranslatePhys(ibAddr), ibLen, 1); ibn++;
+            }
+            if (g_ktrace) fprintf(stderr, "[ringexec] #%d executed %d ring IBs (wptr=%u span=%u)\n", (int)rxn.load(), ibn, wptr, span);
+        }}
         uint32_t fenceptr = GLD32(device + 10896);
         if (fenceptr) {
             uint32_t head = GLD32(device + 10908), current = GLD32(fenceptr);
