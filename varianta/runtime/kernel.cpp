@@ -3449,11 +3449,74 @@ PPC_FUNC(sub_8222A9F8)
 // [STOPGAP. The clean fix is a continuous CP that follows the WAIT_REG_MEM-chained deferred IBs and
 //  executes them, so the fence advances as a real result. This forwarding MUST be replaced before a real
 //  renderer lands, or deferred draws would be skipped. See varianta/NIGHT-LOG.md + NEXT-SESSION-PROMPT.]
+
+// cont.81 (REX_FRAMEBUF): at the per-frame fence-wait SYNC POINT (here — where the title has JUST built the
+// frame, so its geometry should be LIVE, unlike VdSwap/EXECSEGS time where cont.59 found verts=0,0), READ-ONLY
+// walk the build-cursor directory (device+13568/13572 — the structure the REX_CHUNKDUMP census localized the
+// menu content to). Count DRAW_INDX + dump prims, and by SHADOWING the fetch region (0x4800, cumulative across
+// segments) locate each draw's vertex pool and report whether its verts are LIVE. No execution / no side
+// effects. Resolves cont.80's caveat: is the per-frame content stream LIVE at the fence-wait (vs dead at VdSwap)?
+static void FrameBufDump(uint32_t device) {
+    uint32_t b0 = GLD32(device + 13568), b1 = GLD32(device + 13572);
+    uint32_t lo = b0 < b1 ? b0 : b1, hi = b0 < b1 ? b1 : b0;
+    fprintf(stderr, "[framebuf] dev+13568=0x%08X dev+13572=0x%08X dir=[0x%X..0x%X] span=%u dw | raw@13568: %08X %08X %08X\n",
+            b0, b1, lo, hi, (hi - lo) / 4, GLD32(b0), GLD32(b0 + 4), GLD32(b0 + 8));
+    if (lo < 0xA0000000u || hi <= lo || (hi - lo) > 0x200000u) { fprintf(stderr, "[framebuf]  (dir range not sane)\n"); return; }
+    uint32_t shadow[256]; for (int i = 0; i < 256; i++) shadow[i] = 0;   // fetch region 0x4800..0x48FF (cumulative)
+    int descs = 0, segs = 0, draws = 0, liveDraws = 0, contentDraws = 0;
+    for (uint32_t a = lo; a + 8 <= hi && descs < 512; a += 4) {
+        uint32_t d = GLD32(a);
+        if ((d >> 24) != 0x81u) continue;                          // census parse: 0x81LLLLLL descriptor tag
+        uint32_t len = d & 0xFFFFFFu, phys = GLD32(a + 4);
+        if (len == 0 || len >= 0x8000u || (phys & 3)) continue;
+        descs++;
+        uint32_t seg = 0xA0000000u | (phys & 0x1FFFFFFFu);
+        if ((GLD32(seg) >> 30) == 2u) continue;                    // first packet type-2 nop => not a segment
+        segs++;
+        uint32_t a2 = seg, segEnd = seg + len * 4;
+        while (a2 + 4 <= segEnd) {
+            uint32_t pkt = GLD32(a2); a2 += 4;
+            if (pkt == 0) continue;
+            uint32_t t = pkt >> 30;
+            if (t == 2) continue;
+            if (t == 0) { uint32_t cnt = ((pkt >> 16) & 0x3FFF) + 1, bi = pkt & 0x7FFF; bool one = (pkt >> 15) & 1;
+                for (uint32_t m = 0; m < cnt && a2 + 4 <= segEnd; m++, a2 += 4) { uint32_t ri = one ? bi : bi + m;
+                    if (ri >= 0x4800u && ri < 0x4900u) shadow[ri - 0x4800u] = GLD32(a2); }
+                continue; }
+            if (t == 1) { a2 += 8; continue; }
+            uint32_t op = (pkt >> 8) & 0x7F, cnt = ((pkt >> 16) & 0x3FFF) + 1;
+            if (op == 0x2D) {                                       // SET_CONSTANT
+                uint32_t ot = GLD32(a2), index = ot & 0x7FF, type = (ot >> 16) & 0xFF;
+                if (type == 1) for (uint32_t i = 1; i < cnt; i++) { uint32_t ri = index + (i - 1); if (ri < 256u) shadow[ri] = GLD32(a2 + i * 4); }
+            } else if (op == 0x22 || op == 0x36) {                  // DRAW_INDX / DRAW_INDX_2
+                draws++;
+                uint32_t init = (op == 0x22) ? GLD32(a2 + 4) : GLD32(a2);
+                uint32_t numI = init >> 16, prim = init & 0x3F;
+                if (prim == 5 || prim == 13 || prim == 4) contentDraws++;   // sprite/text/content prims (cont.69-73)
+                int vslot = -1; uint32_t vbase = 0; float vx = 0, vy = 0; bool live = false;
+                for (int s = 0; s < 128; s++) { uint32_t f0 = shadow[s * 2]; if ((f0 & 3) == 3) { vslot = s;
+                    vbase = 0xA0000000u | ((f0 & 0xFFFFFFFCu) & 0x1FFFFFFFu);
+                    uint32_t ux = GLD32(vbase), uy = GLD32(vbase + 4); memcpy(&vx, &ux, 4); memcpy(&vy, &uy, 4);
+                    live = (ux || uy) && (vx == vx) && vx > -1e6f && vx < 1e6f && vy > -1e6f && vy < 1e6f && (vx != 0.f || vy != 0.f); break; } }
+                if (live) liveDraws++;
+                if (draws <= 28) fprintf(stderr, "[framebuf]   seg#%d DRAW prim=%u numI=%u vtxSlot=%d vbase=0x%X v0=(%.1f,%.1f) %s\n",
+                                         segs, prim, numI, vslot, vbase, vx, vy, live ? "LIVE" : "dead");
+            }
+            a2 += cnt * 4;
+        }
+    }
+    fprintf(stderr, "[framebuf] SUMMARY descs=%d segs=%d draws=%d contentDraws(prim4/5/13)=%d liveDraws=%d\n",
+            descs, segs, draws, contentDraws, liveDraws);
+}
+
 extern "C" PPC_FUNC(__imp__sub_821C6E58);
 PPC_FUNC(sub_821C6E58)
 {
     if (g_coop || g_preempt) {   // stopgap fires in BOTH scheduler modes — variant A has no real CP in either
         uint32_t device = ctx.r3.u32, target = ctx.r4.u32;
+        // cont.81: read-only dump of the build-cursor directory at this LIVE per-frame sync point (gated, capped).
+        static const bool s_framebuf = getenv("REX_FRAMEBUF") != nullptr;
+        if (s_framebuf) { static std::atomic<int> fbn{0}; if (fbn.fetch_add(1) < 6) { GpuLock _glfb; FrameBufDump(device); } }
         uint32_t fenceptr = GLD32(device + 10896);
         if (fenceptr) {
             uint32_t head = GLD32(device + 10908), current = GLD32(fenceptr);
