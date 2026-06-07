@@ -4998,6 +4998,69 @@ PPC_FUNC(__imp__NtPulseEvent)
     ctx.r3.u64 = 0;
 }
 
+// ---- cont.94: real NtCreateTimer/NtSetTimerEx/NtCancelTimer (cont.53-54) ----------------------------
+// The post-L1 gameplay-subsystem worker (tid=10, sub_824C6ED0) creates + waits on a timer to drive its
+// per-tick render/gameplay work; the stubs no-op'd it, blocking the worker (cont.53/93). Create a real guest
+// timer dispatch object (like NtCreateEvent) + arm a HOST std::thread that SignalObject's it after the due-time
+// (re-arming for a periodic timer), so the worker's KeWaitForSingleObject(timer) wakes per tick. The host-timer
+// FIRING is gated behind REX_TIMER: default boot creates the object (handle resolves) but the timer never fires
+// (== the prior stub behaviour), so default boot is UNREGRESSED.
+namespace {
+struct HostTimer { std::thread th; std::atomic<bool> stop{false}; };
+std::unordered_map<uint32_t, HostTimer*> g_hostTimers;   // obj -> host timer
+std::mutex g_hostTimerMtx;
+void StopHostTimer(uint32_t obj) {  // caller holds g_hostTimerMtx
+    auto it = g_hostTimers.find(obj);
+    if (it != g_hostTimers.end()) { it->second->stop.store(true);
+        if (it->second->th.joinable()) it->second->th.detach(); g_hostTimers.erase(it); }
+}
+}
+PPC_FUNC(__imp__NtCreateTimer) {
+    uint32_t pHandle = ctx.r3.u32, obj, handle;
+    { std::lock_guard<std::mutex> lk(g_handleMutex); obj = AllocObject(0x20); handle = g_nextHandle++;
+      g_objHandles[handle] = obj; }
+    PPC_STORE_U8 (obj + 0x00, 1);                              // dispatch type: synchronization (auto-reset)
+    PPC_STORE_U8 (obj + 0x01, 0);
+    PPC_STORE_U32(obj + 0x04, 0);                              // signal_state = 0 (not yet fired)
+    PPC_STORE_U32(obj + 0x08, obj + 0x08); PPC_STORE_U32(obj + 0x0C, obj + 0x08);  // wait_list self-ref
+    if (pHandle) PPC_STORE_U32(pHandle, handle);
+    KTRACE("NtCreateTimer -> handle=0x%X obj=0x%X\n", handle, obj);
+    ctx.r3.u64 = 0;
+}
+// NTSTATUS NtSetTimerEx(handle r3, *DueTime r4, ApcRoutine r5, ApcMode r6, Ctx r7, Resume r8, LONG Period(ms) r9, *Prev r10)
+PPC_FUNC(__imp__NtSetTimerEx) {
+    static const bool s_timer = getenv("REX_TIMER") != nullptr;
+    uint32_t obj = ResolveObject(ctx.r3.u32);
+    if (!s_timer || !obj) { ctx.r3.u64 = 0; return; }          // off -> stub-equivalent (object exists, never fires)
+    uint32_t dtp = ctx.r4.u32;                                 // *DueTime = LARGE_INTEGER (BE: hi@dtp, lo@dtp+4)
+    int64_t due = dtp ? (int64_t)(((uint64_t)GLD32(dtp) << 32) | (uint64_t)GLD32(dtp + 4)) : 0;
+    int64_t firstMs = (due < 0) ? (-due) / 10000 : 1;          // relative(neg) 100ns -> ms; absolute/0 -> fire soon
+    if (firstMs < 0) firstMs = 0; if (firstMs > 5000) firstMs = 5000;
+    int32_t period = (int32_t)ctx.r9.u32;                      // LONG ms; 0 = one-shot
+    int periodMs = (period > 0) ? (period > 60000 ? 60000 : period) : 0;
+    { std::lock_guard<std::mutex> lk(g_hostTimerMtx); StopHostTimer(obj);
+      HostTimer* ht = new HostTimer(); g_hostTimers[obj] = ht;
+      ht->th = std::thread([obj, firstMs, periodMs, ht]{   // ht is never freed (leaked, bounded) -> no UAF
+          std::this_thread::sleep_for(std::chrono::milliseconds(firstMs));
+          if (ht->stop.load()) return;
+          SignalObject(obj, 1);
+          if (periodMs == 0) return;                           // one-shot
+          while (!ht->stop.load()) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(periodMs));
+              if (ht->stop.load()) break;
+              SignalObject(obj, 1);
+          }
+      }); }
+    KTRACE("NtSetTimerEx obj=0x%X first=%lldms period=%dms (host timer armed)\n", obj, (long long)firstMs, periodMs);
+    ctx.r3.u64 = 0;
+}
+PPC_FUNC(__imp__NtCancelTimer) {
+    uint32_t obj = ResolveObject(ctx.r3.u32);
+    { std::lock_guard<std::mutex> lk(g_hostTimerMtx); StopHostTimer(obj); }
+    if (ctx.r4.u32) PPC_STORE_U32(ctx.r4.u32, 0);
+    ctx.r3.u64 = 0;
+}
+
 // ---- spinlocks / critical regions / IRQL (kernel-level serialization) ------------------------------
 namespace { void SpinAcquire(uint32_t lock) {   // per-lock host mutex; release the token if contended
     auto* m = CsLock(lock);

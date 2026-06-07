@@ -16,6 +16,8 @@ set environment REX_CPCOMPLETE=1
 set environment REX_MOVIE_EOF=30
 set environment REX_FRAMEEXEC=1
 set environment REX_EWDRAIN=1
+set environment REX_SUBSYS=1
+set environment REX_TIMER=1
 set args /home/h/src/recomp/rexglue-recomps/south-park-recomp/private/extracted/default.xex
 
 set $n = 0
