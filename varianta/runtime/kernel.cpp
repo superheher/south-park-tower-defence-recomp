@@ -1864,13 +1864,32 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                     static std::atomic<int> scn{0}; if (g_ktrace && scn.fetch_add(1) < 12)
                         fprintf(stderr, "[spritecarve] prim=%u numI=%u gv=0x%X stride=%u v0=(%.1f,%.1f) v1=(%.1f,%.1f) v2=(%.1f,%.1f)\n",
                                 prim, numInd, gv, stride, vb[0],vb[1], vb[2],vb[3], vb[4],vb[5]);
-                    // cont.114: for the stride-16 text draws, dump the FULL float4 (xy=pos, zw=likely UV into the font atlas)
-                    if (prim == 13 && stride >= 16) { static std::atomic<int> tn{0}; if (g_ktrace && tn.fetch_add(1) < 4) {
-                        char tb[300]; int tp = snprintf(tb, sizeof tb, "[textvert] gv=0x%X numI=%u xy+zw:", gv, numInd);
-                        for (uint32_t i = 0; i < 6 && i < numInd && tp < 270; i++) {
-                            uint32_t uz=GLD32(gv+i*stride+8), uw=GLD32(gv+i*stride+12); float fz,fw; memcpy(&fz,&uz,4); memcpy(&fw,&uw,4);
-                            tp += snprintf(tb+tp, sizeof(tb)-tp, " [%.1f,%.1f,%.3f,%.3f]", vb[i*2], vb[i*2+1], fz, fw); }
-                        fprintf(stderr, "%s\n", tb); }}
+                    // cont.119 MEASUREMENT: RE the glyph layout. cont.118 showed the per-draw transform is GLOBAL
+                    // (identical for every text draw), so the cont.117 "fan" distortion is the layout itself +/- the
+                    // ~6 dup buffers overlapping. Dump (1) a per-draw bbox so I can see how many DISTINCT text draws
+                    // there are and whether they have distinct y-bands (= real menu lines) or identical bboxes (= dup
+                    // buffers re-rendered by the directory exec); (2) the FULL per-glyph quad layout for the FIRST
+                    // text draw (all quads: 4 corners + the uv bbox) to see the x-advance, y-orientation, the real
+                    // glyph count (numInd/4), and any degenerate/garbage quads that would fan.
+                    if (prim == 13 && stride >= 16) {   // gate = the REX_SPRITECARVE carve scope (measurement-only); independent of KTRACE so it survives REX_KTRACE=0
+                        float mnx=1e9f,mxx=-1e9f,mny=1e9f,mxy=-1e9f;
+                        for (uint32_t i = 0; i < nr; i++) { float x=vb[i*2],y=vb[i*2+1];
+                            if(x<mnx)mnx=x; if(x>mxx)mxx=x; if(y<mny)mny=y; if(y>mxy)mxy=y; }
+                        static std::atomic<int> bn{0}; int bi=bn.fetch_add(1);
+                        if (bi < 20) fprintf(stderr, "[txtbbox] #%d gv=0x%X numI=%u quads=%u bbox=(%.1f,%.1f)-(%.1f,%.1f)\n",
+                                             bi, gv, numInd, numInd/4u, mnx,mny, mxx,mxy);
+                        static std::atomic<bool> dumped{false}; bool exp=false;
+                        if (dumped.compare_exchange_strong(exp, true)) {
+                            fprintf(stderr, "[glyphlayout] FULL layout for gv=0x%X numI=%u stride=%u:\n", gv, numInd, stride);
+                            for (uint32_t i = 0; i + 4 <= nr; i += 4) {
+                                uint32_t a0=GLD32(gv+i*stride+8), b0=GLD32(gv+i*stride+12);
+                                uint32_t a2=GLD32(gv+(i+2)*stride+8), b2=GLD32(gv+(i+2)*stride+12);
+                                float u0,w0,u2,w2; memcpy(&u0,&a0,4);memcpy(&w0,&b0,4);memcpy(&u2,&a2,4);memcpy(&w2,&b2,4);
+                                fprintf(stderr, "[glyph%02u] p0(%.1f,%.1f) p1(%.1f,%.1f) p2(%.1f,%.1f) p3(%.1f,%.1f) uv(%.3f,%.3f)-(%.3f,%.3f)\n",
+                                        i/4u, vb[i*2],vb[i*2+1], vb[(i+1)*2],vb[(i+1)*2+1], vb[(i+2)*2],vb[(i+2)*2+1], vb[(i+3)*2],vb[(i+3)*2+1], u0,w0,u2,w2);
+                            }
+                        }
+                    }
                     auto cx = [](float v){ return v / 884.0f - 1.0f; };      // placeholder authoring->clip (tune from the log)
                     auto cy = [](float v){ return v / 521.5f - 1.0f; };
                     static const bool s_tg = getenv("REX_TEXTGLYPH") != nullptr;
