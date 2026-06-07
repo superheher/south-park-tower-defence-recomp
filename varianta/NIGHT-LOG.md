@@ -4964,3 +4964,25 @@ MEASUREMENT (cont.90's binary, REX_FRAMEEXEC+REX_EWDRAIN + REX_SUBSYS; no code c
 **METHODOLOGY LESSON (logged to memory):** never break a HOT function (memcpy/alloc/per-instruction) with gdb `commands`+continue — it throttles the whole run and produces false "never reached" negatives for anything downstream. Break only cold/structural functions; for hot paths use a counter inside the runtime (a gated KTRACE), not a gdb breakpoint.
 
 **⭐NEXT (cont.97) — RE THE EXECUTED-DRAW→PM4 GAP AT sub_821F8E60 (cont.55, now with the live title):** instrument sub_821F8E60's submit — does it call Lock(vtable+120)/Unlock(vtable+124)? what does the Unlock (the inlined-D3D submit) DO — does it reach the build-cursor segment / emit any PM4? Use a RUNTIME gated trace (REX flag + KTRACE inside the sub_821F8E60 hook or the vtable+124 callsite), NOT a gdb breakpoint (hot path). prod-oracle: find sub_821F8E60's host address in prod (or the equiv submit), confirm prod's Unlock emits a DRAW_INDX that variant A's doesn't. Default boot UNREGRESSED (cont.96 = measurement only, new gdb tool dispatch.gdb; no code change).
+
+———— cont.97 — ⚠️REFINES cont.55: the vtable+124 "submit" (sub_822052F8) is a FAITHFUL tiny VB-Unlock, NOT a stubbed draw-submit; the DRAW_INDX emit is ELSEWHERE ————
+
+**ONE MEASUREMENT (no code change; new tool varianta/tools/submit_probe.gdb):** static read first — sub_821F8E60's body (ppc_recomp.21:22553-22623) is the cont.55 D3D dynamic-VB pattern: vtable+200 (get obj, 22553) → vtable+120 (Lock, 22576-81) → sub_8242BF10 fill (22594) → vtable+124 (Unlock/"submit", 22600-05) → vtable+60 on r31 with r4=0 (SetTexture(0), 22611-23). To get the ACTUAL guest method behind vtable+124 (which cont.55 couldn't name), I captured it ONE-SHOT (self-disabling gdb breakpoints — services 1 hit, NO throttle, per the cont.96 lesson).
+
+**CAPTURE (clean, one-shot):** r30 (VB/draw obj) = 0x000E36A0, vtable-base = 0x820E0B10; **Lock (vtable+120) = sub_822052B0**; **submit/Unlock (vtable+124) = sub_822052F8**.
+
+**RE OF sub_822052F8 (the "submit" — ppc_recomp.23:1990):** NOT a kernel stub (no override in kernel.cpp; real recompiled code). Its ENTIRE body is 4 instructions:
+```
+r11 = *(r3+12)            // r3=r30 (VB obj); r11 = *(obj+12) = parent device/state ptr
+r3  = 0                   // return 0 (success)
+r10 = *(r11+13652)        // load dev+13652
+*(r11+48) = r10           // store -> dev+48
+return
+```
+⇒ it's a faithful tiny **VB-Unlock** that just copies dev+13652→dev+48 and returns success. It emits **NO PM4, NO DRAW_INDX**, touches no command buffer — and was NEVER meant to (an Unlock releases the lock; it doesn't draw).
+
+**⚠️ REFINES cont.55:** cont.55 called vtable+124 "the draw-submit, stubbed (emits no PM4)". That conflated two things. vtable+124 is NOT stubbed (it's faithful) and NOT the draw-submit (it's the VB-unlock). So sub_821F8E60 = a **VB-fill → unlock → SetTexture(0)** helper (the SetTexture(0)/r4=0 at 22613 = the cont.45 tex=0x0). The actual **DrawPrimitive→DRAW_INDX emit is a SEPARATE call, NOT here** — it's emitted somewhere after the VB is filled+unlocked (most likely in the per-draw loop sub_821F8488 right after the sub_821F8E60 call at :22228, or a DrawIndexedPrimitive helper). cont.55's "missing link = SetStreamSource+DrawPrimitive that binds r30 into slot-0" (line 2741) was the RIGHT instinct; cont.97 rules OUT vtable+124 as that link and re-points at the separate draw call.
+
+**⇒ The chain is now precise:** the menu render runs (cont.96: sub_821F8488→sub_821F8E60 live on thread 1); sub_821F8E60 fills+unlocks the VB and sets tex=0 — but the DRAW_INDX that consumes that VB is a distinct call still to be located. The plateau (0 content DRAW_INDX in the ring) means that distinct draw call either (a) doesn't run, or (b) runs but its PM4-emit doesn't reach the build-cursor segment.
+
+**⭐NEXT (cont.98) — LOCATE THE ACTUAL DRAW CALL (DrawPrimitive→DRAW_INDX):** static-read sub_821F8488's body right after the sub_821F8E60 call (:22228) + at :21874 — find the DrawIndexedPrimitive/DrawPrimitive call (a vtable method on the device r31 that writes the DRAW_INDX opcode 0x22/0x36 to the command buffer). Capture its guest method addr ONE-SHOT (like cont.97), RE it: does it WRITE a DRAW_INDX to the build-cursor segment? If it runs but writes to a buffer that REX_FRAMEEXEC isn't executing, that's the gap; if it doesn't run, find its guard. prod-oracle: the same method in prod emits the draw. Default boot UNREGRESSED (cont.97 = measurement only, new gdb tool submit_probe.gdb; no code change).
