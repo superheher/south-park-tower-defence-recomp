@@ -4311,6 +4311,17 @@ PPC_FUNC(__imp__VdSwap) {
             tl_esTexVerts.clear();// Task #8: fresh per-frame textured-backdrop accumulator
             tl_textSeen.clear(); tl_textTotal = 0;   // cont.120: reset the per-frame text-block dedup set + counter
             tl_s1cursor = 0;      // REX_SPRITECARVE: rescan the slot-1 dense start each frame
+            // cont.127: CARVE ONCE then STOP. cont.125/126 proved the CONTINUOUS every-swap directory re-exec is what
+            // breaks the font-atlas population (the title allocates the atlas elsewhere + never fills it). Resolution:
+            // exec the directory only until the menu text is carved, CACHE the carved geometry, LATCH, then on every
+            // later swap SKIP the re-exec and replay the cache — so the title runs FREE and populates the atlas, while
+            // the cached text still submits each frame + the deferred upload (cont.122) grabs the populated atlas.
+            // Pair with REX_EXECSEGS=<late> (e.g. 250) so the single carve happens AFTER the atlas has populated.
+            static const bool s_carveonce = getenv("REX_CARVEONCE") != nullptr;
+            static std::atomic<bool> s_carvedLatch{false};
+            static std::vector<float> s_cacheTex, s_cacheMenu; static std::mutex s_cacheMtx;
+            bool latched = s_carveonce && s_carvedLatch.load();
+            if (latched) { std::lock_guard<std::mutex> lk(s_cacheMtx); tl_esTexVerts = s_cacheTex; tl_esVerts = s_cacheMenu; }  // replay the cached carve; no re-exec
             // REX_UITEXT: take this frame's accumulated text snapshots (drain the guest-thread buffer); the
             // prim-13 DRAW handler consumes them by matching count, applying the live reg-0x4000 transform.
             std::vector<TxtSnap> txtFrame;
@@ -4324,7 +4335,7 @@ PPC_FUNC(__imp__VdSwap) {
             // disrupts the font system. Skipping it (but keeping the directory carve + submit) should let the
             // atlas stay populated AND the text carve → render. Gated; default behaviour unchanged without the flag.
             static const bool s_nochunk = getenv("REX_NOCHUNK") != nullptr;
-            if (!s_nochunk) for (uint32_t a = base; a + 8 <= wptr; a += 4) {
+            if (!s_nochunk && !latched) for (uint32_t a = base; a + 8 <= wptr; a += 4) {
                 uint32_t d = GLD32(a);
                 if ((d >> 24) != 0x81u) continue;                       // census parse: 0x81LLLLLL descriptor tag
                 uint32_t len = d & 0xFFFFFFu, addr = GLD32(a + 4);
@@ -4339,7 +4350,7 @@ PPC_FUNC(__imp__VdSwap) {
             // draws are in a PRIOR directory entry, NOT the current [base,wptr] chunk). Under tl_execsegs=true these
             // carve into tl_esVerts → the Vulkan bridge → VISIBLE. (cont.109 proved they reach ExecuteType3 with real
             // vf95 verts; here they also get carved+submitted.) Gated REX_DIREXEC, in-execsegs so the carve fires.
-            if (getenv("REX_DIREXEC")) {
+            if (getenv("REX_DIREXEC") && !latched) {
                 uint32_t addrs[96]; int na = 0;
                 for (uint32_t off = 13400; off <= 13700 && na < 96; off += 4) {
                     uint32_t v = GLD32(dv + off);
@@ -4354,6 +4365,14 @@ PPC_FUNC(__imp__VdSwap) {
                 }
             }
             tl_execsegs = false;
+            // cont.127: once this carve produced text geometry, CACHE it + LATCH — subsequent swaps skip the
+            // directory re-exec (above) and replay the cache, leaving the title free to populate the atlas.
+            if (s_carveonce && !s_carvedLatch.load() && !tl_esTexVerts.empty()) {
+                std::lock_guard<std::mutex> lk(s_cacheMtx);
+                s_cacheTex = tl_esTexVerts; s_cacheMenu = tl_esVerts; s_carvedLatch.store(true);
+                fprintf(stderr, "[carveonce] LATCHED at swap %u: cached %zu tex + %zu menu verts; directory re-exec now disabled (title runs free to populate the atlas)\n",
+                        n, s_cacheTex.size()/4, s_cacheMenu.size()/2);
+            }
             tl_txtFrame = nullptr;
             { static std::atomic<int> tf{0}; if (getenv("REX_UITEXT") && tf.fetch_add(1) < 4)
                 fprintf(stderr, "[uitext] frame: %zu text snapshots available, esVerts now %zu\n", txtFrame.size(), tl_esVerts.size()/2); }
