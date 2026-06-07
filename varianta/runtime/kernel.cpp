@@ -3536,13 +3536,20 @@ static void FrameBufDump(uint32_t device) {
                 // World+Proj transform (reg 0x4000 ALU consts, cont.23/73) from alu[] and project the World origin
                 // -> clip — does the REAL label have an ON-SCREEN game-accurate position at the FENCE-WAIT (vs
                 // cont.73's off-screen DEBUG label at VdSwap timing)? Tx=c0.w Ty=c1.w Px=c4.x Pxw=c4.w Py=c5.y Pyw=c5.w.
-                if (prim == 13 && draws <= 24) {
+                if (prim == 13) {
                     auto af = [&](int i){ float f; memcpy(&f, &alu[i], 4); return f; };
                     float Tx=af(3), Ty=af(7), Px=af(16), Pxw=af(19), Py=af(21), Pyw=af(23);
                     float ox = Tx*Px + Pxw, oy = Ty*Py + Pyw;
                     bool onscr = ox>-1.2f && ox<1.2f && oy>-1.2f && oy<1.2f;
-                    fprintf(stderr, "[fwxform] prim13 numI=%u World=(%.1f,%.1f) Proj=(%.4f,%.4f)+(%.4f,%.4f) origin->clip=(%.3f,%.3f) %s\n",
+                    if (draws <= 24) fprintf(stderr, "[fwxform] prim13 numI=%u World=(%.1f,%.1f) Proj=(%.4f,%.4f)+(%.4f,%.4f) origin->clip=(%.3f,%.3f) %s\n",
                             numI, Tx,Ty, Px,Py, Pxw,Pyw, ox,oy, onscr ? "ON-SCREEN" : "off");
+                    // cont.86: feed the REAL fence-wait transform into g_textXform[numI] so the existing
+                    // REX_TEXTRENDER (cont.70-71) places the decoded text at its GAME-ACCURATE position — cont.73's
+                    // pairing, now with the real menu labels' transforms (vs the EXECSEGS debug label). Only real
+                    // transforms (Px!=0; skip the spurious unset 0,0). Keyed by numI == the snapshot vert count.
+                    static const bool s_fwplace = getenv("REX_FWPLACE") != nullptr;
+                    if (s_fwplace && Px != 0.f) { std::lock_guard<std::mutex> lk(g_textXformMtx);
+                        g_textXform[numI] = { Tx, Ty, Px, Pxw, Py, Pyw }; }
                 }
                 // cont.84 (REX_FRAMEDRAW): composite the LIVE prim-8 draws into g_frameBuf at their REAL screen
                 // positions (carved from the verts) — the GAME-ACCURATE placement cont.73 couldn't reach — via the
