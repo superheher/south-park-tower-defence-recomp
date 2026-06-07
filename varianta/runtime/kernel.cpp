@@ -3493,14 +3493,29 @@ static void FrameBufDump(uint32_t device) {
                 uint32_t init = (op == 0x22) ? GLD32(a2 + 4) : GLD32(a2);
                 uint32_t numI = init >> 16, prim = init & 0x3F;
                 if (prim == 5 || prim == 13 || prim == 4) contentDraws++;   // sprite/text/content prims (cont.69-73)
-                int vslot = -1; uint32_t vbase = 0; float vx = 0, vy = 0; bool live = false;
-                for (int s = 0; s < 128; s++) { uint32_t f0 = shadow[s * 2]; if ((f0 & 3) == 3) { vslot = s;
-                    vbase = 0xA0000000u | ((f0 & 0xFFFFFFFCu) & 0x1FFFFFFFu);
-                    uint32_t ux = GLD32(vbase), uy = GLD32(vbase + 4); memcpy(&vx, &ux, 4); memcpy(&vy, &uy, 4);
-                    live = (ux || uy) && (vx == vx) && vx > -1e6f && vx < 1e6f && vy > -1e6f && vy < 1e6f && (vx != 0.f || vy != 0.f); break; } }
+                int vslot = -1; uint32_t vbase = 0;
+                for (int s = 0; s < 128; s++) { uint32_t f0 = shadow[s * 2]; if ((f0 & 3) == 3) {
+                    vslot = s; vbase = 0xA0000000u | ((f0 & 0xFFFFFFFCu) & 0x1FFFFFFFu); break; } }
+                // cont.82: read the INDEXED verts (op-0x22: data[2]=idxBase, idxFmt init[11]: 0=u16/1=u32) at
+                // vbase+idx*8 — the EXACT verts the draw uses (cont.81's pool[0] read was a false-negative for
+                // indexed content draws). PLUS a robust pool float-DENSITY scan (head 1024 dw) as a fallback.
+                float iv[4] = {0,0,0,0}; uint32_t ix[3] = {0,0,0}; bool idxLive = false, haveIdx = false;
+                if (vbase && op == 0x22) { uint32_t ibRaw = GLD32(a2 + 8), idxFmt = (init >> 11) & 1;
+                    uint32_t ig = 0xA0000000u | (ibRaw & 0x1FFFFFFFu);
+                    if (ibRaw && (ibRaw & 0x1FFFFFFFu) < 0x20000000u) { haveIdx = true;
+                        for (int j = 0; j < 3; j++) { uint32_t v = idxFmt ? GLD32(ig + j*4)
+                                                              : ((GLD32(ig + (j/2)*4) >> ((j&1) ? 0 : 16)) & 0xFFFF);
+                            ix[j] = v; uint32_t ux = GLD32(vbase + v*8), uy = GLD32(vbase + v*8 + 4);
+                            float fx, fy; memcpy(&fx, &ux, 4); memcpy(&fy, &uy, 4);
+                            if (j < 2) { iv[j*2] = fx; iv[j*2+1] = fy; }
+                            if ((ux || uy) && fx == fx && fx > -8192.f && fx < 8192.f && fy > -8192.f && fy < 8192.f && (fx != 0.f || fy != 0.f)) idxLive = true; } } }
+                int realF = 0; if (vbase) for (int i = 0; i < 1024; i++) { uint32_t w = GLD32(vbase + i*4);
+                    if (!w || w == 0xFFFFFFFFu || w == 0x0BADF00Du) continue; float f; memcpy(&f, &w, 4);
+                    if (f == f && f > -8192.f && f < 8192.f && (f > 0.0039f || f < -0.0039f)) realF++; }
+                bool live = idxLive || realF >= 16;
                 if (live) liveDraws++;
-                if (draws <= 28) fprintf(stderr, "[framebuf]   seg#%d DRAW prim=%u numI=%u vtxSlot=%d vbase=0x%X v0=(%.1f,%.1f) %s\n",
-                                         segs, prim, numI, vslot, vbase, vx, vy, live ? "LIVE" : "dead");
+                if (draws <= 28) fprintf(stderr, "[framebuf]   seg#%d DRAW prim=%u numI=%u vtxSlot=%d vbase=0x%X idx=[%u %u %u] iv=(%.1f,%.1f)(%.1f,%.1f) poolRealF=%d/1024 %s\n",
+                                         segs, prim, numI, vslot, vbase, ix[0], ix[1], ix[2], iv[0], iv[1], iv[2], iv[3], realF, live ? "LIVE" : "dead");
             }
             a2 += cnt * 4;
         }
@@ -3516,7 +3531,7 @@ PPC_FUNC(sub_821C6E58)
         uint32_t device = ctx.r3.u32, target = ctx.r4.u32;
         // cont.81: read-only dump of the build-cursor directory at this LIVE per-frame sync point (gated, capped).
         static const bool s_framebuf = getenv("REX_FRAMEBUF") != nullptr;
-        if (s_framebuf) { static std::atomic<int> fbn{0}; if (fbn.fetch_add(1) < 6) { GpuLock _glfb; FrameBufDump(device); } }
+        if (s_framebuf) { static std::atomic<int> fbn{0}; if (fbn.fetch_add(1) < 250) { GpuLock _glfb; FrameBufDump(device); } }
         uint32_t fenceptr = GLD32(device + 10896);
         if (fenceptr) {
             uint32_t head = GLD32(device + 10908), current = GLD32(fenceptr);
