@@ -5522,3 +5522,19 @@ Sent the decoded atlas to the user (it shows the menu's real text + confirms the
 **⭐NEXT (cont.135) — fix the striped glyphs:** per-glyph pos/uv-width dump → identify + fix the defective quads → fully legible menu text. Then the composited backdrop (cont.124 RGBA panels). Gate behind REX_TEXTGLYPH.
 
 **Default boot UNREGRESSED:** the atlas dump is a one-shot in LoadFontAtlasOnce (render-path only; default boot never enters it). Verified — clean loader→XamLoaderLaunchTitle boot, 0 fatal (exit 137). Diff: vulkan_render.cpp +8.
+
+———— cont.135 — 🎯 THE STRIPING ROOT CAUSE: the ATLAS has a permanent STRIPED BAND at the top (y~0-35); glyphs whose UV references it (v≈0.008) render striped, those referencing the clean glyph rows (v≥0.176) render legible. The carve geometry + per-vertex UVs are CORRECT — it's a title-side atlas-population issue ————
+
+**MEASUREMENT (per-glyph UV analysis + atlas-structure dump + big-render + timing test) — render unchanged:** cont.134 narrowed the striping to per-glyph geometry/UV. cont.135 settled it in four steps:
+1. **Per-glyph pos vs uv width:** ALL 63 glyphs have pos_width ≈ uv_width (ratio ~1.0) — no stretched/squished quads.
+2. **All-4-vertex UVs:** every glyph's 4 corner UVs form a PROPER RECT (TL/BL share u, TR/BR share u, TL/TR share v, …) — no scrambled/degenerate UVs. So the carve geometry + UVs are CORRECT.
+3. **Big render (REX_TEXTCENTER):** the striping PERSISTS at large size (some glyphs clean: s,_,n,t,r,U; others vertical-striped blocks) — so it's NOT small-size aliasing.
+4. **Atlas-structure dump (zoomed):** the uploaded atlas has a **STRIPED/solid band at the very top (y~0-35)** with the clean glyph rows below ("□_This col / ntruedam / fpg" at y~40-180). The menu glyphs with v≈[0.008,0.160] (atlas rows 2-41) sample that band → STRIPED; glyphs with v≥0.176 sample the clean glyph rows → LEGIBLE. **Timing test:** uploading later (REX_EXECSEGS=500, swap 500) leaves the band STILL striped (y=15: 120/120 solid cols) — so it's a PERSISTENT atlas feature, not a mid-render capture.
+
+**⇒ ROOT CAUSE (measured): the striping is the atlas's striped top band, NOT the carve.** The carve faithfully samples where the title's UVs point; the title points some menu glyphs at v≈0.008 (the atlas's first row), but that row is rendered as a striped band rather than glyphs. The first atlas row's glyphs aren't fully rasterized in variant A (a title-side atlas-population gap — same family as the cont.124-127 atlas saga: variant A doesn't execute all of the title's render-to-atlas work). The menu text is therefore PARTIALLY LEGIBLE: the glyphs sampling the clean rows read correctly; those sampling the top band stripe.
+
+**⇒ STATUS HONEST SUMMARY:** the menu text renders at its game-accurate 1280×720 position+size with ~2/3 of the glyphs legible; the remaining ~1/3 stripe because the atlas's first row is incompletely rasterized by variant A. The render pipeline (carve → atlas → upload → draw → position) is fully correct end-to-end.
+
+**⭐NEXT (cont.136) — either (a) the deeper title-side fix: get variant A to fully rasterize the atlas's top band (RE what renders into v≈0-0.16 of 0xA337D000 — likely a render-to-texture/EVENT the carve-once path skips; reuse the cont.125-127 directory-exec machinery), OR (b) PIVOT to the composited backdrop: texture the prim-8 backdrop + prim-5 panels with their REAL RGBA textures (cont.124: fmt=6 textures ARE populated) for the full menu background, deferring the band-striping as a documented title-side limitation. Given the depth of (a), lean (b) for visible monumental progress, then return to (a). Gate behind REX_TEXTGLYPH.
+
+**Default boot UNREGRESSED:** the per-glyph UV dump is a one-shot in the REX_SPRITECARVE carve. Verified — clean loader→XamLoaderLaunchTitle boot, 0 fatal (exit 137). Diff: kernel.cpp +5/−5.

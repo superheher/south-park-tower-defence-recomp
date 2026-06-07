@@ -1912,11 +1912,11 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                         if (dumped.compare_exchange_strong(exp, true)) {
                             fprintf(stderr, "[glyphlayout] FULL layout for gv=0x%X numI=%u stride=%u:\n", gv, numInd, stride);
                             for (uint32_t i = 0; i + 4 <= nr; i += 4) {
-                                uint32_t a0=GLD32(gv+i*stride+8), b0=GLD32(gv+i*stride+12);
-                                uint32_t a2=GLD32(gv+(i+2)*stride+8), b2=GLD32(gv+(i+2)*stride+12);
-                                float u0,w0,u2,w2; memcpy(&u0,&a0,4);memcpy(&w0,&b0,4);memcpy(&u2,&a2,4);memcpy(&w2,&b2,4);
-                                fprintf(stderr, "[glyph%02u] p0(%.1f,%.1f) p1(%.1f,%.1f) p2(%.1f,%.1f) p3(%.1f,%.1f) uv(%.3f,%.3f)-(%.3f,%.3f)\n",
-                                        i/4u, vb[i*2],vb[i*2+1], vb[(i+1)*2],vb[(i+1)*2+1], vb[(i+2)*2],vb[(i+2)*2+1], vb[(i+3)*2],vb[(i+3)*2+1], u0,w0,u2,w2);
+                                float uu[4],ww[4]; for (int j=0;j<4;j++){ uint32_t au=GLD32(gv+(i+j)*stride+8), aw=GLD32(gv+(i+j)*stride+12); memcpy(&uu[j],&au,4); memcpy(&ww[j],&aw,4); }
+                                // cont.135: ALL 4 per-vertex UVs (TL,TR,BR,BL) — verify the quad's UVs form a proper rect; a scrambled/degenerate UV set ⇒ striped sampling.
+                                fprintf(stderr, "[glyph%02u] pos TL(%.1f,%.1f) TR(%.1f,%.1f) BR(%.1f,%.1f) BL(%.1f,%.1f) | uv TL(%.3f,%.3f) TR(%.3f,%.3f) BR(%.3f,%.3f) BL(%.3f,%.3f)\n",
+                                        i/4u, vb[i*2],vb[i*2+1], vb[(i+1)*2],vb[(i+1)*2+1], vb[(i+2)*2],vb[(i+2)*2+1], vb[(i+3)*2],vb[(i+3)*2+1],
+                                        uu[0],ww[0], uu[1],ww[1], uu[2],ww[2], uu[3],ww[3]);
                             }
                         }
                     }
