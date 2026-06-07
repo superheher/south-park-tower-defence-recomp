@@ -812,6 +812,14 @@ bool LoadFontAtlasOnce() {
         uint8_t v = atlas[i];
         rgba[i*4+0] = 255; rgba[i*4+1] = 255; rgba[i*4+2] = 255; rgba[i*4+3] = v;
     }
+    // cont.134: dump the EXACT alpha buffer being uploaded (render-side, 256-linear) → /tmp; compare to cont.125's
+    // clean kernel-side FONTDUMP. Striped here ⇒ the upload's 256-linear read is wrong (row pitch/tiling); clean ⇒
+    // the bug is downstream (geometry/UVs/sampler).
+    if (FILE* pf = fopen("/tmp/varianta_uploaded_atlas.ppm", "wb")) {
+        fprintf(pf, "P5\n256 256\n255\n");
+        for (uint32_t i = 0; i < 256u*256u; i++) { uint8_t a = rgba[i*4+3]; fwrite(&a, 1, 1, pf); }
+        fclose(pf); fprintf(stderr, "[render] dumped uploaded atlas alpha -> /tmp/varianta_uploaded_atlas.ppm\n");
+    }
     g_bgLoaded = UploadTexture(rgba.data(), 256, 256);
     fprintf(stderr, "[render] font atlas %s (256x256 FMT_8 @ guest 0x%X) — %u/%u non-zero bytes (stable=%d, waited=%d frames)\n",
             g_bgLoaded ? "uploaded" : "FAILED", bestOff, nz, 256u*256u, s_stable, s_waited);

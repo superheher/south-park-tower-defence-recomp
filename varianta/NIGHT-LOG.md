@@ -5508,3 +5508,17 @@ Sent the decoded atlas to the user (it shows the menu's real text + confirms the
 **⭐NEXT (cont.134) — fix the striped glyphs (legible menu text):** (a) dump the uploaded atlas texture (render side) → identify upload-stride vs geometry-UV as the striping cause; (b) fix it (correct stride/untile, or the UV mapping); (c) capture → LEGIBLE menu text at its game-accurate 1280×720 position. Then the composited backdrop (cont.124 RGBA panels) + housekeeping (drop REX_CARVEONCE test). Gate behind REX_TEXTGLYPH.
 
 **Default boot UNREGRESSED:** the transform change is in the REX_TEXTGLYPH-gated textglyph carve. Verified — clean loader→XamLoaderLaunchTitle boot, 0 fatal (exit 137). Diff: kernel.cpp +5/−2.
+
+———— cont.134 — 🔍 THE UPLOAD IS CLEAN, the striping is per-glyph GEOMETRY/UV: dumped the render-side uploaded atlas (clean "□_This col…", identical to cont.125) and zoomed the rendered text — SOME glyphs render clean+legible (s,n,t,r,U,_), OTHERS as vertical striped blocks. So the atlas/upload/sampler are fine; specific glyph quads have a geometry/UV defect ————
+
+**MEASUREMENT (one-shot atlas dump + zoom) — render behavior unchanged:** cont.133 left the menu text bigger but striped. To split "upload bug" vs "geometry/UV bug", added a one-shot PPM dump of the EXACT alpha buffer LoadFontAtlasOnce uploads (256-linear, render-side) + zoomed the rendered text 3×.
+
+**RESULT — the upload is CLEAN; the striping is per-glyph:**
+- The uploaded atlas dump (/tmp/varianta_uploaded_atlas.ppm) shows **clean legible glyphs "□_This col / ntruedam / fpg"** — identical to cont.125's kernel-side FONTDUMP. So the render-side 256-linear read + UploadTexture are CORRECT (not a row-stride/tiling bug). Saved varianta/tools/uploaded_atlas_clean_c134.png.
+- Zooming the rendered text (3×): **a MIX — some glyphs are clean and legible (s, n, t, r, U, _), others render as vertical striped white blocks.** Since the atlas + sampler are proven good (the clean glyphs prove the path works), the striping is a **per-glyph GEOMETRY/UV defect** — specific quads sample wrong (a too-wide quad spanning multiple atlas cells, an overlapping duplicate, or a bad per-vertex UV), not a global bug.
+
+**⇒ STRIPING = a per-glyph quad/UV issue (cont.135):** the difference between the clean and striped glyphs is in the per-glyph DATA. Decisive next: dump EACH carved glyph's pos-width vs uv-width (and all 4 corners' UVs) — find the striped glyphs (likely pos_width >> uv_width×256, i.e. a wide quad stretching a narrow atlas cell, or uv_width spanning multiple atlas glyphs) and fix the carve (clamp/skip degenerate quads, or correct the per-vertex UV read). The menu text is already PARTIALLY legible at its game-accurate position — this is the last quality step.
+
+**⭐NEXT (cont.135) — fix the striped glyphs:** per-glyph pos/uv-width dump → identify + fix the defective quads → fully legible menu text. Then the composited backdrop (cont.124 RGBA panels). Gate behind REX_TEXTGLYPH.
+
+**Default boot UNREGRESSED:** the atlas dump is a one-shot in LoadFontAtlasOnce (render-path only; default boot never enters it). Verified — clean loader→XamLoaderLaunchTitle boot, 0 fatal (exit 137). Diff: vulkan_render.cpp +8.
