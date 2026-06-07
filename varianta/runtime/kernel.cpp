@@ -1854,7 +1854,7 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                 for (uint32_t s = 0; s < 96; s++) { uint32_t d0 = GLD32(0x7FC80000u + (0x4800u + s*2u)*4u);
                     if ((d0 & 3u) != 3u) continue;
                     uint32_t d1 = GLD32(0x7FC80000u + (0x4800u + s*2u + 1u)*4u);
-                    gv = 0xA0000000u | ((d0 & 0xFFFFFFFCu) & 0x1FFFFFFFu); vbBytes = ((d1 >> 2) & 0xFFFFFFu) * 4u; break; }
+                    gv = 0xA0000000u | ((d0 & 0xFFFFFFFCu) & 0x1FFFFFFFu); vbBytes = ((d1 >> 2) & 0xFFFFFFu) * 4u; }   // cont.111: take the LAST type-3 slot (= vf95; the first is a stale slot)
                 if (gv) {
                     uint32_t stride = (numInd && vbBytes >= numInd*8u) ? vbBytes / numInd : 8u;   // bytes/vertex
                     static thread_local float vb[512*2];
