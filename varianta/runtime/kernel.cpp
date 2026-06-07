@@ -3632,22 +3632,33 @@ PPC_FUNC(sub_821C6E58)
         // EMITTED anywhere (built into a non-executed buffer) or never emitted (the flush doesn't run)? prim @
         // init&0x3F; init = (op==0x22)?data[1]:data[0] (data starts at header+4). Gated REX_DRAWSCAN, capped.
         static const bool s_drawscan = getenv("REX_DRAWSCAN") != nullptr;
-        if (s_drawscan) { static std::atomic<int> dsn{0}; if (dsn.fetch_add(1) < 4) { GpuLock _glds;
-            int p5=0,p13=0,p8=0,p4=0,p6=0,p2=0,p1=0,pother=0; uint32_t firstSprite=0, firstSpriteInit=0;
+        if (s_drawscan) { static std::atomic<int> dsn{0}; if (dsn.fetch_add(1) < 6) { GpuLock _glds;
+            int p5=0,p13=0,p8=0,p4=0,pother=0; uint32_t firstSprite=0, firstSpriteInit=0, lastSprite=0;
             for (uint32_t a = 0xA0000000u; a + 12 <= 0xA0600000u; a += 4) {
                 uint32_t h = GLD32(a); if ((h >> 30) != 3u) continue;
                 uint32_t op = (h >> 8) & 0x7Fu; if (op != 0x22u && op != 0x36u) continue;
                 uint32_t init = (op == 0x22u) ? GLD32(a + 8) : GLD32(a + 4);
                 uint32_t prim = init & 0x3Fu, numI = init >> 16;
                 if (numI == 0 || numI > 100000u) continue;                 // sanity: skip garbage inits
-                switch (prim) { case 1:p1++;break; case 2:p2++;break; case 4:p4++;break;
-                    case 5:p5++; if(!firstSprite){firstSprite=a;firstSpriteInit=init;} break;
-                    case 6:p6++;break; case 8:p8++;break;
-                    case 13:p13++; if(!firstSprite){firstSprite=a;firstSpriteInit=init;} break;
-                    default:pother++; }
+                if (prim==5||prim==13) { if(prim==5)p5++; else p13++; if(!firstSprite){firstSprite=a;firstSpriteInit=init;} lastSprite=a; }
+                else if (prim==8) p8++; else if (prim==4) p4++; else pother++;
             }
-            fprintf(stderr, "[drawscan] #%d DRAW_INDX in 0xA0000000-0xA0600000: p5(strip)=%d p13(quad)=%d p8(rect)=%d p4(list)=%d p6(fan)=%d p2(line)=%d p1(pt)=%d other=%d | firstSprite@0x%X init=0x%X\n",
-                    (int)dsn.load(), p5, p13, p8, p4, p6, p2, p1, pother, firstSprite, firstSpriteInit);
+            fprintf(stderr, "[drawscan] #%d p5(strip)=%d p13(quad)=%d p8(rect)=%d p4(list)=%d other=%d | sprites @[0x%X..0x%X] firstInit=0x%X\n",
+                    (int)dsn.load(), p5, p13, p8, p4, pother, firstSprite, lastSprite, firstSpriteInit);
+            if (firstSprite) {
+                // cont.105: dump the 20 dwords bracketing the first sprite draw (is it a standalone IB? what type-3 packets bracket it?)
+                char buf[256]; int bp = snprintf(buf, sizeof buf, "[drawscan]   bracket 0x%X:", firstSprite);
+                for (int i = -6; i < 14 && bp < 230; i++) bp += snprintf(buf+bp, sizeof(buf)-bp, " %08X", GLD32(firstSprite + i*4));
+                fprintf(stderr, "%s\n", buf);
+                // scan for an INDIRECT_BUFFER (op 0x3F) whose target lands in the sprite region — the link variant A may not be following
+                uint32_t lo = (firstSprite & ~0xFFFu) - 0x4000u, hi = (lastSprite & ~0xFFFu) + 0x4000u; int ibhit = 0;
+                for (uint32_t a = 0xA0000000u; a + 12 <= 0xA0600000u && ibhit < 8; a += 4) {
+                    uint32_t h = GLD32(a); if ((h >> 30) != 3u || ((h >> 8) & 0x7Fu) != 0x3Fu) continue;
+                    uint32_t tgt = GLD32(a + 4), tg = 0xA0000000u | (tgt & 0x1FFFFFFFu), len = GLD32(a + 8);
+                    if (tg >= lo && tg <= hi) { fprintf(stderr, "[drawscan]   IB@0x%X -> 0x%X len=%u (targets sprite region)\n", a, tg, len & 0xFFFFFu); ibhit++; }
+                }
+                if (!ibhit) fprintf(stderr, "[drawscan]   NO INDIRECT_BUFFER targets the sprite region [0x%X..0x%X]\n", lo, hi);
+            }
         }}
         uint32_t fenceptr = GLD32(device + 10896);
         if (fenceptr) {
