@@ -3666,6 +3666,20 @@ PPC_FUNC(sub_821C6E58)
                     if (v == firstSprite || v == phys) { fprintf(stderr, "[drawscan]   PTR@0x%X = 0x%X (-> sprite)\n", a, v); ptrhit++; }
                 }
                 if (!ptrhit) fprintf(stderr, "[drawscan]   NO raw pointer to 0x%X/phys 0x%X found\n", firstSprite, phys);
+                // cont.108: scan SYSTEM memory (guest heap + the render-ctx/device structs are LOW: dev@0x26F80,
+                // render-ctx@0x000E50F0) for a pointer NEAR the sprite buffer — gpuForm = 0xA0000000|(v&0x1FFFFFFF)
+                // within ±0x4000 of the sprite. The cont.98 batched-UI builder holds the sprite cmd-buffer here.
+                static std::atomic<bool> sysScanDone{false};
+                if (!sysScanDone.exchange(true)) {
+                    int sysptr = 0;
+                    for (uint32_t a = 0x00010000u; a + 4 <= 0x01000000u && sysptr < 16; a += 4) {
+                        uint32_t v = GLD32(a); if (v < 0x1000u) continue;
+                        uint32_t gf = 0xA0000000u | (v & 0x1FFFFFFFu);
+                        if (gf + 0x4000u >= firstSprite && gf <= firstSprite + 0x4000u)
+                            { fprintf(stderr, "[drawscan]   SYSPTR@0x%X = 0x%X (gpuForm 0x%X near sprite 0x%X)\n", a, v, gf, firstSprite); sysptr++; }
+                    }
+                    if (!sysptr) fprintf(stderr, "[drawscan]   NO system-memory pointer near the sprite buffer (0x%X) found in 0x10000-0x1000000\n", firstSprite);
+                }
             }
         }}
         // cont.106 (THE FIX): the sprite/text draws (prim 5/13) are linked into the MAIN RING (0xA0002000) via
