@@ -3593,6 +3593,31 @@ PPC_FUNC(sub_821C6E58)
         // cont.81: read-only dump of the build-cursor directory at this LIVE per-frame sync point (gated, capped).
         static const bool s_framebuf = getenv("REX_FRAMEBUF") != nullptr;
         if (s_framebuf) { static std::atomic<int> fbn{0}; if (fbn.fetch_add(1) < 250) { GpuLock _glfb; FrameBufDump(device); } }
+        // cont.88: EXECUTE the build-cursor segment at this fence-wait (its REAL EVENT_WRITE_SHD fence-writes +
+        // INTERRUPT + DRAW_INDX) via ExecutePM4 — instead of the blind fence-forward below — so the fence advances
+        // as a REAL result of executing the located per-frame segment (cont.21's "execute the built fences", now
+        // with the real segment found, cont.80-81). Then MEASURE whether the title PROGRESSES (kick unfreezes /
+        // labels move on-screen). HIGH RISK (mid-frame side effects: fires interrupts/producer, advances fences) —
+        // gated + capped + GpuLock; default boot unaffected (flag off). [experiment]
+        static const bool s_frameexec = getenv("REX_FRAMEEXEC") != nullptr;
+        if (s_frameexec) { static std::atomic<int> fxn{0}; int fk = fxn.fetch_add(1);
+            if (fk < 30) { GpuLock _glfx;
+                uint32_t b0 = GLD32(device + 13568), b1 = GLD32(device + 13572);
+                uint32_t lo = b0 < b1 ? b0 : b1, hi = b0 < b1 ? b1 : b0;
+                if (lo >= 0xA0000000u && hi > lo && (hi - lo) < 0x200000u) {
+                    int nseg = 0;
+                    for (uint32_t a = lo; a + 8 <= hi && nseg < 64; a += 4) {
+                        uint32_t d = GLD32(a); if ((d >> 24) != 0x81u) continue;
+                        uint32_t len = d & 0xFFFFFFu, phys = GLD32(a + 4);
+                        if (len == 0 || len >= 0x8000u || (phys & 3)) continue;
+                        uint32_t seg = 0xA0000000u | (phys & 0x1FFFFFFFu);
+                        if ((GLD32(seg) >> 30) == 2u) continue;
+                        ExecutePM4(seg, len, 1); nseg++;
+                    }
+                    if (g_ktrace) fprintf(stderr, "[frameexec] #%d executed %d segs from [0x%X..0x%X]\n", fk, nseg, lo, hi);
+                }
+            }
+        }
         uint32_t fenceptr = GLD32(device + 10896);
         if (fenceptr) {
             uint32_t head = GLD32(device + 10908), current = GLD32(fenceptr);
