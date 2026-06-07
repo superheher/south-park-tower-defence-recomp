@@ -1847,24 +1847,33 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
             // worthwhile. Sequential carve from the dense start, authoring→clip, triangulate per prim.
             static const bool s_spritecarve = getenv("REX_SPRITECARVE") != nullptr;
             if (s_spritecarve && (prim == 5 || prim == 13) && numInd >= 3) {
-                uint32_t s1 = 0xA01FE0FCu;
-                if (tl_s1cursor == 0)   // find the first dense authoring-coord run once per frame
-                    for (uint32_t o = 8; o < 0x80000; o += 8) { uint32_t u = GLD32(s1 + o); float f; memcpy(&f, &u, 4);
-                        if (f > 16.f && f < 4096.f) { tl_s1cursor = o; break; } }
-                auto cx = [](float v){ return v / 884.0f - 1.0f; };
-                auto cy = [](float v){ return v / 521.5f - 1.0f; };
-                static thread_local float vb[512*2];
-                uint32_t nr = numInd < 512 ? numInd : 512;
-                for (uint32_t i = 0; i < nr; i++) { uint32_t ux = GLD32(s1 + tl_s1cursor + i*8), uy = GLD32(s1 + tl_s1cursor + i*8 + 4);
-                    memcpy(&vb[i*2], &ux, 4); memcpy(&vb[i*2+1], &uy, 4); }
-                tl_s1cursor += numInd * 8;
-                if (prim == 5) { for (uint32_t i = 2; i < nr; i++) {   // tri-strip
-                    float t[6] = { cx(vb[(i-2)*2]),cy(vb[(i-2)*2+1]), cx(vb[(i-1)*2]),cy(vb[(i-1)*2+1]), cx(vb[i*2]),cy(vb[i*2+1]) };
-                    if (tl_esVerts.size() < 60000) tl_esVerts.insert(tl_esVerts.end(), t, t+6); } }
-                else { for (uint32_t i = 0; i + 4 <= nr; i += 4) {     // quad-list -> 2 tris
-                    float q[12] = { cx(vb[i*2]),cy(vb[i*2+1]), cx(vb[(i+1)*2]),cy(vb[(i+1)*2+1]), cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]),
-                                    cx(vb[i*2]),cy(vb[i*2+1]), cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]), cx(vb[(i+3)*2]),cy(vb[(i+3)*2+1]) };
-                    if (tl_esVerts.size() < 60000) tl_esVerts.insert(tl_esVerts.end(), q, q+12); } }
+                // cont.110: read the draw's ACTUAL kVertex fetch slot (cont.109: with REX_DIREXEC the sprites reach
+                // here fetching slot 95 / 0xA011EE80 with REAL data — NOT the heuristic slot-1). Scan the fetch
+                // region for the first type-3 (kVertex) slot; per-draw stride = vbBytes/numInd (8 for quads, 16 for text).
+                uint32_t gv = 0, vbBytes = 0;
+                for (uint32_t s = 0; s < 96; s++) { uint32_t d0 = GLD32(0x7FC80000u + (0x4800u + s*2u)*4u);
+                    if ((d0 & 3u) != 3u) continue;
+                    uint32_t d1 = GLD32(0x7FC80000u + (0x4800u + s*2u + 1u)*4u);
+                    gv = 0xA0000000u | ((d0 & 0xFFFFFFFCu) & 0x1FFFFFFFu); vbBytes = ((d1 >> 2) & 0xFFFFFFu) * 4u; break; }
+                if (gv) {
+                    uint32_t stride = (numInd && vbBytes >= numInd*8u) ? vbBytes / numInd : 8u;   // bytes/vertex
+                    static thread_local float vb[512*2];
+                    uint32_t nr = numInd < 512 ? numInd : 512;
+                    for (uint32_t i = 0; i < nr; i++) { uint32_t ux = GLD32(gv + i*stride), uy = GLD32(gv + i*stride + 4);
+                        memcpy(&vb[i*2], &ux, 4); memcpy(&vb[i*2+1], &uy, 4); }
+                    static std::atomic<int> scn{0}; if (g_ktrace && scn.fetch_add(1) < 12)
+                        fprintf(stderr, "[spritecarve] prim=%u numI=%u gv=0x%X stride=%u v0=(%.1f,%.1f) v1=(%.1f,%.1f) v2=(%.1f,%.1f)\n",
+                                prim, numInd, gv, stride, vb[0],vb[1], vb[2],vb[3], vb[4],vb[5]);
+                    auto cx = [](float v){ return v / 884.0f - 1.0f; };      // placeholder authoring->clip (tune from the log)
+                    auto cy = [](float v){ return v / 521.5f - 1.0f; };
+                    if (prim == 5) { for (uint32_t i = 2; i < nr; i++) {   // tri-strip
+                        float t[6] = { cx(vb[(i-2)*2]),cy(vb[(i-2)*2+1]), cx(vb[(i-1)*2]),cy(vb[(i-1)*2+1]), cx(vb[i*2]),cy(vb[i*2+1]) };
+                        if (tl_esVerts.size() < 60000) tl_esVerts.insert(tl_esVerts.end(), t, t+6); } }
+                    else { for (uint32_t i = 0; i + 4 <= nr; i += 4) {     // quad-list -> 2 tris
+                        float q[12] = { cx(vb[i*2]),cy(vb[i*2+1]), cx(vb[(i+1)*2]),cy(vb[(i+1)*2+1]), cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]),
+                                        cx(vb[i*2]),cy(vb[i*2+1]), cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]), cx(vb[(i+3)*2]),cy(vb[(i+3)*2+1]) };
+                        if (tl_esVerts.size() < 60000) tl_esVerts.insert(tl_esVerts.end(), q, q+12); } }
+                }
             }
         }
         // step (a) result-gate: a resolve (EDRAM->texture readback) is a draw with an active copy command —
@@ -4212,6 +4221,24 @@ PPC_FUNC(__imp__VdSwap) {
                 if ((GLD32(guest) >> 30) == 2u) continue;               // first packet type-2 (nop) => not a segment
                 ExecutePM4(guest, len, 1);                              // depth 1 = IB body (skips the cpdump path)
                 segs++;
+            }
+            // cont.110: ALSO execute the FULL device DIRECTORY's other command segments (cont.108/109: the sprite/text
+            // draws are in a PRIOR directory entry, NOT the current [base,wptr] chunk). Under tl_execsegs=true these
+            // carve into tl_esVerts → the Vulkan bridge → VISIBLE. (cont.109 proved they reach ExecuteType3 with real
+            // vf95 verts; here they also get carved+submitted.) Gated REX_DIREXEC, in-execsegs so the carve fires.
+            if (getenv("REX_DIREXEC")) {
+                uint32_t addrs[96]; int na = 0;
+                for (uint32_t off = 13400; off <= 13700 && na < 96; off += 4) {
+                    uint32_t v = GLD32(dv + off);
+                    if (v >= 0xA0090000u && v <= 0xA0120000u) addrs[na++] = v;
+                }
+                for (int i = 1; i < na; i++) { uint32_t k = addrs[i]; int j = i-1; while (j >= 0 && addrs[j] > k) { addrs[j+1]=addrs[j]; j--; } addrs[j+1]=k; }
+                for (int i = 0; i + 1 < na; i++) {
+                    if (addrs[i+1] <= addrs[i]) continue;
+                    uint32_t len = (addrs[i+1] - addrs[i]) / 4u;
+                    if (len == 0u || len > 0x8000u || (GLD32(addrs[i]) >> 30) == 2u) continue;
+                    ExecutePM4(addrs[i], len, 1); segs++;
+                }
             }
             tl_execsegs = false;
             tl_txtFrame = nullptr;
