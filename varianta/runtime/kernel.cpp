@@ -1864,6 +1864,13 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                     static std::atomic<int> scn{0}; if (g_ktrace && scn.fetch_add(1) < 12)
                         fprintf(stderr, "[spritecarve] prim=%u numI=%u gv=0x%X stride=%u v0=(%.1f,%.1f) v1=(%.1f,%.1f) v2=(%.1f,%.1f)\n",
                                 prim, numInd, gv, stride, vb[0],vb[1], vb[2],vb[3], vb[4],vb[5]);
+                    // cont.114: for the stride-16 text draws, dump the FULL float4 (xy=pos, zw=likely UV into the font atlas)
+                    if (prim == 13 && stride >= 16) { static std::atomic<int> tn{0}; if (g_ktrace && tn.fetch_add(1) < 4) {
+                        char tb[300]; int tp = snprintf(tb, sizeof tb, "[textvert] gv=0x%X numI=%u xy+zw:", gv, numInd);
+                        for (uint32_t i = 0; i < 6 && i < numInd && tp < 270; i++) {
+                            uint32_t uz=GLD32(gv+i*stride+8), uw=GLD32(gv+i*stride+12); float fz,fw; memcpy(&fz,&uz,4); memcpy(&fw,&uw,4);
+                            tp += snprintf(tb+tp, sizeof(tb)-tp, " [%.1f,%.1f,%.3f,%.3f]", vb[i*2], vb[i*2+1], fz, fw); }
+                        fprintf(stderr, "%s\n", tb); }}
                     auto cx = [](float v){ return v / 884.0f - 1.0f; };      // placeholder authoring->clip (tune from the log)
                     auto cy = [](float v){ return v / 521.5f - 1.0f; };
                     if (prim == 5) { for (uint32_t i = 2; i < nr; i++) {   // tri-strip
