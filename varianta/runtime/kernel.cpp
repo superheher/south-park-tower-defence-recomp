@@ -3463,6 +3463,7 @@ static void FrameBufDump(uint32_t device) {
             b0, b1, lo, hi, (hi - lo) / 4, GLD32(b0), GLD32(b0 + 4), GLD32(b0 + 8));
     if (lo < 0xA0000000u || hi <= lo || (hi - lo) > 0x200000u) { fprintf(stderr, "[framebuf]  (dir range not sane)\n"); return; }
     uint32_t shadow[256]; for (int i = 0; i < 256; i++) shadow[i] = 0;   // fetch region 0x4800..0x48FF (cumulative)
+    uint32_t alu[128]; for (int i = 0; i < 128; i++) alu[i] = 0;          // cont.85: ALU consts 0x4000..0x407F (the World+Proj transform reg 0x4000, cont.23/73)
     int descs = 0, segs = 0, draws = 0, liveDraws = 0, contentDraws = 0;
     for (uint32_t a = lo; a + 8 <= hi && descs < 512; a += 4) {
         uint32_t d = GLD32(a);
@@ -3481,16 +3482,19 @@ static void FrameBufDump(uint32_t device) {
             if (t == 2) continue;
             if (t == 0) { uint32_t cnt = ((pkt >> 16) & 0x3FFF) + 1, bi = pkt & 0x7FFF; bool one = (pkt >> 15) & 1;
                 for (uint32_t m = 0; m < cnt && a2 + 4 <= segEnd; m++, a2 += 4) { uint32_t ri = one ? bi : bi + m;
-                    if (ri >= 0x4800u && ri < 0x4900u) shadow[ri - 0x4800u] = GLD32(a2); }
+                    if (ri >= 0x4800u && ri < 0x4900u) shadow[ri - 0x4800u] = GLD32(a2);
+                    else if (ri >= 0x4000u && ri < 0x4080u) alu[ri - 0x4000u] = GLD32(a2); }
                 continue; }
             if (t == 1) { a2 += 8; continue; }
             uint32_t op = (pkt >> 8) & 0x7F, cnt = ((pkt >> 16) & 0x3FFF) + 1;
             if (op == 0x2D) {                                       // SET_CONSTANT
                 uint32_t ot = GLD32(a2), index = ot & 0x7FF, type = (ot >> 16) & 0xFF;
                 if (type == 1) for (uint32_t i = 1; i < cnt; i++) { uint32_t ri = index + (i - 1); if (ri < 256u) shadow[ri] = GLD32(a2 + i * 4); }
+                else if (type == 0) for (uint32_t i = 1; i < cnt; i++) { uint32_t ri = index + (i - 1); if (ri < 128u) alu[ri] = GLD32(a2 + i * 4); }  // ALU 0x4000 (transform)
             } else if (op == 0x55) {                                // SET_CONSTANT2 (absolute 16-bit reg — cont.54: also binds fetch/texture consts)
                 uint32_t aidx = GLD32(a2) & 0xFFFF;
-                for (uint32_t i = 1; i < cnt; i++) { uint32_t ri = aidx + (i - 1); if (ri >= 0x4800u && ri < 0x4900u) shadow[ri - 0x4800u] = GLD32(a2 + i * 4); }
+                for (uint32_t i = 1; i < cnt; i++) { uint32_t ri = aidx + (i - 1); if (ri >= 0x4800u && ri < 0x4900u) shadow[ri - 0x4800u] = GLD32(a2 + i * 4);
+                    else if (ri >= 0x4000u && ri < 0x4080u) alu[ri - 0x4000u] = GLD32(a2 + i * 4); }
             } else if (op == 0x22 || op == 0x36) {                  // DRAW_INDX / DRAW_INDX_2
                 draws++;
                 uint32_t init = (op == 0x22) ? GLD32(a2 + 4) : GLD32(a2);
@@ -3527,6 +3531,18 @@ static void FrameBufDump(uint32_t device) {
                     float pf[12]; for (int q = 0; q < 12; q++) { uint32_t w = GLD32(vbase + q*4); memcpy(&pf[q], &w, 4); }
                     fprintf(stderr, "[framebuf]     ^prim%u vbase floats: %.1f %.1f %.1f %.1f | %.1f %.1f %.1f %.1f | %.1f %.1f %.1f %.1f\n",
                             prim, pf[0],pf[1],pf[2],pf[3], pf[4],pf[5],pf[6],pf[7], pf[8],pf[9],pf[10],pf[11]);
+                }
+                // cont.85: for prim-13 TEXT draws (numI=100/156/252 = the REAL menu labels), read the exec-time
+                // World+Proj transform (reg 0x4000 ALU consts, cont.23/73) from alu[] and project the World origin
+                // -> clip — does the REAL label have an ON-SCREEN game-accurate position at the FENCE-WAIT (vs
+                // cont.73's off-screen DEBUG label at VdSwap timing)? Tx=c0.w Ty=c1.w Px=c4.x Pxw=c4.w Py=c5.y Pyw=c5.w.
+                if (prim == 13 && draws <= 24) {
+                    auto af = [&](int i){ float f; memcpy(&f, &alu[i], 4); return f; };
+                    float Tx=af(3), Ty=af(7), Px=af(16), Pxw=af(19), Py=af(21), Pyw=af(23);
+                    float ox = Tx*Px + Pxw, oy = Ty*Py + Pyw;
+                    bool onscr = ox>-1.2f && ox<1.2f && oy>-1.2f && oy<1.2f;
+                    fprintf(stderr, "[fwxform] prim13 numI=%u World=(%.1f,%.1f) Proj=(%.4f,%.4f)+(%.4f,%.4f) origin->clip=(%.3f,%.3f) %s\n",
+                            numI, Tx,Ty, Px,Py, Pxw,Pyw, ox,oy, onscr ? "ON-SCREEN" : "off");
                 }
                 // cont.84 (REX_FRAMEDRAW): composite the LIVE prim-8 draws into g_frameBuf at their REAL screen
                 // positions (carved from the verts) — the GAME-ACCURATE placement cont.73 couldn't reach — via the
