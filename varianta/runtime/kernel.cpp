@@ -1591,6 +1591,15 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
         address &= ~0x3u;                       // low 2 bits = endianness; the standard fence is k8in32
         GST32(TranslatePhys(address), dataValue);   // BE store => guest's BE load reads back dataValue
         if (g_cptrace) fprintf(stderr, "[cp] EVENT_WRITE_SHD addr=0x%X val=0x%X cnt=%d\n", address, dataValue, isCounter);
+        // cont.90 (REX_EWDRAIN): a FAITHFUL per-submission device+0x2b04 drain — decrement the kick-gate counter
+        // when the CP processes a submission's completion marker (EVENT_WRITE_SHD = VS|PS-done fence), instead of
+        // REX_CPCOMPLETE's blanket 1/vblank (cont.22 identified per-submission as the prod-faithful model: prod
+        // oscillates 0<->1). With REX_FRAMEEXEC executing the real located segment, its EVENT_WRITE_SHDs fire here
+        // -> drains the gate per real completion marker. Re-tests cont.22's "ring flow != content" with the real
+        // segment located (cont.88). [experiment, gated, default-off]
+        static const bool s_ewdrain = getenv("REX_EWDRAIN") != nullptr;
+        if (s_ewdrain && g_interruptData) { uint32_t c = GLD32(g_interruptData + 0x2b04);
+            if (c > 0) GST32(g_interruptData + 0x2b04, c - 1); }
         break;
       }
       case PM4_EVENT_WRITE:
