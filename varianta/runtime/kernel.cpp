@@ -4317,7 +4317,14 @@ PPC_FUNC(__imp__VdSwap) {
             if (getenv("REX_UITEXT")) { std::lock_guard<std::mutex> lk(g_txtMtx); txtFrame = g_txtSnaps; }  // COPY (persist)
             for (auto& sn : txtFrame) sn.used = false;                                                       // re-match each frame
             tl_txtFrame = txtFrame.empty() ? nullptr : &txtFrame;
-            for (uint32_t a = base; a + 8 <= wptr; a += 4) {
+            // cont.126: REX_NOCHUNK skips this [base,wptr] CHUNK re-exec. cont.125 proved REX_EXECSEGS BREAKS the
+            // font-atlas population (the cont.122-124 "empty atlas" artifact) while REX_DIREXEC alone leaves it
+            // populated. The directory exec below (4335) is the same faithful logic as the working DIREXEC; the
+            // suspect is THIS chunk re-exec, which re-runs the title's current command stream every swap and
+            // disrupts the font system. Skipping it (but keeping the directory carve + submit) should let the
+            // atlas stay populated AND the text carve → render. Gated; default behaviour unchanged without the flag.
+            static const bool s_nochunk = getenv("REX_NOCHUNK") != nullptr;
+            if (!s_nochunk) for (uint32_t a = base; a + 8 <= wptr; a += 4) {
                 uint32_t d = GLD32(a);
                 if ((d >> 24) != 0x81u) continue;                       // census parse: 0x81LLLLLL descriptor tag
                 uint32_t len = d & 0xFFFFFFu, addr = GLD32(a + 4);
