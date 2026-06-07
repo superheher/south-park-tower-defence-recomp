@@ -3514,8 +3514,17 @@ static void FrameBufDump(uint32_t device) {
                     if (f == f && f > -8192.f && f < 8192.f && (f > 0.0039f || f < -0.0039f)) realF++; }
                 bool live = idxLive || realF >= 16;
                 if (live) liveDraws++;
-                if (draws <= 28) fprintf(stderr, "[framebuf]   seg#%d DRAW prim=%u numI=%u vtxSlot=%d vbase=0x%X idx=[%u %u %u] iv=(%.1f,%.1f)(%.1f,%.1f) poolRealF=%d/1024 %s\n",
-                                         segs, prim, numI, vslot, vbase, ix[0], ix[1], ix[2], iv[0], iv[1], iv[2], iv[3], realF, live ? "LIVE" : "dead");
+                uint32_t srcSel = (init >> 6) & 3;                   // 0=DMA-indexed, 2=auto-index (sequential)
+                if (draws <= 28) fprintf(stderr, "[framebuf]   seg#%d DRAW prim=%u numI=%u src=%u vtxSlot=%d vbase=0x%X poolRealF=%d/1024 %s\n",
+                                         segs, prim, numI, srcSel, vslot, vbase, realF, live ? "LIVE" : "dead");
+                // cont.83: reveal the EXACT vertex layout/stride of the first few LIVE content draws — the draws
+                // are auto-indexed (src=2) so verts are sequential vbase + j*stride; dump 12 raw pool floats so
+                // the real stride (8=pos.xy / 16=pos+uv / 24=pos+uv+rgba …) + coords are visible (cont.82 idx fix).
+                if (live && (prim == 5 || prim == 13 || prim == 4 || prim == 8) && draws <= 16) {
+                    float pf[12]; for (int q = 0; q < 12; q++) { uint32_t w = GLD32(vbase + q*4); memcpy(&pf[q], &w, 4); }
+                    fprintf(stderr, "[framebuf]     ^prim%u vbase floats: %.1f %.1f %.1f %.1f | %.1f %.1f %.1f %.1f | %.1f %.1f %.1f %.1f\n",
+                            prim, pf[0],pf[1],pf[2],pf[3], pf[4],pf[5],pf[6],pf[7], pf[8],pf[9],pf[10],pf[11]);
+                }
             }
             a2 += cnt * 4;
         }
