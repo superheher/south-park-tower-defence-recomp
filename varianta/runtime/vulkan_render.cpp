@@ -783,16 +783,27 @@ bool LoadBackgroundOnce() {
 bool LoadFontAtlasOnce() {
     if (g_bgLoaded || !g_base) return g_bgLoaded;
     const uint8_t* atlas = g_base + 0x337D000u;          // phys of the GPU aperture addr 0xA337D000
+    // cont.122 FIX: the atlas at 0xA337D000 is a DYNAMIC glyph cache (cont.116) the title populates over time.
+    // cont.121 PROVED uploading at the first text submit captures an EMPTY (0/65536 non-zero) atlas => the text
+    // samples a transparent texture => invisible. Defer the (single) upload until the cache has populated: require
+    // nz>0 AND nz stable across a few frames (= done filling), with a frame-count fallback so it never waits
+    // forever. UploadTexture is NOT re-entrant (it leaks the old image/descriptor each call), so upload exactly once.
+    uint32_t nz = 0;
+    for (uint32_t i = 0; i < 256u * 256u; i++) if (atlas[i]) nz++;
+    { static int s_dbg = 0; if ((s_dbg++ % 120) == 0) fprintf(stderr, "[fontwait] check #%d: atlas nz=%u/65536 @ g_base+0x337D000\n", s_dbg, nz); }   // cont.122: confirm whether 0x337D000 ever populates this run
+    static uint32_t s_lastNz = 0; static int s_stable = 0, s_waited = 0;
+    s_waited++;
+    if (nz == s_lastNz) s_stable++; else { s_stable = 0; s_lastNz = nz; }
+    if (nz == 0) return false;                            // still empty — retry next frame
+    if (s_stable < 3 && s_waited < 240) return false;     // still populating (nz changing) — retry, unless we've waited ~240 frames
     std::vector<uint8_t> rgba((size_t)256 * 256 * 4);
-    uint32_t nz = 0;   // cont.121: count non-zero atlas bytes AT upload time — if ~0, the dynamic glyph cache
-    for (uint32_t i = 0; i < 256u * 256u; i++) {   // hasn't populated yet (uploaded too early) => the text samples a transparent atlas => invisible.
+    for (uint32_t i = 0; i < 256u * 256u; i++) {
         uint8_t v = atlas[i];
-        if (v) nz++;
         rgba[i*4+0] = 255; rgba[i*4+1] = 255; rgba[i*4+2] = 255; rgba[i*4+3] = v;
     }
     g_bgLoaded = UploadTexture(rgba.data(), 256, 256);
-    fprintf(stderr, "[render] font atlas %s (256x256 FMT_8 @ guest 0x337D000) — %u/%u non-zero bytes at upload\n",
-            g_bgLoaded ? "uploaded" : "FAILED", nz, 256u*256u);
+    fprintf(stderr, "[render] font atlas %s (256x256 FMT_8 @ guest 0x337D000) — %u/%u non-zero bytes (stable=%d, waited=%d frames)\n",
+            g_bgLoaded ? "uploaded" : "FAILED", nz, 256u*256u, s_stable, s_waited);
     return g_bgLoaded;
 }
 
