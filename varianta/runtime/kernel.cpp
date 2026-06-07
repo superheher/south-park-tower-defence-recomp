@@ -3627,6 +3627,28 @@ PPC_FUNC(sub_821C6E58)
                 }
             }
         }
+        // cont.104: scan guest GPU memory for DRAW_INDX (op 0x22 / DRAW_INDX_2 0x36) packets and tally by prim.
+        // DECISIVE: cont.103 found prim 5/13 (sprite/text) draws are ABSENT from the EXECUTED stream. Are they
+        // EMITTED anywhere (built into a non-executed buffer) or never emitted (the flush doesn't run)? prim @
+        // init&0x3F; init = (op==0x22)?data[1]:data[0] (data starts at header+4). Gated REX_DRAWSCAN, capped.
+        static const bool s_drawscan = getenv("REX_DRAWSCAN") != nullptr;
+        if (s_drawscan) { static std::atomic<int> dsn{0}; if (dsn.fetch_add(1) < 4) { GpuLock _glds;
+            int p5=0,p13=0,p8=0,p4=0,p6=0,p2=0,p1=0,pother=0; uint32_t firstSprite=0, firstSpriteInit=0;
+            for (uint32_t a = 0xA0000000u; a + 12 <= 0xA0600000u; a += 4) {
+                uint32_t h = GLD32(a); if ((h >> 30) != 3u) continue;
+                uint32_t op = (h >> 8) & 0x7Fu; if (op != 0x22u && op != 0x36u) continue;
+                uint32_t init = (op == 0x22u) ? GLD32(a + 8) : GLD32(a + 4);
+                uint32_t prim = init & 0x3Fu, numI = init >> 16;
+                if (numI == 0 || numI > 100000u) continue;                 // sanity: skip garbage inits
+                switch (prim) { case 1:p1++;break; case 2:p2++;break; case 4:p4++;break;
+                    case 5:p5++; if(!firstSprite){firstSprite=a;firstSpriteInit=init;} break;
+                    case 6:p6++;break; case 8:p8++;break;
+                    case 13:p13++; if(!firstSprite){firstSprite=a;firstSpriteInit=init;} break;
+                    default:pother++; }
+            }
+            fprintf(stderr, "[drawscan] #%d DRAW_INDX in 0xA0000000-0xA0600000: p5(strip)=%d p13(quad)=%d p8(rect)=%d p4(list)=%d p6(fan)=%d p2(line)=%d p1(pt)=%d other=%d | firstSprite@0x%X init=0x%X\n",
+                    (int)dsn.load(), p5, p13, p8, p4, p6, p2, p1, pother, firstSprite, firstSpriteInit);
+        }}
         uint32_t fenceptr = GLD32(device + 10896);
         if (fenceptr) {
             uint32_t head = GLD32(device + 10908), current = GLD32(fenceptr);
