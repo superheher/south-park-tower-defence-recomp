@@ -1942,8 +1942,11 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                             // the top). If big glyphs appear centered → geometry/atlas are fine, the blocker was the
                             // transform/edge; if blank/garbled → atlas-sample issue; if nothing → deeper geometry issue.
                             static const bool s_textcenter = getenv("REX_TEXTCENTER") != nullptr;
-                            auto tcx = [&](float v){ return s_textcenter ? v/350.0f - 0.7f : cx(v); };
-                            auto tcy = [&](float v){ return s_textcenter ? v/100.0f - 0.4f : cy(v); };
+                            // cont.133: the cont.119 placeholder cx/cy (/884,/521.5) is the PANEL authoring space (1768x1043);
+                            // the TEXT local coords (16.5..458.5, -0.5..76.5) are screen-space in the title's 1280x720 ortho
+                            // (cont.118 reg-0x4000: Px=1/640, Py=-1/360). Map the text with /640,/360 → its real screen size+place.
+                            auto tcx = [&](float v){ return s_textcenter ? v/350.0f - 0.7f : v/640.0f - 1.0f; };
+                            auto tcy = [&](float v){ return s_textcenter ? v/100.0f - 0.4f : v/360.0f - 1.0f; };
                             if (!seen) {   // cont.120: carve each UNIQUE text block once/frame (skip the ~20x re-rendered duplicates that overlapped into mush)
                                 tl_textSeen.push_back(key);
                                 for (uint32_t i = 0; i + 4 <= nr; i += 4) {
