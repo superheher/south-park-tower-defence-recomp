@@ -5257,3 +5257,19 @@ return
 **Default boot UNREGRESSED** (the [draw] texture-slot dump is gated behind REX_DRAWLOG; verified 681-line no-crash default boot).
 
 **⭐NEXT (cont.116) — TEXTURE THE TEXT (the implementation):** (a) add a FMT_8 decode path to rex_texture.h (8bpp → RGBA: R=G=B=255, A=the 8-bit value — or R=G=B=value for a luminance font) if not already present; (b) decode the 256×256 atlas @ 0xA337D000 + upload it as a Vulkan texture (a dedicated font sampler, separate from the backdrop's g_tex); (c) in the carve, route the prim-13 glyphs into a TEXTURED esVerts buffer (pos.xy→clip + uv.zw, like tl_esTexVerts) instead of the flat-color tl_esVerts; (d) in PresentOnce, draw the text via g_texPipe bound to the font atlas (the glyph alpha masks the letters, text color tints); (e) capture → the menu text reads as real letters. Gate behind a flag (e.g. REX_TEXTGLYPH). Default boot UNREGRESSED (cont.115 = gated [draw] tex-slot dump; verified no-crash default boot 681 lines/8s).
+
+———— cont.116 — 🎉🎉 THE FONT ATLAS DECODES TO LEGIBLE LETTERS: dumped the 256×256 FMT_8 atlas @ 0xA337D000 → readable glyphs "_This col / ntruedam / fpg". The FMT_8 decode + atlas + UV plan are all confirmed; the textured-text path is de-risked ————
+
+**ONE CHANGE (gated REX_FONTDUMP) + MEASUREMENT:** before wiring the substantial textured-draw (Vulkan), de-risk by verifying the FMT_8 decode. Added REX_FONTDUMP (kernel.cpp, after the direxec block): decode the 256×256 FMT_8 (8bpp, untiled) font atlas @ GPU 0xA337D000 → a grayscale PPM. (GLD32 is BE-swapped, so the raw byte at linear offset i = `(GLD32(base+(i&~3)) >> (8*(3-(i&3)))) & 0xFF`.) Fires once on a late sync (after the menu loads).
+
+**RESULT — 🎉 THE ATLAS IS REAL FONT GLYPHS:** /tmp/varianta_font.ppm (256×256) is mostly black (96%) with 2605 non-black pixels = the glyphs. Viewing it: **clearly legible LETTERS — "_This col" / "ntruedam" / "fpg"** (3 rows of a dynamic glyph cache — only the glyphs the current menu text needs are uploaded). So:
+- the **FMT_8 decode WORKS** (atlas → readable letters);
+- the atlas at **0xA337D000 is the menu's font glyph cache** (the actual menu text, e.g. "This col[lection]…");
+- the cont.114 glyph UVs sample these glyphs.
+Sent the decoded atlas to the user (it shows the menu's real text + confirms the decode).
+
+**⇒ THE TEXTURED-TEXT PATH IS FULLY DE-RISKED:** font atlas (256×256 FMT_8 @ 0xA337D000, decodes to legible glyphs) + glyph quads (pos.xy + UV.zw, cont.114) + the textured pipeline (g_texPipe, already wired). Wiring the textured draw will turn the cont.113 colored-rect text into legible letters.
+
+**Default boot UNREGRESSED** (REX_FONTDUMP gated; verified 679-line no-crash default boot).
+
+**⭐NEXT (cont.117) — WIRE THE TEXTURED TEXT DRAW:** (a) add an FMT_8 decode path to the Vulkan texture upload (8bpp → RGBA: A=value, RGB=1, so the alpha masks the glyph and the text color tints) — or reuse rex_texture.h's decode + an R8/RGBA upload; (b) decode + upload the 256×256 atlas @ 0xA337D000 as a dedicated Vulkan font texture (g_fontTex + sampler + descriptor); (c) in the carve, route the prim-13 glyphs into a textured esVerts buffer (pos.xy→clip + uv.zw); (d) in PresentOnce, draw the text via g_texPipe bound to the font atlas; (e) capture → legible menu text. Gate behind REX_TEXTGLYPH. Default boot UNREGRESSED (cont.116 = gated REX_FONTDUMP; verified no-crash default boot 679 lines/8s).

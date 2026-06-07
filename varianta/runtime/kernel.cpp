@@ -3741,6 +3741,24 @@ PPC_FUNC(sub_821C6E58)
             }
             if (g_ktrace) fprintf(stderr, "[direxec] #%d executed %d dir segments (n=%d cmd-addrs in dir)\n", (int)dxn.load(), exn, n);
         }}
+        // cont.116: dump the menu font atlas (cont.115: 256x256 FMT_8 8bpp @ GPU 0xA337D000, untiled) -> grayscale PPM,
+        // to verify the FMT_8 decode + SEE the glyphs before wiring the textured-text draw. GLD32 is BE-swapped, so
+        // raw byte at linear offset i = (GLD32(base+(i&~3)) >> (8*(3-(i&3)))) & 0xFF. Fires once, when the atlas has data.
+        static const bool s_fontdump = getenv("REX_FONTDUMP") != nullptr;
+        if (s_fontdump) { static std::atomic<int> fcnt{0}; static std::atomic<bool> fdone{false};
+            uint32_t atlas = 0xA337D000u;
+            if (fcnt.fetch_add(1) > 200 && !fdone.exchange(true)) {
+                fprintf(stderr, "[fontdump] atlas @0x%X probe dwords: %08X %08X %08X %08X | +0x2000: %08X %08X\n",
+                        atlas, GLD32(atlas), GLD32(atlas+4), GLD32(atlas+8), GLD32(atlas+12), GLD32(atlas+0x2000), GLD32(atlas+0x2004));
+                FILE* ff = fopen("/tmp/varianta_font.ppm", "wb");
+                if (ff) { fprintf(ff, "P6\n256 256\n255\n");
+                    for (uint32_t i = 0; i < 256u*256u; i++) {
+                        uint32_t dw = GLD32(atlas + (i & ~3u));
+                        uint8_t v = (dw >> (8u*(3u - (i & 3u)))) & 0xFFu;
+                        fputc(v, ff); fputc(v, ff); fputc(v, ff); }
+                    fclose(ff); fprintf(stderr, "[fontdump] wrote /tmp/varianta_font.ppm (256x256 FMT_8 @ 0x%X)\n", atlas); }
+            }
+        }
         uint32_t fenceptr = GLD32(device + 10896);
         if (fenceptr) {
             uint32_t head = GLD32(device + 10908), current = GLD32(fenceptr);
