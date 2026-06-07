@@ -3488,6 +3488,9 @@ static void FrameBufDump(uint32_t device) {
             if (op == 0x2D) {                                       // SET_CONSTANT
                 uint32_t ot = GLD32(a2), index = ot & 0x7FF, type = (ot >> 16) & 0xFF;
                 if (type == 1) for (uint32_t i = 1; i < cnt; i++) { uint32_t ri = index + (i - 1); if (ri < 256u) shadow[ri] = GLD32(a2 + i * 4); }
+            } else if (op == 0x55) {                                // SET_CONSTANT2 (absolute 16-bit reg — cont.54: also binds fetch/texture consts)
+                uint32_t aidx = GLD32(a2) & 0xFFFF;
+                for (uint32_t i = 1; i < cnt; i++) { uint32_t ri = aidx + (i - 1); if (ri >= 0x4800u && ri < 0x4900u) shadow[ri - 0x4800u] = GLD32(a2 + i * 4); }
             } else if (op == 0x22 || op == 0x36) {                  // DRAW_INDX / DRAW_INDX_2
                 draws++;
                 uint32_t init = (op == 0x22) ? GLD32(a2 + 4) : GLD32(a2);
@@ -3524,6 +3527,32 @@ static void FrameBufDump(uint32_t device) {
                     float pf[12]; for (int q = 0; q < 12; q++) { uint32_t w = GLD32(vbase + q*4); memcpy(&pf[q], &w, 4); }
                     fprintf(stderr, "[framebuf]     ^prim%u vbase floats: %.1f %.1f %.1f %.1f | %.1f %.1f %.1f %.1f | %.1f %.1f %.1f %.1f\n",
                             prim, pf[0],pf[1],pf[2],pf[3], pf[4],pf[5],pf[6],pf[7], pf[8],pf[9],pf[10],pf[11]);
+                }
+                // cont.84 (REX_FRAMEDRAW): composite the LIVE prim-8 draws into g_frameBuf at their REAL screen
+                // positions (carved from the verts) — the GAME-ACCURATE placement cont.73 couldn't reach — via the
+                // cont.66 AccumulateFrame bridge (decode texture + blit to the screen rect). The screen rect is the
+                // bbox of the pool's screen-range (x,y) pairs (robust to the stride-8 backdrop / stride-16 UV layouts);
+                // the texture is a 0x02/0xA2 base found in the fetch shadow. REQUIRE a uv-range pair (stride-16
+                // textured UI) so the un-textured stride-8 backdrop quads don't pick up a stale binding.
+                // SnapshotFrameOnSwap (REX_FCOMPOSE) writes /tmp/cont66_frame_NNN.ppm each present.
+                static const bool s_framedraw = getenv("REX_FRAMEDRAW") != nullptr;
+                if (s_framedraw && live && prim == 8 && vbase) {
+                    float mnx=1e9f,mny=1e9f,mxx=-1e9f,mxy=-1e9f; int nsc=0; bool hasUV=false;
+                    int cap = (int)numI*4 + 8; if (cap > 96) cap = 96;
+                    for (int q = 0; q + 1 < cap; q++) {
+                        uint32_t ux=GLD32(vbase+q*4), uy=GLD32(vbase+q*4+4); float fx,fy; memcpy(&fx,&ux,4); memcpy(&fy,&uy,4);
+                        if (fx!=fx || fy!=fy) continue;
+                        if (fx>-8.f && fx<1300.f && fy>-8.f && fy<730.f && (fx>1.f||fy>1.f)) {
+                            mnx=fminf(mnx,fx); mny=fminf(mny,fy); mxx=fmaxf(mxx,fx); mxy=fmaxf(mxy,fy); nsc++; }
+                        if (fx>0.f && fx<=1.001f && fy>0.f && fy<=1.001f) hasUV=true; }
+                    uint32_t texB=0;
+                    for (int s=0;s<256 && !texB;s++){ uint32_t b=shadow[s]&0xFFFFF000u;
+                        if ((b>=0x02000000u && b<0x03000000u) || (b>=0xA2000000u && b<0xB1000000u)) texB=0xA0000000u|(b&0x1FFFFFFFu); }
+                    if (nsc>=3 && (mxx-mnx)>=8.f && (mxy-mny)>=8.f && texB) {
+                        AccumulateFrame(texB, mnx, mny, mxx, mxy);
+                        static std::atomic<int> fdn{0}; if (g_ktrace && fdn.fetch_add(1) < 24)
+                            fprintf(stderr, "[framedraw] prim8 rect=(%.0f,%.0f)-(%.0f,%.0f) tex=0x%X uv=%d composited\n", mnx,mny,mxx,mxy,texB,hasUV?1:0);
+                    }
                 }
             }
             a2 += cnt * 4;
