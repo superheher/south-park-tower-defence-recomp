@@ -657,7 +657,7 @@ bool Init() {
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     VKCHECK(vkCreateFence(g_device, &fci, nullptr, &g_fence));
 
-    if (g_menutex) LoadBackgroundOnce();   // Task #8: upload the menu background .png (uses g_cmdPool, made above)
+    if (g_menutex && !getenv("REX_TEXTGLYPH")) LoadBackgroundOnce();   // Task #8: upload the menu background .png (cont.117: skip when texturing text — the font atlas takes g_tex, loaded once the menu populates it)
 
     fprintf(stderr, "[render] initialised — window + Vulkan up.\n");
     return true;
@@ -774,6 +774,22 @@ bool LoadBackgroundOnce() {
     const char* path = p ? p : "../private/extracted/media/Assets/Frontend/Graphics/LevelSelectBG.png";
     g_bgLoaded = LoadPNGToTexture(path);
     if (!g_bgLoaded) fprintf(stderr, "[render] disk-resource: background load FAILED (%s) — set REX_BGTEX\n", path);
+    return g_bgLoaded;
+}
+
+// cont.117: load the menu FONT ATLAS (cont.115/116: 256x256 FMT_8 8bpp glyph alpha mask @ GPU 0xA337D000,
+// phys 0x337D000) from guest memory into g_tex — the textured pipeline samples it for the menu text glyphs.
+// 8bpp -> RGBA: white glyph, alpha = the 8-bit coverage (so the text color tints + the blend masks the letter).
+bool LoadFontAtlasOnce() {
+    if (g_bgLoaded || !g_base) return g_bgLoaded;
+    const uint8_t* atlas = g_base + 0x337D000u;          // phys of the GPU aperture addr 0xA337D000
+    std::vector<uint8_t> rgba((size_t)256 * 256 * 4);
+    for (uint32_t i = 0; i < 256u * 256u; i++) {
+        uint8_t v = atlas[i];
+        rgba[i*4+0] = 255; rgba[i*4+1] = 255; rgba[i*4+2] = 255; rgba[i*4+3] = v;
+    }
+    g_bgLoaded = UploadTexture(rgba.data(), 256, 256);
+    fprintf(stderr, "[render] font atlas %s (256x256 FMT_8 @ guest 0x337D000)\n", g_bgLoaded ? "uploaded" : "FAILED");
     return g_bgLoaded;
 }
 
@@ -913,6 +929,9 @@ bool PresentOnce() {
             EnsureMenuVB(g_menuGeom.size()*sizeof(float));
             if (g_menuVBMap) memcpy(g_menuVBMap, g_menuGeom.data(), g_menuGeom.size()*sizeof(float));
         } else { EnsureMenuVB(sizeof(quads)); if (g_menuVBMap) memcpy(g_menuVBMap, quads, sizeof(quads)); }
+        // cont.117: once the menu has submitted text glyphs (g_texGeom populated), the font atlas @0xA337D000 is
+        // loaded in guest memory — upload it into g_tex now (deferred; it's empty at init). Then the textured draw fires.
+        if (getenv("REX_TEXTGLYPH") && !g_bgLoaded && g_texGeomVerts.load() >= 3) LoadFontAtlasOnce();
         // Task #8: upload the submitted TEXTURED geometry (backdrop quadrants, pos.xy+uv.xy) BEFORE the
         // render pass — EnsureTexGeoVB may recreate the buffer (vkDeviceWaitIdle), unsafe inside a pass.
         int texVerts = g_menutex ? g_texGeomVerts.load() : 0;
