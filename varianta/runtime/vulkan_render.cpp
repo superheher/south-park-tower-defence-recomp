@@ -1020,7 +1020,7 @@ bool PresentOnce() {
                 vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
                 vkCmdDraw(g_cmd, 6, 1, q * 6, 0);
             }
-        } else if (!g_hudsheet) {                                // REX_MENUTEST: hardcoded validation rects
+        } else if (!g_hudsheet && !getenv("REX_TEXTGLYPH")) {    // REX_MENUTEST: hardcoded validation rects (cont.130: skip in REX_TEXTGLYPH — they alpha-blend OVER the menu text and obscure it)
             const float cols[3][4] = {{1.0f,0.2f,0.2f,0.6f},{0.2f,1.0f,0.2f,0.6f},{0.3f,0.4f,1.0f,0.8f}};
             for (int q = 0; q < 3; q++) { memcpy(pc.color, cols[q], 16);
                 vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
@@ -1039,7 +1039,11 @@ bool PresentOnce() {
         }
         vkCmdEndRenderPass(g_cmd);
         static int s_maxCap = 0;   // capture the RICHEST frame seen (most submitted verts) — steady-state menu
-        bool richer = (subVerts + texVerts) > s_maxCap;          // incl. Task #8 textured backdrop verts
+        // cont.130: in REX_TEXTGLYPH mode the font-atlas upload is DEFERRED (cont.122/129), so the richest frame
+        // (texVerts first maxing at the carve-once latch) would be captured BEFORE g_bgLoaded → no text. Only count
+        // a frame as "richer" once the atlas is uploaded, so the default capture shows the rendered text.
+        bool atlasReady = !getenv("REX_TEXTGLYPH") || g_bgLoaded;
+        bool richer = atlasReady && (subVerts + texVerts) > s_maxCap;   // incl. Task #8 textured backdrop verts
         bool cap = (g_shotTarget && g_frame == g_shotTarget) || richer;
         if (richer) s_maxCap = subVerts + texVerts;
         if (cap) { EnsureCaptureBuffer();
