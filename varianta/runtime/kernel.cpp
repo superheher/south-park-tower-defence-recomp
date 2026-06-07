@@ -1913,14 +1913,22 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                             for (uint32_t s = 0; s < nr; s += kstep) { uint32_t bx, by; memcpy(&bx,&vb[s*2],4); memcpy(&by,&vb[s*2+1],4);
                                 key = (key ^ bx) * 1099511628211ull; key = (key ^ by) * 1099511628211ull; }
                             bool seen = false; for (uint64_t k : tl_textSeen) if (k == key) { seen = true; break; }
+                            // cont.121 DECISIVE TEST: REX_TEXTCENTER maps the block to a LARGE CENTERED region (clip
+                            // x≈[-0.65,0.61] y≈[-0.4,0.37], ~806x277px) instead of the 884/521.5 top-left placement —
+                            // to rule out top-edge clipping (the default puts the block at clip y from -1.001, just past
+                            // the top). If big glyphs appear centered → geometry/atlas are fine, the blocker was the
+                            // transform/edge; if blank/garbled → atlas-sample issue; if nothing → deeper geometry issue.
+                            static const bool s_textcenter = getenv("REX_TEXTCENTER") != nullptr;
+                            auto tcx = [&](float v){ return s_textcenter ? v/350.0f - 0.7f : cx(v); };
+                            auto tcy = [&](float v){ return s_textcenter ? v/100.0f - 0.4f : cy(v); };
                             if (!seen) {   // cont.120: carve each UNIQUE text block once/frame (skip the ~20x re-rendered duplicates that overlapped into mush)
                                 tl_textSeen.push_back(key);
                                 for (uint32_t i = 0; i + 4 <= nr; i += 4) {
                                     float u[4], w[4]; for (int j = 0; j < 4; j++) {
                                         uint32_t au=GLD32(gv+(i+j)*stride+8), aw=GLD32(gv+(i+j)*stride+12); memcpy(&u[j],&au,4); memcpy(&w[j],&aw,4); }
                                     float t[24] = {   // 2 tris (0,1,2)+(0,2,3): pos.xy(clip) + uv.xy
-                                        cx(vb[i*2]),cy(vb[i*2+1]),u[0],w[0], cx(vb[(i+1)*2]),cy(vb[(i+1)*2+1]),u[1],w[1], cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]),u[2],w[2],
-                                        cx(vb[i*2]),cy(vb[i*2+1]),u[0],w[0], cx(vb[(i+2)*2]),cy(vb[(i+2)*2+1]),u[2],w[2], cx(vb[(i+3)*2]),cy(vb[(i+3)*2+1]),u[3],w[3] };
+                                        tcx(vb[i*2]),tcy(vb[i*2+1]),u[0],w[0], tcx(vb[(i+1)*2]),tcy(vb[(i+1)*2+1]),u[1],w[1], tcx(vb[(i+2)*2]),tcy(vb[(i+2)*2+1]),u[2],w[2],
+                                        tcx(vb[i*2]),tcy(vb[i*2+1]),u[0],w[0], tcx(vb[(i+2)*2]),tcy(vb[(i+2)*2+1]),u[2],w[2], tcx(vb[(i+3)*2]),tcy(vb[(i+3)*2+1]),u[3],w[3] };
                                     if (tl_esTexVerts.size() < 120000) tl_esTexVerts.insert(tl_esTexVerts.end(), t, t+24); }
                             }
                         } else { for (uint32_t i = 0; i + 4 <= nr; i += 4) {     // quad-list -> 2 tris (flat color)

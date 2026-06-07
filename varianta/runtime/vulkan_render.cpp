@@ -784,12 +784,15 @@ bool LoadFontAtlasOnce() {
     if (g_bgLoaded || !g_base) return g_bgLoaded;
     const uint8_t* atlas = g_base + 0x337D000u;          // phys of the GPU aperture addr 0xA337D000
     std::vector<uint8_t> rgba((size_t)256 * 256 * 4);
-    for (uint32_t i = 0; i < 256u * 256u; i++) {
+    uint32_t nz = 0;   // cont.121: count non-zero atlas bytes AT upload time — if ~0, the dynamic glyph cache
+    for (uint32_t i = 0; i < 256u * 256u; i++) {   // hasn't populated yet (uploaded too early) => the text samples a transparent atlas => invisible.
         uint8_t v = atlas[i];
+        if (v) nz++;
         rgba[i*4+0] = 255; rgba[i*4+1] = 255; rgba[i*4+2] = 255; rgba[i*4+3] = v;
     }
     g_bgLoaded = UploadTexture(rgba.data(), 256, 256);
-    fprintf(stderr, "[render] font atlas %s (256x256 FMT_8 @ guest 0x337D000)\n", g_bgLoaded ? "uploaded" : "FAILED");
+    fprintf(stderr, "[render] font atlas %s (256x256 FMT_8 @ guest 0x337D000) — %u/%u non-zero bytes at upload\n",
+            g_bgLoaded ? "uploaded" : "FAILED", nz, 256u*256u);
     return g_bgLoaded;
 }
 
