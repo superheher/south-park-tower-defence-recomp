@@ -820,6 +820,16 @@ bool LoadFontAtlasOnce() {
         for (uint32_t i = 0; i < 256u*256u; i++) { uint8_t a = rgba[i*4+3]; fwrite(&a, 1, 1, pf); }
         fclose(pf); fprintf(stderr, "[render] dumped uploaded atlas alpha -> /tmp/varianta_uploaded_atlas.ppm\n");
     }
+    // cont.136: the prim-5 panels bind 0x2D98000 (RGBA fmt=6, populated per cont.124) — the backdrop/panel art.
+    // Dump it (full GPU aperture g_base+0xA2D98000, 1280x434 RGBA8 untiled) to verify it's real art + the read path
+    // before wiring the composited backdrop. nz check first (skip if empty/garbage).
+    { const uint8_t* bg = g_base + 0xA2D98000u; uint32_t bw=1280, bh=434, bnz=0;
+      for (uint32_t i=0;i<bw*bh*4u;i+=997) if (bg[i]) bnz++;   // sparse non-zero probe
+      if (FILE* bf = fopen("/tmp/varianta_panel_tex.ppm","wb")) {
+        fprintf(bf, "P6\n%u %u\n255\n", bw, bh);
+        for (uint32_t i=0;i<bw*bh;i++) fwrite(bg+i*4, 1, 3, bf);   // RGB (drop A)
+        fclose(bf); fprintf(stderr, "[render] dumped panel tex 0xA2D98000 %ux%u -> /tmp/varianta_panel_tex.ppm (probe nz=%u)\n", bw, bh, bnz); }
+    }
     g_bgLoaded = UploadTexture(rgba.data(), 256, 256);
     fprintf(stderr, "[render] font atlas %s (256x256 FMT_8 @ guest 0x%X) — %u/%u non-zero bytes (stable=%d, waited=%d frames)\n",
             g_bgLoaded ? "uploaded" : "FAILED", bestOff, nz, 256u*256u, s_stable, s_waited);
