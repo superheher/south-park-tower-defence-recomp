@@ -5151,3 +5151,24 @@ return
 **⇒ THE FIX (refined): execute the FULL device build-cursor directory, not just the current [dev+13568, dev+13572] chunk.** The directory (device+13400+) lists ALL segment records {base, writeptr}; the sprite's segment is one of them. Walk every record, ExecutePM4(base, writeptr-base) — the sprite segment then reaches ExecuteType3.
 
 **⭐NEXT (cont.109) — PARSE THE FULL DIRECTORY + EXECUTE THE SPRITE'S SEGMENT:** dump device+13400..13700 to parse the segment records (cont.104 fmt {base, writeptr, 0x1080, base+0x44, 0, dev}); identify the record whose [base, writeptr] CONTAINS 0xA009A588 (base near 0xA0097DDC, writeptr near 0xA009A9D0). Add a gated REX_DIREXEC: walk ALL directory records and ExecutePM4(base, (writeptr-base)/4) for each (or just the sprite's), at the per-frame sync. MEASURE: do prim 5/13 now reach ExecuteType3 (REX_DRAWDECODE shows tri-strip/quad)? Does the menu sprite/text geometry carve (s_spritecarve/esVerts)? Watch double-exec (the current chunk is already done by REX_FRAMEEXEC — skip it or dedup). Default boot UNREGRESSED (cont.108 = gated REX_DRAWSCAN sys-scan; verified no-crash default boot 686 lines/8s).
+
+———— cont.109 — 🎉🎉 BREAKTHROUGH (THE FIX WORKS): REX_DIREXEC (execute the FULL device directory) makes the menu SPRITE/TEXT draws (prim 5/13) REACH ExecuteType3 WITH REAL VERTEX FETCHES (vf95). After ~13 iterations, the menu geometry flows to the renderer ————
+
+**ONE CHANGE (gated REX_DIREXEC) + MEASUREMENT:** added REX_DIREXEC (kernel.cpp, after the ringexec block): at the per-frame sync, scan the device build-cursor DIRECTORY (device+13400..13700) for command-segment addrs (GPU addrs in [0xA0090000, 0xA0120000], the sprite region), sort them, and ExecutePM4 each [addr[i], addr[i+1]) segment — executing the FULL directory's segments, not just REX_FRAMEEXEC's current chunk [dev+13568, dev+13572]. Gated, capped 60 frames, GpuLock.
+
+**RESULT — 🎉 THE SPRITE/TEXT DRAWS NOW REACH ExecuteType3 WITH REAL VERTS:**
+- REX_DIREXEC executed **15-21 dir segments/frame** in the early frames (#1-4: 15,15,15,21 segs from n=22-29 cmd-addrs in the directory) — the directory entries REX_FRAMEEXEC was skipping.
+- **[drawdec] NOW shows the sprites: 3 tri-strip (prim 5), 2 quad (prim 13), 2 tri-list (prim 4)** — 7 sprite/text draws total reaching ExecuteType3 (vs cont.103/106's ZERO). Each with a **REAL vertex fetch**:
+  - `tri-strip numInd=4 init=0x40085 vertexbufs=1 [vf95 addr=0x11EE80 sz=32]` (a sprite quad, 4 verts)
+  - `tri-list numInd=6 init=0x60084 [vf95 addr=0x11EEA0 sz=48]`
+  - `tri-strip numInd=4 [vf95 addr=0x11EED0 sz=32]`
+  - **`quad numInd=252 init=0xFC008D [vf95 addr=0x11EEF0 sz=4032]`** ← SUBSTANTIAL text/menu content (252 indices, 4032 B of verts)
+- Far less flooding than REX_RINGEXEC (33 RECT + 24 point, vs RINGEXEC's 869 RECT) — REX_DIREXEC is TARGETED (only the sprite-region directory segments).
+
+**⇒ TWO MAJOR FINDINGS:**
+1. **THE FIX WORKS:** executing the FULL device directory (not just the current chunk) is the correct CP behavior — it surfaces the menu sprite/text draws that REX_FRAMEEXEC's single-chunk window was skipping. This is the cont.88-90 "segment-execution gap" SOLVED for the sprites.
+2. **The cont.22 "slot-0 empty" was a RED HERRING for the sprites:** the sprite/text draws fetch **slot 95** (vf95, addr 0x11EE80 → 0xA011EE80, with REAL data sz=32-4032) — NOT slot 0 (0xA2000000). cont.22/55's whole slot-0/slot-1 vertex saga + the s_spritecarve heuristic (which reads slot-1 0xA01FE0FC) were aimed at the wrong slot; the real sprite verts are in slot 95, and they're PRESENT.
+
+**Default boot UNREGRESSED** (REX_DIREXEC gated off; verified 675-line no-crash default boot).
+
+**⭐NEXT (cont.110) — MAKE THE SPRITES VISIBLE (carve via the REAL fetch slot):** the sprite draws now reach ExecuteType3 with real verts in slot 95, but ExecuteType3's s_spritecarve (kernel.cpp:1848) reads the HEURISTIC slot-1 (0xA01FE0FC) — WRONG. Update the sprite carve to read the draw's ACTUAL kVertex fetch slot (the REX_DRAWDECODE scan already finds it = vf95) → the sprite/text geometry carves into the esVerts Vulkan bridge correctly → the menu RENDERS. Then: (a) vulkan_render capture to SEE the menu; (b) decode the vf95 vert format (stride 8 = float2 screen coords? the numInd=252 quad = a text run); (c) consider folding REX_DIREXEC into the default render path (it's the real directory-execution fix). Default boot UNREGRESSED (cont.109 = gated REX_DIREXEC; verified no-crash default boot 675 lines/8s).

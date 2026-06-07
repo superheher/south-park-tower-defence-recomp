@@ -3701,6 +3701,28 @@ PPC_FUNC(sub_821C6E58)
             }
             if (g_ktrace) fprintf(stderr, "[ringexec] #%d executed %d ring IBs (wptr=%u span=%u)\n", (int)rxn.load(), ibn, wptr, span);
         }}
+        // cont.109 (THE FIX v2): cont.108 found the sprite buffer is referenced by the device build-cursor DIRECTORY
+        // (device+13400..13700, records {base,writeptr,...}), but REX_FRAMEEXEC executes ONLY the current chunk
+        // [dev+13568,13572] — so the sprite's PRIOR directory entry (base~0xA0097DDC, writeptr~0xA009A9D0, containing
+        // 0xA009A588) is skipped. Here: collect the directory's command-segment addrs, sort, and ExecutePM4 each
+        // [addr[i], addr[i+1]) segment — so ALL directory entries (incl. the sprite's) reach ExecuteType3. Gated, capped.
+        static const bool s_direxec = getenv("REX_DIREXEC") != nullptr;
+        if (s_direxec) { static std::atomic<int> dxn{0}; if (dxn.fetch_add(1) < 60) { GpuLock _gldx;
+            uint32_t addrs[96]; int n = 0;
+            for (uint32_t off = 13400; off <= 13700 && n < 96; off += 4) {            // the directory record region
+                uint32_t v = GLD32(device + off);
+                if (v >= 0xA0090000u && v <= 0xA0120000u) addrs[n++] = v;             // a command-segment base in the sprite region
+            }
+            for (int i = 1; i < n; i++) { uint32_t k = addrs[i]; int j = i-1; while (j >= 0 && addrs[j] > k) { addrs[j+1]=addrs[j]; j--; } addrs[j+1]=k; }
+            int exn = 0;
+            for (int i = 0; i + 1 < n; i++) {
+                if (addrs[i+1] <= addrs[i]) continue;
+                uint32_t len = (addrs[i+1] - addrs[i]) / 4u;
+                if (len == 0u || len > 0x8000u) continue;
+                ExecutePM4(addrs[i], len, 1); exn++;
+            }
+            if (g_ktrace) fprintf(stderr, "[direxec] #%d executed %d dir segments (n=%d cmd-addrs in dir)\n", (int)dxn.load(), exn, n);
+        }}
         uint32_t fenceptr = GLD32(device + 10896);
         if (fenceptr) {
             uint32_t head = GLD32(device + 10908), current = GLD32(fenceptr);
