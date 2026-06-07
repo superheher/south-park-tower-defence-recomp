@@ -1886,6 +1886,22 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                             }
                         }
                     }
+                    // cont.137: discover the PRIM-5 PANEL texture at the carve-once frame (swap 250). cont.136 dumped
+                    // 0xA2D98000 = the SPLASH logo from EARLY draws; the MENU panels here may bind a different RGBA
+                    // texture. Log each prim-5 panel's bound type-2 texture (any non-zero base) to find the menu's panel art.
+                    if (prim == 5) {
+                        for (uint32_t sl = 0; sl < 32; sl++) {
+                            uint32_t fb = 0x7FC80000u + (0x4800u + sl*6u)*4u;
+                            uint32_t td0 = GLD32(fb), td1 = GLD32(fb+4), td2 = GLD32(fb+8);
+                            if ((td0 & 3u) != 2u) continue;
+                            uint32_t tbase = ((td1 >> 12) & 0xFFFFFu) << 12; if (!tbase) continue;
+                            uint32_t tw = (td2 & 0x1FFFu)+1, th = ((td2 >> 13) & 0x1FFFu)+1, tfmt = td1 & 0x3Fu;
+                            static std::atomic<uint32_t> s_lastp{0}; uint32_t po = tbase & 0x1FFFFFFFu;
+                            if (s_lastp.exchange(po) != po)
+                                fprintf(stderr, "[paneltex] prim5 panel bound tex: phys=0x%X (gpu 0xA%07X) %ux%u fmt=%u tiled=%u\n", po, po, tw, th, tfmt, (td0>>31)&1u);
+                            break;
+                        }
+                    }
                     uint32_t stride = (numInd && vbBytes >= numInd*8u) ? vbBytes / numInd : 8u;   // bytes/vertex
                     static thread_local float vb[512*2];
                     uint32_t nr = numInd < 512 ? numInd : 512;
