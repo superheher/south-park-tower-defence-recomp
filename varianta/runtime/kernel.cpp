@@ -1903,10 +1903,12 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                 uint32_t fb = 0x7FC80000u + (0x4800u + slot*6u)*4u;
                 uint32_t d0 = GLD32(fb), d1 = GLD32(fb+4), d2 = GLD32(fb+8);
                 uint32_t baseAddr = ((d1 >> 12) & 0xFFFFF) << 12;
-                if (baseAddr >= 0xA0000000u) {   // a bound texture (physical window)
-                    fprintf(stderr, "[draw]   tex slot%u base=0x%X %ux%u fmt=%u tiled=%u type=%u @base=%08X\n",
-                            slot, baseAddr, (d2 & 0x1FFF)+1, ((d2 >> 13) & 0x1FFF)+1, d1 & 0x3F,
-                            (d0 >> 31) & 1, d0 & 3, GLD32(baseAddr));
+                // cont.115: a bound texture = type-2 fetch const; the base may be low-phys (like vf95) -> map to the 0xA0 aperture.
+                if ((d0 & 3u) == 2u && baseAddr != 0u) {
+                    uint32_t gbase = baseAddr >= 0xA0000000u ? baseAddr : (0xA0000000u | (baseAddr & 0x1FFFFFFFu));
+                    fprintf(stderr, "[draw]   tex slot%u base=0x%X(gpu 0x%X) %ux%u fmt=%u tiled=%u type=%u\n",
+                            slot, baseAddr, gbase, (d2 & 0x1FFF)+1, ((d2 >> 13) & 0x1FFF)+1, d1 & 0x3F,
+                            (d0 >> 31) & 1, d0 & 3);
                 }
             }
         }

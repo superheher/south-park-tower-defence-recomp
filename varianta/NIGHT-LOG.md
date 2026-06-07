@@ -5242,3 +5242,18 @@ return
 **Default boot UNREGRESSED** (the [textvert] log is gated behind REX_SPRITECARVE; verified 682-line no-crash default boot).
 
 **⭐NEXT (cont.115) — TEXTURE THE MENU TEXT (legible letters):** (a) FIND the font atlas — the prim-13 draw's bound texture (trace the 0x4800 fetch consts' texture slot / the cont.24/54 SetTexture chain at the draw, or REX_DRAWLOG's "tex slot" dump); (b) carve the text glyphs WITH their UVs (pos.xy→clip + uv.zw) into a textured esVerts buffer (like tl_esTexVerts for the backdrop), and draw them via the textured pipeline (g_texPipe: pos+uv + sampler2D, already wired) bound to the font atlas; (c) capture → the menu text should read as letters. Also (parallel): the prim-5 full-screen panels — RE whether they're a backdrop (render dark/subtle) or real panels. Default boot UNREGRESSED (cont.114 = gated [textvert] log; verified no-crash default boot 682 lines/8s).
+
+———— cont.115 — ⭐ FOUND THE FONT ATLAS: the menu text binds a 256×256 FMT_8 (8bpp alpha glyph mask) texture @ GPU 0xA337D000. Now have the full recipe to texture the menu text ————
+
+**ONE CHANGE (relaxed the [draw] texture-slot dump) + MEASUREMENT:** cont.114 confirmed the text glyphs carry UVs (font-atlas coords). To find the atlas, ran REX_DRAWLOG (which dumps each draw's bound texture fetch consts) — but its filter required `baseAddr >= 0xA0000000` and the title's textures are LOW-PHYS (like the vf95 verts @ 0x11EE80). Relaxed it to dump type-2 (texture) fetch consts with any non-zero base, mapping low-phys → the 0xA0 aperture.
+
+**RESULT — 🎉 THE FONT ATLAS IS FOUND:** the prim-13 text draws (init=0xFC008D, numInd=252) bind:
+- **tex slot0: base=0x337D000 (GPU 0xA337D000), 256×256, fmt=2, tiled=0, type=2.**
+- **fmt=2 = FMT_8** (rex_texture.h:33) — an 8-bit SINGLE-CHANNEL texture = a font glyph ALPHA MASK (the 8-bit value = glyph coverage). 256×256, untiled.
+- ⇒ The complete recipe: the glyph quads (cont.114: pos.xy + UV.zw, UVs in [0,1]) sample this 256×256 FMT_8 atlas at 0xA337D000; the alpha is the letter shape.
+
+**⇒ EVERYTHING NEEDED TO TEXTURE THE MENU TEXT IS NOW KNOWN:** font atlas (256×256 FMT_8 @ 0xA337D000, untiled) + glyph quads with UVs. Render: decode FMT_8 → upload as a Vulkan texture → carve the glyphs with UVs into a textured buffer → draw via the textured pipeline (g_texPipe), sampling the atlas alpha as the glyph coverage, tinted by the text color → LEGIBLE menu text.
+
+**Default boot UNREGRESSED** (the [draw] texture-slot dump is gated behind REX_DRAWLOG; verified 681-line no-crash default boot).
+
+**⭐NEXT (cont.116) — TEXTURE THE TEXT (the implementation):** (a) add a FMT_8 decode path to rex_texture.h (8bpp → RGBA: R=G=B=255, A=the 8-bit value — or R=G=B=value for a luminance font) if not already present; (b) decode the 256×256 atlas @ 0xA337D000 + upload it as a Vulkan texture (a dedicated font sampler, separate from the backdrop's g_tex); (c) in the carve, route the prim-13 glyphs into a TEXTURED esVerts buffer (pos.xy→clip + uv.zw, like tl_esTexVerts) instead of the flat-color tl_esVerts; (d) in PresentOnce, draw the text via g_texPipe bound to the font atlas (the glyph alpha masks the letters, text color tints); (e) capture → the menu text reads as real letters. Gate behind a flag (e.g. REX_TEXTGLYPH). Default boot UNREGRESSED (cont.115 = gated [draw] tex-slot dump; verified no-crash default boot 681 lines/8s).
