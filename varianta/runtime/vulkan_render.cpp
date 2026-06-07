@@ -784,19 +784,28 @@ std::atomic<uint32_t> g_fontAtlasPhys{0x337D000u};   // cont.123: live atlas phy
 
 bool LoadFontAtlasOnce() {
     if (g_bgLoaded || !g_base) return g_bgLoaded;
-    const uint8_t* atlas = g_base + g_fontAtlasPhys.load();   // cont.123: the LIVE atlas address (the cont.115 0x337D000 was run-specific)
-    // cont.122 FIX: the atlas at 0xA337D000 is a DYNAMIC glyph cache (cont.116) the title populates over time.
-    // cont.121 PROVED uploading at the first text submit captures an EMPTY (0/65536 non-zero) atlas => the text
-    // samples a transparent texture => invisible. Defer the (single) upload until the cache has populated: require
-    // nz>0 AND nz stable across a few frames (= done filling), with a frame-count fallback so it never waits
-    // forever. UploadTexture is NOT re-entrant (it leaks the old image/descriptor each call), so upload exactly once.
-    uint32_t nz = 0;
-    for (uint32_t i = 0; i < 256u * 256u; i++) if (atlas[i]) nz++;
-    { static int s_dbg = 0; if ((s_dbg++ % 120) == 0) fprintf(stderr, "[fontwait] check #%d: atlas nz=%u/65536 @ g_base+0x%X\n", s_dbg, nz, g_fontAtlasPhys.load()); }   // cont.122/123: confirm the LIVE atlas populates
+    // cont.122 FIX: the atlas is a DYNAMIC glyph cache (cont.116) the title populates over time; cont.121 proved
+    // uploading at the first text submit captures an EMPTY atlas => invisible text. Defer the (single) upload
+    // until the cache has populated (nz>0 AND stable, with a frame-count fallback). UploadTexture is NOT
+    // re-entrant (leaks the old image/descriptor each call), so upload exactly once.
+    // cont.128 FIX: the carve's discovered address (g_fontAtlasPhys) can be a STALE/back-buffer atlas (cont.127:
+    // 0x337F000 stays empty while the title populates the FRONT atlas at 0x337D000). Pick whichever candidate
+    // ACTUALLY has glyph data — the carve's dynamic offset OR the cont.115 hardcode 0x337D000 — by non-zero count.
+    // cont.128 BUG FIX: GLD32(a) reads g_base + a DIRECTLY — the 0xA0000000 GPU aperture is mapped into g_base at
+    // the FULL address (kernel.cpp:861 "Xbox physical-address window"). So the atlas is at g_base + 0xA337D000,
+    // NOT g_base + 0x337D000 (the masked phys, a different empty location). The cont.117 hardcode used the masked
+    // phys — wrong since cont.117. Use the FULL GPU aperture addresses (0xA0000000 | offset).
+    uint32_t cands[2] = { 0xA0000000u | g_fontAtlasPhys.load(), 0xA337D000u };
+    uint32_t bestOff = cands[0], nz = 0;
+    for (uint32_t c = 0; c < 2; c++) { const uint8_t* a = g_base + cands[c]; uint32_t cn = 0;
+        for (uint32_t i = 0; i < 256u * 256u; i++) if (a[i]) cn++;
+        if (cn > nz) { nz = cn; bestOff = cands[c]; } }
+    const uint8_t* atlas = g_base + bestOff;
+    { static int s_dbg = 0; if ((s_dbg++ % 120) == 0) fprintf(stderr, "[fontwait] check #%d: best atlas nz=%u/65536 @ g_base+0x%X (cands 0x%X / 0x337D000)\n", s_dbg, nz, bestOff, cands[0]); }
     static uint32_t s_lastNz = 0; static int s_stable = 0, s_waited = 0;
     s_waited++;
     if (nz == s_lastNz) s_stable++; else { s_stable = 0; s_lastNz = nz; }
-    if (nz == 0) return false;                            // still empty — retry next frame
+    if (nz == 0) return false;                            // both candidates still empty — retry next frame
     if (s_stable < 3 && s_waited < 240) return false;     // still populating (nz changing) — retry, unless we've waited ~240 frames
     std::vector<uint8_t> rgba((size_t)256 * 256 * 4);
     for (uint32_t i = 0; i < 256u * 256u; i++) {
@@ -804,8 +813,8 @@ bool LoadFontAtlasOnce() {
         rgba[i*4+0] = 255; rgba[i*4+1] = 255; rgba[i*4+2] = 255; rgba[i*4+3] = v;
     }
     g_bgLoaded = UploadTexture(rgba.data(), 256, 256);
-    fprintf(stderr, "[render] font atlas %s (256x256 FMT_8 @ guest 0x337D000) — %u/%u non-zero bytes (stable=%d, waited=%d frames)\n",
-            g_bgLoaded ? "uploaded" : "FAILED", nz, 256u*256u, s_stable, s_waited);
+    fprintf(stderr, "[render] font atlas %s (256x256 FMT_8 @ guest 0x%X) — %u/%u non-zero bytes (stable=%d, waited=%d frames)\n",
+            g_bgLoaded ? "uploaded" : "FAILED", bestOff, nz, 256u*256u, s_stable, s_waited);
     return g_bgLoaded;
 }
 
