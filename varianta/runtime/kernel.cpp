@@ -1939,10 +1939,13 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
                     auto cx = [](float v){ return v / 884.0f - 1.0f; };      // placeholder authoring->clip (tune from the log)
                     auto cy = [](float v){ return v / 521.5f - 1.0f; };
                     static const bool s_tg = getenv("REX_TEXTGLYPH") != nullptr;
-                    if (prim == 5 && !s_tg) { for (uint32_t i = 2; i < nr; i++) {   // tri-strip panels (skipped in REX_TEXTGLYPH text-only view, since the full-screen panels would obscure the text)
+                    static const bool s_panels = getenv("REX_PANELS") != nullptr;   // cont.138: carve the flat prim-5 panels even in REX_TEXTGLYPH (composite the menu UI layout: panels UNDER the text)
+                    static std::atomic<int> s_p5{0};
+                    if (prim == 5 && (!s_tg || s_panels)) { if (s_panels) { int c=s_p5.fetch_add(1); if(c<8) fprintf(stderr,"[panel] prim5 carved #%d numI=%u v0=(%.1f,%.1f) v2=(%.1f,%.1f)\n",c,numInd,vb[0],vb[1],vb[4],vb[5]); }
+                        for (uint32_t i = 2; i < nr; i++) {   // tri-strip panels
                         float t[6] = { cx(vb[(i-2)*2]),cy(vb[(i-2)*2+1]), cx(vb[(i-1)*2]),cy(vb[(i-1)*2+1]), cx(vb[i*2]),cy(vb[i*2+1]) };
                         if (tl_esVerts.size() < 60000) tl_esVerts.insert(tl_esVerts.end(), t, t+6); } }
-                    else if (prim == 5) { /* REX_TEXTGLYPH: panels skipped */ }
+                    else if (prim == 5) { /* REX_TEXTGLYPH: panels skipped (no REX_PANELS) */ }
                     else {   // prim 13 = quad-list (text glyphs)
                         static const bool s_textglyph = getenv("REX_TEXTGLYPH") != nullptr;
                         if (s_textglyph && stride >= 16) {   // cont.117: TEXTURED text — pos.xy->clip + uv.zw (font atlas @0xA337D000)
