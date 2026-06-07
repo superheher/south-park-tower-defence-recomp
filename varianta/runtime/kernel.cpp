@@ -1819,7 +1819,8 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
             // Screen→Vulkan-NDC: clip=(x/640-1, y/360-1) for the 1280×720 fb (NDC y-down matches screen y-down).
             uint32_t fc0 = GLD32(0x7FC80000u + 0x4800u*4u);
             static const bool s_skipBackdrop = getenv("REX_UITEXT_FIT") != nullptr;   // text-only validation view
-            if (!s_skipBackdrop && (fc0 & 3u) == 3u && prim == 8 && numInd >= 3) {
+            static const bool s_tgTextOnly = getenv("REX_TEXTGLYPH") != nullptr;   // cont.132: in REX_TEXTGLYPH g_tex IS the FONT ATLAS — the prim-8 backdrop's full-screen [0,1] UVs would sample the atlas FULL-SCREEN (the cont.131 "big atlas display"), and its flat fallback paints debug quadrants OVER the text. Skip the whole backdrop → the carved menu-text glyphs render alone on the dark clear.
+            if (!s_skipBackdrop && !s_tgTextOnly && (fc0 & 3u) == 3u && prim == 8 && numInd >= 3) {
                 uint32_t base = fc0 & 0xFFFFFFFCu, gv = 0xA0000000u | (base & 0x1FFFFFFFu);
                 float x[3], y[3];
                 for (int i = 0; i < 3; i++) { uint32_t ux = GLD32(gv + i*8), uy = GLD32(gv + i*8 + 4);
