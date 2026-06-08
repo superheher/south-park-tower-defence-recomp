@@ -5752,3 +5752,14 @@ Sent the decoded atlas to the user (it shows the menu's real text + confirms the
 **Default boot UNREGRESSED:** REX_SATGATE gated; the case 0x3C just `break`s without it. Verified — default boot 324901 lines clean, satgate 0 fires, 0 crashes (exit 137).
 
 **⭐NEXT** — genuine decision point for the user (they chose "commit to the cycle-break"; the concrete attempt has now failed): (a) keep grinding the multi-week rearchitecture (large, uncertain); or (b) consolidate cont.119-148 + write a morning report. Recommend (b): the loop has exhausted the tractable levers — the crack is a rearchitecture, not an iteration.
+
+================================================================================
+## cont.150 (2026-06-08, /loop "go job next", autonomous; user chose "keep grinding the rearchitecture") — REFRAME: the LATE device+13568 holds the title's real render (caption + textured panels), but still NOT the menu items
+
+**🟡🔁 cont.150** (measurement-only, existing REX_CHUNKDUMP) — a correction to my own earlier assumption: cont.143-149 parsed device+13568 **early** (caption/empty). REX_CHUNKDUMP (fires at its swap#4000+ counter on richer frames) shows the **late** device+13568 (base 0xA15Exxxx, growing) is the title's real per-frame render: prim-13 CAPTION (`numI=252`, 116 `[drawstate]` samples — all 252) + prim-5 PANELS (289) with FULL draw-state — `vp 1280x-720 off(640,360)`, scissor bottom-right quadrant, `blend0=0x7060706`, `texFetch=9/seg` (textures BOUND).
+
+**⇒** The late chunk additionally has the **textured panels** (the menu BACKGROUND — the cont.137-138 wall, now confirmed reachable late) + full draw-state, beyond the early caption-only parse. **BUT** the prim-13 is still all caption (numI=252) — the menu TEXT ITEMS (START GAME=9 glyphs, …) are NOT in device+13568 at any swap. They're a genuinely separate, deferred path (REX_TEXTRENDER guest-thread VBs, never landing in device+13568 — the cont.21 deferred frame). cont.146-149 holds for the items.
+
+**(NB:** my REX_MENUXFORM late-gate used g_swapCount [slow: 6 here] vs the chunkdump's fast counter [16188] → never fired; **reverted**. Use REX_CHUNKDUMP for late parsing. No code change committed → default boot trivially UNREGRESSED.)
+
+**⭐NEXT (cont.151)** — two reachable threads: **(a) [visible]** the late device+13568's textured panels = the menu BACKGROUND art (cont.137-138 wall, now reachable) — decode the bound panel textures (texFetch slots) + composite UNDER the cont.141 text → a more complete menu demo (background + text); **(b) [cycle-break]** the menu items remain deferred (still the cont.21 wall). (a) is a concrete visible win complementing cont.141; (b) is the hard rearchitecture. Tools: REX_CHUNKDUMP ~4680, cont.136 panel-texture decode, cont.141 recon ~2907.
