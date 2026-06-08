@@ -4869,6 +4869,37 @@ PPC_FUNC(__imp__VdSwap) {
                     fprintf(stderr,"[segdump] (end; %d packets shown)\n", pk<120?pk:120);
                 }
             }
+            // cont.151 (MEASUREMENT-ONLY): which TEXTURES do the menu directory segments actually reference? cont.150
+            // read texFetch=9/seg and inferred "textures BOUND" (the menu background art). This decodes them to settle
+            // it. The prim-5 panel draws read EMPTY slot-0 in the executed directory (the cont.59 placeholder), so scan
+            // the ACCUMULATED fetch shadow after the whole frame walk for every type-2 texture const (d0[1:0]=2; base=
+            // d1[31:12]<<12, phys 0x02xxxxxx -> 0xA2xxxxxx mirror, cont.57; fmt=d1[5:0]; endian=d1[7:6]; w/h-1 in
+            // d2[12:0]/[25:13]; pitch=d0[30:22]<<5; tiled=d0[31] — the sub_821BEC00 handle layout). Decode-dump each
+            // distinct one (so the art is verifiable) + one-shot raw fetch dump. RESULT (REX_CHUNKDUMP=3 full-menu):
+            // the ONLY type-2 texture is the FONT ATLAS (0xA337D000 256² fmt2); the rest are type-0 (null/disabled) +
+            // type-3 (vertex). So texFetch=9/seg OVERCOUNTS null fetch-const loads — there is NO menu-background texture
+            // in the executed segments (matches cont.137-138: flat panels / attract-video bg). cont.150 (a) refuted.
+            { static std::atomic<bool> fd{false}; bool e=false;
+              if (fd.compare_exchange_strong(e,true)) { fprintf(stderr,"[fetchdump] non-zero fetch[] slots after frame walk:\n");
+                  for (uint32_t fk=0;fk<0x180;fk++){ if(!fetch[fk])continue; fprintf(stderr,"  fetch[0x%X]=%08X (type=%u)\n",fk,fetch[fk],fetch[fk]&3); } } }
+            for (uint32_t fk = 0; fk + 2 < 0x180; fk++) {
+                if ((fetch[fk] & 3) != 2) continue;
+                uint32_t d0 = fetch[fk], d1 = fetch[fk+1], d2 = fetch[fk+2];
+                uint32_t base = d1 & 0xFFFFF000u; if (base < 0xA0000000u) base |= 0xA0000000u;   // phys -> 0xA mirror (cont.57)
+                if (base < 0xA2000000u || base >= 0xB1000000u) continue;
+                uint32_t fmt = d1 & 0x3F, endian = (d1 >> 6) & 3, tw = (d2 & 0x1FFF)+1, th = ((d2 >> 13) & 0x1FFF)+1;
+                uint32_t pitch = ((d0 >> 22) & 0x1FFu) << 5, tiled = (d0 >> 31) & 1;
+                if (tw <= 4 || th <= 4 || tw > 4096 || th > 4096 || !rex_tex::BytesPerBlock(fmt)) continue;
+                static std::unordered_set<uint32_t> s_seen; static std::mutex s_sm; bool fst;
+                { std::lock_guard<std::mutex> lk(s_sm); fst = s_seen.insert(base).second; }
+                if (!fst) continue;
+                { std::lock_guard<std::mutex> lk(g_texDimsMtx);   // make it decodable by base (gated under REX_CHUNKDUMP only)
+                  g_texDimsByBase[base] = { (uint16_t)tw, (uint16_t)th, (uint16_t)(pitch>8192?8192:pitch), (uint8_t)fmt, (uint8_t)endian, (uint8_t)tiled }; }
+                const CachedTex* t = DecodeByBase(base);
+                char pp[112]; snprintf(pp, sizeof pp, "/tmp/cont151_segtex_%08X_%ux%u_f%02X.ppm", base, tw, th, fmt);
+                if (t && t->w && t->h) rex_tex::WriteRGBAasPPM(pp, t->rgba.data(), t->w, t->h);
+                fprintf(stderr, "[segtex] base=0x%08X %ux%u fmt=0x%X pitch=%u tiled=%u -> %s\n", base, tw, th, fmt, pitch, tiled, (t&&t->w)?pp:"(undecodable)");
+            }
             { char hb[512]; size_t ho=0; ho+=snprintf(hb+ho,sizeof(hb)-ho,"[ophist]");
               for (int op=0; op<128; op++) if (opHist[op]) {
                   const char* nm = op==0x22?"DRAW":op==0x36?"DRAW2":op==0x2D?"SETCONST":op==0x55?"SETCONST2":op==0x56?"SETSHCONST":
