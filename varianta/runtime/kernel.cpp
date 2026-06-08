@@ -2944,8 +2944,14 @@ PPC_FUNC(sub_8242BF10)
                             // cont.141: keep the CRISP menu items/headers (3..20 glyphs, single-line) — skip the
                             // 63-glyph caption + the wide multi-line paragraphs (they garble in the single-bbox raster)
                             // for a clean menu. Each is already seenLbl-unique (we're inside `if(isnew)`).
-                            int rbright = 0;   // cont.141: bright (glyph) pixels — drop sparse partial-build/garbled labels
-                            for (size_t z=0; z<size_t(LW)*LH; z++) { const uint8_t* sp=&fb[z*4]; if(sp[0]>=24||sp[1]>=24||sp[2]>=24) rbright++; }
+                            int rbright = 0, rwhite = 0;   // cont.141: bright (glyph) pixels — drop sparse partial-build/garbled labels.
+                            // cont.153: rwhite = WHITE-ISH (low-saturation/grayscale) lit pixels. Real text glyphs are white;
+                            // the title's CHARACTER chroma-key SPRITE atlas (cont.68 green sprites) gets mis-rastered as a
+                            // "label" → saturated GREEN blocks. Require the label to be mostly white-ish to drop those.
+                            for (size_t z=0; z<size_t(LW)*LH; z++) { const uint8_t* sp=&fb[z*4];
+                                int mx=sp[0]>sp[1]?(sp[0]>sp[2]?sp[0]:sp[2]):(sp[1]>sp[2]?sp[1]:sp[2]);
+                                int mn=sp[0]<sp[1]?(sp[0]<sp[2]?sp[0]:sp[2]):(sp[1]<sp[2]?sp[1]:sp[2]);
+                                if (mx>=24) { rbright++; if (mx-mn <= mx/3 + 12) rwhite++; } }   // low saturation = white-ish glyph
                             // cont.142: detect + skip MULTI-LINE labels (≥2 bright-row bands separated by a ≥5px gap).
                             // They're dynamic/non-menu strings that garble in the single-bbox raster; clean single-line
                             // menu items are one band. (A small internal gap, e.g. an 'i' dot, stays one band.)
@@ -2960,7 +2966,7 @@ PPC_FUNC(sub_8242BF10)
                             // Then recompose the whole clean frame (stacked, 2 columns) on change + publish. Layout
                             // RECONSTRUCTED (NOT the title's real screen positions — those are the cont.73 A↔B wall).
                             if (getenv("REX_MENURECON") && vc/4 >= 3 && vc/4 <= 20 && LH >= 16 && LH <= 84 && LW <= 560
-                                && rbright >= (int)(vc/4) * 18 && !rmulti) {     // ≥18 lit px/glyph (real glyphs, not a partial) + single-line only
+                                && rbright >= (int)(vc/4) * 18 && !rmulti && rwhite >= rbright*3/4) {     // ≥18 lit px/glyph + single-line + mostly white-ish (text, not the green sprite atlas)
                                 struct RLabel { uint64_t key; std::vector<uint8_t> bmp; int w, h; uint32_t vc; };
                                 static std::mutex krm; static std::vector<RLabel> rl;
                                 std::lock_guard<std::mutex> lk(krm);
