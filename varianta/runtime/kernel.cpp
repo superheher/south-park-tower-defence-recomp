@@ -3958,6 +3958,42 @@ PPC_FUNC(sub_821C6E58)
                     a2 += cnt * 4u;
                 }
             }
+            // cont.147: ALSO walk the HUGE main build-cursor buffer [dev+13572..dev+13568] (cont.145: ~125k dw raw PM4;
+            // FrameBufDump mis-parsed it as 0x81 descriptors → never walked). The menu-item DRAW_INDX are most likely
+            // built HERE (cont.146 found only the caption in the small cont.108-109 segments). Shadow reg-0x4000, dump
+            // prim-4/5/13 draws — esp. numI != 252 (real menu items, not the 63-glyph caption). First few fires only.
+            if (mxn.load() <= 5) {
+                uint32_t b0 = GLD32(device + 13568), b1 = GLD32(device + 13572);
+                uint32_t lo = b0 < b1 ? b0 : b1, hi = b0 < b1 ? b1 : b0;
+                if (lo >= 0xA0000000u && hi > lo && (hi - lo) < 0x200000u) {
+                    uint32_t alu2[128] = {0}; auto fb2 = [&](int idx){ float f; memcpy(&f, &alu2[idx], 4); return f; };
+                    uint32_t a2 = lo; int nd2 = 0, p13=0, p5=0, p4=0, iters=0;
+                    while (a2 + 4 <= hi && nd2 < 48 && iters++ < 300000) {
+                        uint32_t pkt = GLD32(a2); a2 += 4; if (pkt == 0) continue;
+                        uint32_t t = pkt >> 30;
+                        if (t == 2) continue;
+                        if (t == 0) { uint32_t cnt=((pkt>>16)&0x3FFF)+1, bi=pkt&0x7FFF; bool one=(pkt>>15)&1;
+                            for (uint32_t m=0;m<cnt && a2+4<=hi;m++,a2+=4){ uint32_t ri=one?bi:bi+m; if(ri>=0x4000u&&ri<0x4080u) alu2[ri-0x4000u]=GLD32(a2); }
+                            continue; }
+                        if (t == 1) { a2 += 8; continue; }
+                        uint32_t op=(pkt>>8)&0x7Fu, cnt=((pkt>>16)&0x3FFF)+1;
+                        if (op == 0x2Du) { uint32_t ot=GLD32(a2), index=ot&0x7FFu, type=(ot>>16)&0xFFu;
+                            if (type==0u) for (uint32_t k=1;k<cnt;k++){ uint32_t ri=index+(k-1); if(ri<128u) alu2[ri]=GLD32(a2+k*4); } }
+                        else if (op==0x22u || op==0x36u) {
+                            uint32_t init=(op==0x22u)?GLD32(a2+4):GLD32(a2); uint32_t numI=init>>16, prim=init&0x3Fu;
+                            if (prim==13u||prim==5u||prim==4u) { if(prim==13u)p13++; else if(prim==5u)p5++; else p4++;
+                                float Tx=fb2(3),Ty=fb2(7),Px=fb2(16),Pxw=fb2(19),Py=fb2(21),Pyw=fb2(23);
+                                float ox=(0.f+Tx)*Px+Pxw, oy=(0.f+Ty)*Py+Pyw;
+                                bool on = ox>-1.2f&&ox<1.2f&&oy>-1.2f&&oy<1.2f;
+                                if (nd2 < 48) fprintf(stderr, "[bigbuf] @0x%X prim=%u numI=%u World=(%.0f,%.0f) clip=(%.2f,%.2f) %s\n",
+                                        a2-4, prim, numI, Tx, Ty, ox, oy, on?"ON":"off"); nd2++;
+                            }
+                        }
+                        a2 += cnt * 4u;
+                    }
+                    fprintf(stderr, "[bigbuf] fire#%d walked [0x%X..0x%X] %u dw: p13=%d p5=%d p4=%d (iters=%d)\n", mxn.load(), lo, hi, (hi-lo)/4u, p13, p5, p4, iters);
+                }
+            }
         }}
         // cont.116: dump the menu font atlas (cont.115: 256x256 FMT_8 8bpp @ GPU 0xA337D000, untiled) -> grayscale PPM,
         // to verify the FMT_8 decode + SEE the glyphs before wiring the textured-text draw. GLD32 is BE-swapped, so

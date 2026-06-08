@@ -5710,3 +5710,14 @@ Sent the decoded atlas to the user (it shows the menu's real text + confirms the
 **Default boot UNREGRESSED:** `REX_MENUXFORM` gated + inside the g_coop||g_preempt sub_821C6E58 path; never fires in default boot. Verified — default boot 325481 lines clean, diag 0 fires, 0 crashes (exit 137).
 
 **⭐NEXT** — a clear, informed fork: **(a)** commit to the multi-week cont.21 cycle-break (find where the menu-item DRAW_INDX commands are built before deferral — the sub_821F8E60 vtable[15] renderer output, cont.47/54 — then execute the real deferred frame → real completion → drain the cycle → the title submits live content); or **(b)** consolidate cont.119-146 as the deliverable (the menu-text demo + the rigorous wall diagnosis). Per the project's rigor norm, surfacing this honest "no shortcut" result for the user's decision.
+
+================================================================================
+## cont.147 (2026-06-08, /loop "go job next", autonomous; user chose "commit to the cont.21 cycle-break") — the huge build-cursor buffer has ZERO draws → menu items are in deferred state
+
+**🟡🧱 cont.147** — extended `REX_MENUXFORM` to PM4-walk the HUGE main build-cursor buffer `[dev+13572..dev+13568]` (cont.145: ~125k dw of raw PM4 that FrameBufDump mis-parsed as 0x81 descriptors → never walked). **Result: ZERO prim-4/5/13 draws** across 5 frames (walked 125162→127405 dw each, fully). The huge buffer holds no draws.
+
+**⇒** The menu-item DRAW_INDX are NOT in (a) the ring (cont.144), (b) the small cont.108-109 segments (= caption only, cont.146), nor (c) the huge main build-cursor (cont.147). The title fills the menu-item VBs (REX_TEXTRENDER decodes them) but holds their draws in DEFERRED STATE (sub_821BEC00 records binding + dirty → sub_821CAA18, cont.54), emitted only by the flush — which is gated on the GPU↔CPU WAIT_REG_MEM handshake variant A doesn't model (kernel.cpp ~3954). There's no reachable PM4 buffer to read or execute → the cycle-break must make the title EMIT the deferred draws.
+
+**Default boot UNREGRESSED:** bigbuf is inside the gated REX_MENUXFORM diag. Verified — default boot 274295 lines clean, diag 0 fires, 0 crashes (exit 137).
+
+**⭐NEXT (cont.148)** — the deferred-state FLUSH gate: RE sub_821CAA18 / sub_821C6D58 (the cont.54 flush) + the WAIT_REG_MEM handshake — what gates the title from flushing its deferred menu draws, and can variant A satisfy it (model the GPU↔CPU WAIT_REG_MEM so the title emits the menu draws as PM4 → execute them → real completion → drain the cont.21 cycle). Tools: sub_821BEC00 hook ~2518, sub_821C6E58 ~3793, REX_FRAMEEXEC ~3806, the WAIT_REG_MEM note ~3954.
