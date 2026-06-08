@@ -5819,3 +5819,10 @@ Sent the decoded atlas to the user (it shows the menu's real text + confirms the
 **Default boot UNREGRESSED** (reverted to cont.153).
 
 **⭐NEXT — TRACTABLE WORK IS EXHAUSTED:** the menu wall is closed (cont.137-152, 3 gated axes), the deliverable is cleaned (cont.153), stable-frames failed (cont.154). What remains is only (a) the deep GPU build (multi-day, a user decision, NOT to auto-pilot unverified), (b) the VC-1 decoder (a stub for a complex system codec = deep), or (c) fixing the prod-oracle (off-limits here). The loop paces down to a long (1h) cadence to await the user's fork decision (MORNING-REPORT-2026-06-08.md); each wake = a brief reassessment, act only on genuine new value or user input.
+
+================================================================================
+## cont.155 (2026-06-09, /loop "go next job", autonomous, NOT pushed) — showcase montage + boot-splash deliverable re-verified
+
+**🟢🖼️ cont.155** — a paced re-assessment wake: rather than idle-hold, I verified + showcased the boot-splash deliverable (a real cont.65/75 achievement not re-checked this session). A REX_DRAWCAP+REX_MSSPLASH boot run captured fresh splashes: Microsoft Game Studios (REX_MSSPLASH, nz=256/256), SOUTH PARK Digital Studios (A2D96000 @348,261 584×198), doublesix (A2E12000 @203,203 875×314) — all clean + recognizable at their real positions → confirms cont.65/75 is UNREGRESSED after the cont.151-154 changes (Comedy Central A2F25000 missed this run = the cont.65 timing variance). Composed `tools/SP_renderer_showcase_c155.png` (splashes + menu text) as the achievable-deliverable showcase, and updated MORNING-REPORT-2026-06-08.md to reference it. No code change → default boot trivially UNREGRESSED.
+
+**⭐NEXT** — tractable work is still exhausted (cont.154); the showcase is the tangible result for the user. The loop awaits the user's fork decision (deep GPU build / fix the prod-oracle / accept the deliverable; MORNING-REPORT-2026-06-08.md), paced at a long cadence — act only on genuine new value or user input.

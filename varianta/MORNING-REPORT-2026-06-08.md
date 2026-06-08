@@ -1,7 +1,7 @@
 # Variant A renderer — ночной автономный /loop (2026-06-08, cont.151–153)
 
-**Картинка-итог:** `varianta/tools/real_menu_clean_c153.png` — реальный menu-текст титла, отрендеренный собственным Vulkan-движком variant A (после cont.153 чистки — без зелёного мусора).
-Ветка `experimental/hle-graphics-spike`, коммиты **cont.151–153, НЕ запушены**, default boot не регрессит ни на одном.
+**Картинка-итог:** `varianta/tools/SP_renderer_showcase_c155.png` — общий showcase: реальная boot-последовательность (Microsoft Game Studios → SOUTH PARK Digital Studios → doublesix) + menu-текст, ВСЁ отрендерено собственным Vulkan-движком variant A. (Menu-текст отдельно: `tools/real_menu_clean_c153.png`.)
+Ветка `experimental/hle-graphics-spike`, коммиты **cont.151–155, НЕ запушены**, default boot не регрессит ни на одном. (cont.155 переподтвердил: boot-сплэши рендерятся ЧИСТО после всех cont.151-154 изменений — без регресса.)
 
 ---
 
