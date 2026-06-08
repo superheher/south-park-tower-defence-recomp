@@ -1582,6 +1582,22 @@ void ExecuteType3(uint32_t addr, uint32_t op, uint32_t count, int depth) {
         ExecutePM4(TranslatePhys(ibAddr), ibLen, depth + 1);
         break;
       }
+      case 0x3Cu: {   // WAIT_REG_MEM — cont.149: ATTEMPT the cont.21 cycle-break by SATISFYING the gate (model GPU
+        // completion). cont.148: the title's guest flush spin blocks on these polls (reg:0xA31 GPU-idle, mem:0x2011016
+        // = build-cursor-consumed, mem:0x2011012 = producer, …). Write the polled ref so the spin succeeds → maybe the
+        // title FLUSHES its deferred menu draws. Addr space ambiguous → write reg file (reg) or both g_base+poll AND the
+        // GPU aperture (mem). Gated REX_SATGATE; default boot unaffected. (cont.21-30: faking completion alone left the
+        // title in placeholder — this targets the FLUSH-gate (pre-emission), a different lever; measure if it emits.)
+        static const bool s_satgate = getenv("REX_SATGATE") != nullptr;
+        if (s_satgate) {
+            uint32_t info=GLD32(addr), poll=GLD32(addr+4), ref=GLD32(addr+8), mask=GLD32(addr+12);
+            if (info & 0x10u) { GST32(poll, ref); GST32(0xA0000000u | (poll & 0x1FFFFFFFu), ref); }
+            else { uint32_t ra = 0x7FC80000u + poll*4u; GST32(ra, (GLD32(ra) & ~mask) | (ref & mask)); }
+            static std::atomic<int> sgn{0}; int k=sgn.fetch_add(1);
+            if (k < 24) fprintf(stderr, "[satgate] %s:0x%X <- ref=0x%X mask=0x%X satisfied\n", (info&0x10u)?"mem":"reg", poll, ref, mask);
+        }
+        break;
+      }
       case PM4_INTERRUPT: {
         uint32_t cpuMask = GLD32(addr);
         static const bool intlog2 = getenv("REX_INTLOG") != nullptr;

@@ -5735,3 +5735,20 @@ Sent the decoded atlas to the user (it shows the menu's real text + confirms the
 **⇒** variant A's CP SKIPS WAIT_REG_MEM (kernel.cpp ~2086), so the CP doesn't block — but the GUEST flush spin (sub_821C6D58) on these mailboxes does. The title builds the menu (VBs filled) but its FLUSH blocks on these polls; REX_CPCOMPLETE (device+0x2b04) lets it KICK setup but doesn't satisfy reg:0xA31 / mem:0x2011xxx → the deferred menu frame never flushes. **Concrete, likely-unexplored cycle-break lever.** Measurement-only → default boot trivially UNREGRESSED.
 
 **⭐NEXT (cont.149)** — ATTEMPT to satisfy the gates: model reg 0xA31 bit-31 cleared (GPU-idle) + mem:0x2011016=0xC0090180 + mem:0x2011012=0x821CC7A0 + mem:0x2011002=0x4→0x0, gated behind a new flag, and measure whether the title's flush fires (menu DRAW_INDX appear in the build-cursor via REX_MENUXFORM/bigbuf) and progresses. Tools: WAIT_REG_MEM handler ~1557, GpuReg/GpuRegAddr, REX_CPCOMPLETE ~2303, REX_MENUXFORM/bigbuf ~3925.
+
+================================================================================
+## cont.149 (2026-06-08, /loop "go job next", autonomous; cont.21 cycle-break ATTEMPT) — gate-satisfaction FAILS; the wall holds
+
+**🔴🧱 cont.149** — attempted the concrete cont.148 lever and it failed. **Satisfying the WAIT_REG_MEM gates did NOT make the title flush its menu draws.**
+
+**CHANGE** (kernel.cpp, `REX_SATGATE`, ExecutePM4 case 0x3C): when the CP hits a WAIT_REG_MEM, write the polled ref to the poll location (reg → `0x7FC80000+poll*4` under mask; mem → both g_base+poll AND the GPU aperture) — model GPU completion so the guest flush spin can proceed.
+
+**RESULT** — `[satgate]` fired 22× (gates satisfied), but `[bigbuf]` STILL p13=0 p5=0 p4=0 every frame: the build-cursor has no draws, the title did NOT flush its deferred menu draws, no menu items emitted. No progress change.
+
+**⇒** The lever fails — two principled reasons: (1) faking the mailbox lets the spin pass momentarily, but the title finds no REAL results → stays in placeholder (= cont.25-30); (2) the timing is backwards — completion is signalled by an EVENT_WRITE *inside the deferred frame* (which never executes), not at the WAIT.
+
+**⇒ Honest consolidation (cont.143→149):** the cont.21 A↔B cycle cannot be cracked by faking gates / reading state. The menu draws are built but DEFERRED, emitted only by a flush that needs REAL completion of the prior frame, which needs executing the deferred frame, which isn't emitted → the genuine chicken-and-egg. Cracking it = the multi-week rearchitecture (a continuous CP + real renderer executing the title's ACTUAL per-frame stream — "build A+B together", cont.21 / A2B §3), NOT a loop-iteration task. The solid committed deliverable is cont.119-142 (variant A renders the real menu text; demo, reconstructed layout) + the exhaustive wall diagnosis (143-149).
+
+**Default boot UNREGRESSED:** REX_SATGATE gated; the case 0x3C just `break`s without it. Verified — default boot 324901 lines clean, satgate 0 fires, 0 crashes (exit 137).
+
+**⭐NEXT** — genuine decision point for the user (they chose "commit to the cycle-break"; the concrete attempt has now failed): (a) keep grinding the multi-week rearchitecture (large, uncertain); or (b) consolidate cont.119-148 + write a morning report. Recommend (b): the loop has exhausted the tractable levers — the crack is a rearchitecture, not an iteration.
