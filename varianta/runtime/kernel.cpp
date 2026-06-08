@@ -2913,18 +2913,44 @@ PPC_FUNC(sub_8242BF10)
                             // for a clean menu. Each is already seenLbl-unique (we're inside `if(isnew)`).
                             int rbright = 0;   // cont.141: bright (glyph) pixels — drop sparse partial-build/garbled labels
                             for (size_t z=0; z<size_t(LW)*LH; z++) { const uint8_t* sp=&fb[z*4]; if(sp[0]>=24||sp[1]>=24||sp[2]>=24) rbright++; }
+                            // cont.142: detect + skip MULTI-LINE labels (≥2 bright-row bands separated by a ≥5px gap).
+                            // They're dynamic/non-menu strings that garble in the single-bbox raster; clean single-line
+                            // menu items are one band. (A small internal gap, e.g. an 'i' dot, stays one band.)
+                            int rbands = 0, remptyRun = 999, rnb = LH < 600 ? LH : 599;
+                            for (int yy = 0; yy < rnb; yy++) { bool lit=false;
+                                for (int xx = 0; xx < LW; xx++) { const uint8_t* sp=&fb[(size_t(yy)*LW+xx)*4]; if(sp[0]>=24||sp[1]>=24||sp[2]>=24){lit=true;break;} }
+                                if (lit) { if (remptyRun >= 5) rbands++; remptyRun = 0; } else remptyRun++; }
+                            bool rmulti = rbands >= 2;
+                            // cont.142: keep the FULLEST version of each distinct label. The title re-renders a label
+                            // repeatedly as it builds ("SELECT" → "SELECT GAME MODE"); key by atlas + the first ≤3 glyphs'
+                            // UVs (EXCLUDING the glyph count) so partial builds collapse to one, and we keep the longest.
+                            // Then recompose the whole clean frame (stacked, 2 columns) on change + publish. Layout
+                            // RECONSTRUCTED (NOT the title's real screen positions — those are the cont.73 A↔B wall).
                             if (getenv("REX_MENURECON") && vc/4 >= 3 && vc/4 <= 20 && LH >= 16 && LH <= 84 && LW <= 560
-                                && rbright >= (int)(vc/4) * 18) {     // >= ~18 lit px/glyph ⇒ the glyphs actually rendered (not a 1-2-glyph partial)
-                                static std::mutex krm; static std::vector<uint8_t> kr; static int cx = 70, cy = 48;
-                                std::lock_guard<std::mutex> lk(krm); const int RW = 1280, RH = 720;
-                                if (kr.empty()) { kr.assign(size_t(RW)*RH*4, 0); for (size_t z=0;z<size_t(RW)*RH;z++) kr[z*4+3]=255; }
-                                if (cy + LH > RH - 28) { cx += 600; cy = 48; }     // wrap to the next column
-                                if (cx + LW <= RW) {
-                                    for (int yy=0; yy<LH; yy++) { int ry=cy+yy; if(ry<0||ry>=RH)continue;
-                                        for (int xx=0; xx<LW; xx++) { int rx=cx+xx; if(rx<0||rx>=RW)continue;
-                                            const uint8_t* sp=&fb[(size_t(yy)*LW+xx)*4]; if(sp[0]<24&&sp[1]<24&&sp[2]<24)continue;
-                                            uint8_t* dp=&kr[(size_t(ry)*RW+rx)*4]; dp[0]=sp[0];dp[1]=sp[1];dp[2]=sp[2];dp[3]=255; } }
-                                    cy += LH + 30;
+                                && rbright >= (int)(vc/4) * 18 && !rmulti) {     // ≥18 lit px/glyph (real glyphs, not a partial) + single-line only
+                                struct RLabel { uint64_t key; std::vector<uint8_t> bmp; int w, h; uint32_t vc; };
+                                static std::mutex krm; static std::vector<RLabel> rl;
+                                std::lock_guard<std::mutex> lk(krm);
+                                uint32_t sig = 2166136261u; int ng = (int)(vc/4); if (ng > 3) ng = 3;   // first ≤3 glyphs' first-vertex u
+                                for (int g = 0; g < ng; g++) { uint32_t u = (uint32_t)(rdf((g*4)*16+8) * 512.f); sig = (sig ^ u) * 16777619u; }
+                                uint64_t key = ((uint64_t)g_lastTexBase << 32) | (sig & 0xFFFFFFFFu);
+                                int idx = -1; for (size_t k = 0; k < rl.size(); k++) if (rl[k].key == key) { idx = (int)k; break; }
+                                bool changed = false;
+                                if (idx < 0) { rl.push_back({key, std::vector<uint8_t>(fb.begin(), fb.begin()+size_t(LW)*LH*4), LW, LH, vc}); changed = true; }
+                                else if (vc > rl[idx].vc) { rl[idx] = {key, std::vector<uint8_t>(fb.begin(), fb.begin()+size_t(LW)*LH*4), LW, LH, vc}; changed = true; }
+                                if (changed) {
+                                    const int RW = 1280, RH = 720; static std::vector<uint8_t> kr;
+                                    kr.assign(size_t(RW)*RH*4, 0); for (size_t z=0;z<size_t(RW)*RH;z++) kr[z*4+3]=255;
+                                    int cx = 70, cy = 48;
+                                    for (auto& e : rl) {
+                                        if (cy + e.h > RH - 28) { cx += 600; cy = 48; }
+                                        if (cx + e.w > RW) continue;
+                                        for (int yy=0; yy<e.h; yy++) { int ry=cy+yy; if(ry<0||ry>=RH)continue;
+                                            for (int xx=0; xx<e.w; xx++) { int rx=cx+xx; if(rx<0||rx>=RW)continue;
+                                                const uint8_t* sp=&e.bmp[(size_t(yy)*e.w+xx)*4]; if(sp[0]<24&&sp[1]<24&&sp[2]<24)continue;
+                                                uint8_t* dp=&kr[(size_t(ry)*RW+rx)*4]; dp[0]=sp[0];dp[1]=sp[1];dp[2]=sp[2];dp[3]=255; } }
+                                        cy += e.h + 30;
+                                    }
                                     rex_render::SetReconMenuFrame(kr.data(), RW, RH);
                                 }
                             } }
