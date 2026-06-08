@@ -42,4 +42,13 @@ void BlitMenuCell(const uint8_t* rgba, int w, int h, uint32_t base);
 // draw's bound texture fetch const (the live atlas base) and publishes its PHYS offset here; LoadFontAtlasOnce
 // uploads from g_base + this offset instead of the stale hardcode. physOffset = base & 0x1FFFFFFF.
 void SetFontAtlasAddr(uint32_t physOffset);
+
+// cont.141 (REX_MENURECON): publish a full-screen (1280x720) RGBA frame onto which the kernel has
+// composited the title's REAL decoded menu/UI text labels (REX_TEXTRENDER, cont.70-71) at a
+// RECONSTRUCTED layout. The render thread uploads it into g_tex and draws it as a full-screen quad,
+// so variant A's own Vulkan pipeline renders the real menu text (SELECT GAME MODE / NEXT / BACK / ...).
+// Layout is reconstructed, NOT the title's real screen positions (those need the per-frame transform =
+// the cont.73 A<->B wall). Called repeatedly as labels arrive; the renderer re-uploads on growth (capped).
+// Gated behind REX_MENURECON (no-op otherwise).
+void SetReconMenuFrame(const uint8_t* rgba, int w, int h);
 }

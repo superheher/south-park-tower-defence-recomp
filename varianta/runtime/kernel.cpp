@@ -2903,7 +2903,31 @@ PPC_FUNC(sub_8242BF10)
                             if (ti < 60) { char fp[80]; snprintf(fp,sizeof fp,"/tmp/cont71_text_%02d_%08X.ppm", ti, g_lastTexBase);
                                 rex_tex::WriteRGBAasPPM(fp, fb.data(), LW, LH);
                                 fprintf(stderr,"[textrender] label %d: %u glyphs atlas=0x%08X %dx%d local[%.0f..%.0f,%.0f..%.0f] uv[%.2f..%.2f] -> %s\n",
-                                        ti, vc/4, g_lastTexBase, atlas->w, atlas->h, lmnx,lmxx,lmny,lmxy, minu, maxu, fp); } }
+                                        ti, vc/4, g_lastTexBase, atlas->w, atlas->h, lmnx,lmxx,lmny,lmxy, minu, maxu, fp); }
+                            // cont.141: composite this NEW label's raster (fb, LW x LH) onto a reconstructed 1280x720
+                            // menu frame (stacked, 2 columns) + publish it; the render thread draws it full-screen so
+                            // variant A's OWN Vulkan pipeline renders the real decoded menu text. Layout is RECONSTRUCTED
+                            // (NOT the title's real screen positions — those need the per-frame transform = cont.73 wall).
+                            // cont.141: keep the CRISP menu items/headers (3..20 glyphs, single-line) — skip the
+                            // 63-glyph caption + the wide multi-line paragraphs (they garble in the single-bbox raster)
+                            // for a clean menu. Each is already seenLbl-unique (we're inside `if(isnew)`).
+                            int rbright = 0;   // cont.141: bright (glyph) pixels — drop sparse partial-build/garbled labels
+                            for (size_t z=0; z<size_t(LW)*LH; z++) { const uint8_t* sp=&fb[z*4]; if(sp[0]>=24||sp[1]>=24||sp[2]>=24) rbright++; }
+                            if (getenv("REX_MENURECON") && vc/4 >= 3 && vc/4 <= 20 && LH >= 16 && LH <= 84 && LW <= 560
+                                && rbright >= (int)(vc/4) * 18) {     // >= ~18 lit px/glyph ⇒ the glyphs actually rendered (not a 1-2-glyph partial)
+                                static std::mutex krm; static std::vector<uint8_t> kr; static int cx = 70, cy = 48;
+                                std::lock_guard<std::mutex> lk(krm); const int RW = 1280, RH = 720;
+                                if (kr.empty()) { kr.assign(size_t(RW)*RH*4, 0); for (size_t z=0;z<size_t(RW)*RH;z++) kr[z*4+3]=255; }
+                                if (cy + LH > RH - 28) { cx += 600; cy = 48; }     // wrap to the next column
+                                if (cx + LW <= RW) {
+                                    for (int yy=0; yy<LH; yy++) { int ry=cy+yy; if(ry<0||ry>=RH)continue;
+                                        for (int xx=0; xx<LW; xx++) { int rx=cx+xx; if(rx<0||rx>=RW)continue;
+                                            const uint8_t* sp=&fb[(size_t(yy)*LW+xx)*4]; if(sp[0]<24&&sp[1]<24&&sp[2]<24)continue;
+                                            uint8_t* dp=&kr[(size_t(ry)*RW+rx)*4]; dp[0]=sp[0];dp[1]=sp[1];dp[2]=sp[2];dp[3]=255; } }
+                                    cy += LH + 30;
+                                    rex_render::SetReconMenuFrame(kr.data(), RW, RH);
+                                }
+                            } }
                         // cont.73: GAME-ACCURATE PLACEMENT — if this label's exec-time transform (by glyph-count) was
                         // captured (cont.23), place the glyphs on the shared 1280x720 g_textFrame at their REAL screen
                         // positions (clip=(l+T)*P+Pw; screen px=(clip+1)*half). Diagnostic: anyOn = did any glyph land

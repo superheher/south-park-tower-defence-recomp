@@ -112,6 +112,7 @@ void*                 g_texVBMap     = nullptr;
 // Requires REX_MENUTEST (shares its present path); the debug menu-quads then draw panels/text on top.
 const bool g_menutex = (getenv("REX_MENUTEX") != nullptr);
 const bool g_menulive = (getenv("REX_MENULIVE") != nullptr);  // cont.60: live menu-texture contact sheet
+const bool g_recon    = (getenv("REX_MENURECON") != nullptr); // cont.141: reconstructed real-menu-text frame (REX_TEXTRENDER labels composited + drawn full-screen)
 bool                  g_bgLoaded     = false;            // background texture uploaded into g_tex* (once)
 std::atomic<bool>     g_atlasGrew{false};                // cont.140: pulses true after a font-atlas RE-upload, so the capture path re-snaps the now-fuller (more legible) text
 std::mutex            g_texGeomMtx;
@@ -641,7 +642,7 @@ bool Init() {
     if (!CreateSwapchain()) return false;
     if (g_drawtest) CreateGraphicsPipeline();   // GPU build (piece 1): render pass already made in CreateSwapchain
     if (g_menutest) CreateMenuPipeline();       // GPU build (piece 3b): the menu-quad pipeline
-    if (g_textest || g_menutex || g_hudsheet || g_menulive) CreateTexturedPipeline();   // disk-resource path: the textured UI pipeline
+    if (g_textest || g_menutex || g_hudsheet || g_menulive || g_recon) CreateTexturedPipeline();   // disk-resource path: the textured UI pipeline (cont.141: recon draws its frame through it)
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -948,6 +949,24 @@ bool LoadMenuSheetLive() {                       // render thread: upload the sh
     return UploadTexture(g_menuSheet.data(), MS_W, MS_H);
 }
 
+// cont.141: the reconstructed real-menu-text frame, published by the kernel (SetReconMenuFrame) as labels
+// arrive. The render thread re-uploads it into g_tex on growth (each new label bumps g_reconSeq), capped so
+// the leaked old g_tex images (UploadTexture recreates them) stay bounded. Mirrors the cont.140 atlas re-upload.
+static std::vector<uint8_t> g_reconFrame; static std::mutex g_reconMtx;
+static int g_reconW = 0, g_reconH = 0;
+static std::atomic<uint32_t> g_reconSeq{0}, g_reconUploaded{0};
+static std::atomic<bool> g_reconGrew{false}; static int g_reconUploads = 0;
+bool LoadReconMenuOnce() {                        // render thread: (re-)upload the composited recon frame on growth
+    uint32_t seq = g_reconSeq.load();
+    if (seq == 0 || seq == g_reconUploaded.load() || g_reconUploads >= 16) return g_bgLoaded;
+    std::lock_guard<std::mutex> lk(g_reconMtx);
+    if (g_reconFrame.empty()) return g_bgLoaded;
+    bool ok = UploadTexture(g_reconFrame.data(), (uint32_t)g_reconW, (uint32_t)g_reconH);
+    if (ok) { g_bgLoaded = true; g_reconUploaded.store(seq); g_reconUploads++; g_reconGrew.store(true);
+        fprintf(stderr, "[recon] uploaded menu frame %dx%d (seq %u, upload#%d)\n", g_reconW, g_reconH, seq, g_reconUploads); }
+    return g_bgLoaded;
+}
+
 void PumpEvents() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -989,6 +1008,7 @@ bool PresentOnce() {
         // cont.117: once the menu has submitted text glyphs (g_texGeom populated), the font atlas @0xA337D000 is
         // loaded in guest memory — upload it into g_tex now (deferred; it's empty at init). Then the textured draw fires.
         if (getenv("REX_TEXTGLYPH") && g_texGeomVerts.load() >= 3) LoadFontAtlasOnce();   // cont.140: keep calling past the first upload so it can RE-upload as the atlas fills (flaky-legibility fix)
+        if (g_recon) LoadReconMenuOnce();   // cont.141: (re-)upload the composited recon menu frame on growth — BEFORE the pass (UploadTexture blocks)
         // Task #8: upload the submitted TEXTURED geometry (backdrop quadrants, pos.xy+uv.xy) BEFORE the
         // render pass — EnsureTexGeoVB may recreate the buffer (vkDeviceWaitIdle), unsafe inside a pass.
         int texVerts = g_menutex ? g_texGeomVerts.load() : 0;
@@ -997,12 +1017,13 @@ bool PresentOnce() {
             if (g_texGeoVBMap) memcpy(g_texGeoVBMap, g_texGeom.data(), g_texGeom.size()*sizeof(float)); }
         // disk-resource path (REX_TEXTEST): one-time texture upload + textured-quad VB, BEFORE the render pass
         // (the upload uses its own command buffer + a blocking wait, which must not be nested in g_cmd's pass).
-        if ((g_textest || g_hudsheet || g_menulive) && g_texPipe && !g_texVB) {
+        if ((g_textest || g_hudsheet || g_menulive || g_recon) && g_texPipe && !g_texVB) {
             const char* texfile = getenv("REX_TEXFILE");   // a real .png to load; else the procedural checker
             // cont.37: REX_HUDSHEET decodes the title's real HUD DDS container into a contact sheet; cont.60:
             // REX_MENULIVE composites the live-decoded menu textures (working buffers); else REX_TEXFILE/checker.
-            if (g_menulive ? LoadMenuSheetLive() : g_hudsheet ? LoadHudSheetOnce() : (texfile ? LoadPNGToTexture(texfile) : CreateTestTexture())) {
-                const float fs = (g_hudsheet || g_menulive) ? 0.98f : 0.9f, lo = (g_hudsheet || g_menulive) ? -0.98f : 0.1f;
+            // cont.141: REX_MENURECON — g_tex was just uploaded above by LoadReconMenuOnce; create the full-screen quad.
+            if (g_recon ? g_bgLoaded : (g_menulive ? LoadMenuSheetLive() : g_hudsheet ? LoadHudSheetOnce() : (texfile ? LoadPNGToTexture(texfile) : CreateTestTexture()))) {
+                const float fs = g_recon ? 1.0f : (g_hudsheet || g_menulive) ? 0.98f : 0.9f, lo = g_recon ? -1.0f : (g_hudsheet || g_menulive) ? -0.98f : 0.1f;
                 const float tq[] = {                                 // pos.xy + uv.xy, 2 tris, clip-space quad
                     lo,lo, 0.0f,0.0f,  fs,lo, 1.0f,0.0f,  fs,fs, 1.0f,1.0f,
                     lo,lo, 0.0f,0.0f,  fs,fs, 1.0f,1.0f,  lo,fs, 0.0f,1.0f };
@@ -1052,7 +1073,7 @@ bool PresentOnce() {
                 vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
                 vkCmdDraw(g_cmd, 6, 1, q * 6, 0);
             }
-        } else if (!g_hudsheet && !getenv("REX_TEXTGLYPH")) {    // REX_MENUTEST: hardcoded validation rects (cont.130: skip in REX_TEXTGLYPH — they alpha-blend OVER the menu text and obscure it)
+        } else if (!g_hudsheet && !g_recon && !getenv("REX_TEXTGLYPH")) {    // REX_MENUTEST: hardcoded validation rects (cont.130/141: skip in REX_TEXTGLYPH/REX_MENURECON — they alpha-blend OVER the menu text and obscure it)
             const float cols[3][4] = {{1.0f,0.2f,0.2f,0.6f},{0.2f,1.0f,0.2f,0.6f},{0.3f,0.4f,1.0f,0.8f}};
             for (int q = 0; q < 3; q++) { memcpy(pc.color, cols[q], 16);
                 vkCmdPushConstants(g_cmd, g_menuLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
@@ -1060,7 +1081,7 @@ bool PresentOnce() {
         }
         // disk-resource path (REX_TEXTEST / cont.37 REX_HUDSHEET): draw the textured quad — validates the
         // textured pipeline end to end (pos+uv input + sampler2D descriptor + SPTextured FS = tex(diffuse,uv)*color).
-        if ((g_textest || g_hudsheet || g_menulive) && g_texPipe && g_texSet && g_texVB) {
+        if ((g_textest || g_hudsheet || g_menulive || g_recon) && g_texPipe && g_texSet && g_texVB) {
             vkCmdBindPipeline(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_texPipe);
             VkDeviceSize to = 0; vkCmdBindVertexBuffers(g_cmd, 0, 1, &g_texVB, &to);
             vkCmdBindDescriptorSets(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_texLayout, 0, 1, &g_texSet, 0, nullptr);
@@ -1077,7 +1098,7 @@ bool PresentOnce() {
         // a frame as "richer" once the atlas is uploaded, so the default capture shows the rendered text.
         bool atlasReady = !getenv("REX_TEXTGLYPH") || g_bgLoaded;
         bool richer = atlasReady && (subVerts + texVerts) > s_maxCap;   // incl. Task #8 textured backdrop verts
-        bool cap = (g_shotTarget && g_frame == g_shotTarget) || richer;
+        bool cap = (g_shotTarget && g_frame == g_shotTarget) || richer || (g_recon && g_reconGrew.exchange(false));   // cont.141: re-capture after each recon (re-)upload → the saved frame shows the fullest menu
         if (richer) s_maxCap = subVerts + texVerts;
         if (cap) { EnsureCaptureBuffer();
             if (g_capBuf) {
@@ -1320,6 +1341,13 @@ void BlitMenuCell(const uint8_t* rgba, int w, int h, uint32_t base) {
         uint8_t* dp = &g_menuSheet[((size_t)(cy + yy) * MS_W + (cx + xx)) * 4];
         dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = 255;
     }
+}
+
+void SetReconMenuFrame(const uint8_t* rgba, int w, int h) {     // cont.141: kernel publishes the growing composited recon frame
+    if (!g_recon || !rgba || w <= 0 || h <= 0) return;
+    std::lock_guard<std::mutex> lk(g_reconMtx);
+    g_reconFrame.assign(rgba, rgba + (size_t)w * h * 4);
+    g_reconW = w; g_reconH = h; g_reconSeq.fetch_add(1);
 }
 
 } // namespace rex_render
