@@ -5650,3 +5650,18 @@ Sent the decoded atlas to the user (it shows the menu's real text + confirms the
 **Default boot UNREGRESSED:** the change is inside the REX_MENURECON/REX_TEXTRENDER path. Verified — `REX_RENDER=1` default boot (no flags) ran 372908 lines clean to timeout, 0 crash markers (exit 137).
 
 **⭐NEXT (cont.143)** — the recon is "good enough" as the visible demo; the REAL remaining milestone is **GAME-ACCURATE placement = the A↔B wall** (recover the title's real per-frame menu-draw transforms — reg 0x4000 set at the guest DrawPrimitive, cont.54/85/118 — a self-contained variant-A measurement, NO prod oracle). Or accept the demo and pivot to the wall directly. Tools: kernel.cpp recon ~2907, cont.85 reg-0x4000 ~3672, cont.73 xform ~2907, `varianta/tools/real_menu_clean_c142.png`.
+
+================================================================================
+## cont.143 (2026-06-08, /loop "go job next", autonomous, NOT pushed) — A↔B wall (placement angle): the menu transform is genuinely absent from variant A's GPU state
+
+**🟡🧱 cont.143** — the user chose "go at the wall" (game-accurate placement). Bounded, variant-A-only measurement (no prod oracle). **Finding: the real menu labels' transform is GENUINELY ABSENT from variant A's executed GPU state — game-accurate placement is NOT a free read; it requires variant A to EXECUTE the title's real per-frame menu draws** (whose SET_CONSTANT reg-0x4000 would produce the transform). Default boot UNREGRESSED.
+
+**HYPOTHESIS tested:** cont.118 found reg-0x4000 is a *global* UI transform (identical for every text draw); cont.133 found the text local coords are screen-space in the 1280×720 ortho. So perhaps each menu label's screen position = (live global reg-0x4000) × (its local verts), recoverable WITHOUT the per-draw A↔B transform. Added a `REX_XFORM` diag: at each REX_TEXTRENDER menu-label fill, read the live reg-0x4000 (`GLD32(0x7FC80000 + (0x4000+c*4+cc)*4)`, the cont.73/85/118 read) and apply it to the label's local bbox → screen bbox + on-screen test.
+
+**RESULT:** the transform reads **all zeros** throughout (T=(0,0), P=(0,0)) → all 15 menu labels degenerate to screen-center (640,360). **Not a headless confound** — the CP ran (22 ring `[kick]`s, ~36k fence ops, VdSwap ×6, the title submits ring commands), yet `0x7FC80000` is never non-zero anywhere in the run.
+
+**⇒** The reg-0x4000 constant file (`0x7FC80000`) holds only what variant A's CP has EXECUTED via ExecutePM4 — the device+13568 directory (the caption) under EXECSEGS, or ZERO with no EXECSEGS (this run). The real menu draws' SET_CONSTANT reg-0x4000 lives in the title's real per-frame stream that variant A does NOT execute (the A↔B wall). cont.118's "global transform" was the DIRECTORY CAPTION's (read during EXECSEGS), never the menu's. So placement cannot be read out of existing state — it must be PRODUCED by executing the real menu draws. **The wall for placement is now precisely localized.**
+
+**Default boot UNREGRESSED:** the `REX_XFORM` diag is gated (getenv) and inside the REX_TEXTRENDER/REX_DRAWCAP path. Verified — default boot ran 272251 lines clean, 0 crash markers, the diag never fired (exit 137).
+
+**⭐NEXT (cont.144)** — FIND the real menu draws in the title's stream (A2B §3.1): census the title's ring `[kick]`s (22 seen in the SKIPINTRO menu config) for the real menu prim-13 draws + their SET_CONSTANT reg-0x4000 — are the menu draws in the ring (executable) or only in the deferred device+13568 directory (cont.140 Run C: directory = caption only)? If found in an executable stream → execute them → reg-0x4000 populates → game-accurate menu. Tools: kernel.cpp `[kick]` handler, REX_CHUNKDUMP/SCENE/EXECSEGS CP census, the cont.140 directory finding, REX_XFORM diag ~2907.

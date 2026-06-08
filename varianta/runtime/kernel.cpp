@@ -2904,6 +2904,23 @@ PPC_FUNC(sub_8242BF10)
                                 rex_tex::WriteRGBAasPPM(fp, fb.data(), LW, LH);
                                 fprintf(stderr,"[textrender] label %d: %u glyphs atlas=0x%08X %dx%d local[%.0f..%.0f,%.0f..%.0f] uv[%.2f..%.2f] -> %s\n",
                                         ti, vc/4, g_lastTexBase, atlas->w, atlas->h, lmnx,lmxx,lmny,lmxy, minu, maxu, fp); }
+                            // cont.143 (A↔B wall, game-accurate placement test): read the LIVE global reg-0x4000 transform
+                            // (cont.118: identical for every text draw = the UI World+Proj xform) and apply it to THIS
+                            // label's LOCAL verts → its screen bbox. cont.133 found the text local coords ARE screen-space
+                            // in the 1280×720 ortho; if the menu labels compute to ON-SCREEN, coherent positions, then
+                            // game-accurate placement is achievable from the guest local verts + the live global xform —
+                            // no per-draw A↔B transform needed (cont.73 paired by glyph-count with the directory caption's
+                            // xform and got off-screen; this reads the LIVE menu UI xform instead). Measurement-only.
+                            if (getenv("REX_XFORM")) {
+                                auto rg=[&](uint32_t c,int cc){ float f; uint32_t w=GLD32(0x7FC80000u+(0x4000u+c*4+cc)*4u); memcpy(&f,&w,4); return f; };
+                                float Tx=rg(0,3),Ty=rg(1,3),Px=rg(4,0),Pxw=rg(4,3),Py=rg(5,1),Pyw=rg(5,3);
+                                auto sx=[&](float lx){ return ((lx+Tx)*Px+Pxw + 1.f)*0.5f*1280.f; };
+                                auto sy=[&](float ly){ return ((ly+Ty)*Py+Pyw + 1.f)*0.5f*720.f; };
+                                float X0=sx(lmnx),X1=sx(lmxx),Y0=sy(lmny),Y1=sy(lmxy);
+                                bool on = (X1>0.f && X0<1280.f && Y1>0.f && Y0<720.f);
+                                fprintf(stderr,"[xform] %u glyphs local(%.0f,%.0f)-(%.0f,%.0f) T=(%.1f,%.1f) P=(%.5f,%.5f) Pw=(%.3f,%.3f) -> screen(%.0f,%.0f)-(%.0f,%.0f) %s\n",
+                                        vc/4, lmnx,lmny,lmxx,lmxy, Tx,Ty, Px,Py, Pxw,Pyw, X0,Y0,X1,Y1, on?"ONSCREEN":"offscreen");
+                            }
                             // cont.141: composite this NEW label's raster (fb, LW x LH) onto a reconstructed 1280x720
                             // menu frame (stacked, 2 columns) + publish it; the render thread draws it full-screen so
                             // variant A's OWN Vulkan pipeline renders the real decoded menu text. Layout is RECONSTRUCTED
