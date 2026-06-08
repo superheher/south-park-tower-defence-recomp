@@ -113,6 +113,7 @@ void*                 g_texVBMap     = nullptr;
 const bool g_menutex = (getenv("REX_MENUTEX") != nullptr);
 const bool g_menulive = (getenv("REX_MENULIVE") != nullptr);  // cont.60: live menu-texture contact sheet
 bool                  g_bgLoaded     = false;            // background texture uploaded into g_tex* (once)
+std::atomic<bool>     g_atlasGrew{false};                // cont.140: pulses true after a font-atlas RE-upload, so the capture path re-snaps the now-fuller (more legible) text
 std::mutex            g_texGeomMtx;
 std::vector<float>    g_texGeom;                          // interleaved pos.xy+uv.xy, guarded by g_texGeomMtx
 std::atomic<int>      g_texGeomVerts{0};                  // submitted textured-geometry vertex count
@@ -783,7 +784,7 @@ bool LoadBackgroundOnce() {
 std::atomic<uint32_t> g_fontAtlasPhys{0x337D000u};   // cont.123: live atlas phys offset published by the kernel carve (default = the cont.115 hardcode). SetFontAtlasAddr (the external API) is defined below, OUTSIDE this anonymous namespace.
 
 bool LoadFontAtlasOnce() {
-    if (g_bgLoaded || !g_base) return g_bgLoaded;
+    if (!g_base) return g_bgLoaded;
     // cont.122 FIX: the atlas is a DYNAMIC glyph cache (cont.116) the title populates over time; cont.121 proved
     // uploading at the first text submit captures an EMPTY atlas => invisible text. Defer the (single) upload
     // until the cache has populated (nz>0 AND stable, with a frame-count fallback). UploadTexture is NOT
@@ -802,11 +803,23 @@ bool LoadFontAtlasOnce() {
         if (cn > nz) { nz = cn; bestOff = cands[c]; } }
     const uint8_t* atlas = g_base + bestOff;
     { static int s_dbg = 0; if ((s_dbg++ % 120) == 0) fprintf(stderr, "[fontwait] check #%d: best atlas nz=%u/65536 @ g_base+0x%X (cands 0x%X / 0x337D000)\n", s_dbg, nz, bestOff, cands[0]); }
-    static uint32_t s_lastNz = 0; static int s_stable = 0, s_waited = 0;
+    // cont.140 FIX (FLAKY legibility): the atlas is a glyph cache the title fills in BURSTS. The cont.122 "stable
+    // for 3 frames" gate + one-shot g_bgLoaded latch uploaded the FIRST momentary plateau — this run that was
+    // nz=2605/65536 → fragmented, illegible text; cont.139's "fully legible" (nz=10797) was just luckier capture
+    // timing, NOT a reproducible result. FIX: keep the cont.122 gate for the FIRST upload, then track the running
+    // max and RE-UPLOAD whenever the atlas has GROWN materially and re-settled, so the rendered text deterministically
+    // reflects the FULLEST atlas the title produces. UploadTexture leaks its old image/descriptor, so each re-upload
+    // requires a fresh 3-frame plateau (self-throttling) and the total is hard-capped — a handful of 256KB textures.
+    static uint32_t s_lastNz = 0, s_uploadedNz = 0; static int s_stable = 0, s_waited = 0, s_uploads = 0;
     s_waited++;
     if (nz == s_lastNz) s_stable++; else { s_stable = 0; s_lastNz = nz; }
-    if (nz == 0) return false;                            // both candidates still empty — retry next frame
-    if (s_stable < 3 && s_waited < 240) return false;     // still populating (nz changing) — retry, unless we've waited ~240 frames
+    if (nz == 0) return g_bgLoaded;                       // both candidates still empty — retry next frame
+    if (!g_bgLoaded) {                                    // FIRST upload: cont.122 momentary-plateau gate
+        if (s_stable < 3 && s_waited < 240) return false; // still populating (nz changing) — retry, unless ~240 frames
+    } else {                                              // SUBSEQUENT: re-upload only on settled, material growth
+        bool grew = nz > s_uploadedNz + s_uploadedNz / 8 + 256;   // >~12% (+ floor) past the last uploaded count
+        if (!grew || s_stable < 3 || s_uploads >= 8) return g_bgLoaded;   // not grown / still moving / capped
+    }
     std::vector<uint8_t> rgba((size_t)256 * 256 * 4);
     for (uint32_t i = 0; i < 256u * 256u; i++) {
         uint8_t v = atlas[i];
@@ -830,9 +843,10 @@ bool LoadFontAtlasOnce() {
         for (uint32_t i=0;i<bw*bh;i++) fwrite(bg+i*4, 1, 3, bf);   // RGB (drop A)
         fclose(bf); fprintf(stderr, "[render] dumped panel tex 0xA2D98000 %ux%u -> /tmp/varianta_panel_tex.ppm (probe nz=%u)\n", bw, bh, bnz); }
     }
-    g_bgLoaded = UploadTexture(rgba.data(), 256, 256);
-    fprintf(stderr, "[render] font atlas %s (256x256 FMT_8 @ guest 0x%X) — %u/%u non-zero bytes (stable=%d, waited=%d frames)\n",
-            g_bgLoaded ? "uploaded" : "FAILED", bestOff, nz, 256u*256u, s_stable, s_waited);
+    bool ok = UploadTexture(rgba.data(), 256, 256);
+    if (ok) { g_bgLoaded = true; s_uploadedNz = nz; s_uploads++; s_stable = 0; g_atlasGrew.store(true); }   // cont.140: re-snap the capture
+    fprintf(stderr, "[render] font atlas %s (256x256 FMT_8 @ guest 0x%X) — %u/%u non-zero bytes (upload#%d, waited=%d frames)\n",
+            ok ? "uploaded" : "FAILED", bestOff, nz, 256u*256u, s_uploads, s_waited);
     return g_bgLoaded;
 }
 
@@ -974,7 +988,7 @@ bool PresentOnce() {
         } else { EnsureMenuVB(sizeof(quads)); if (g_menuVBMap) memcpy(g_menuVBMap, quads, sizeof(quads)); }
         // cont.117: once the menu has submitted text glyphs (g_texGeom populated), the font atlas @0xA337D000 is
         // loaded in guest memory — upload it into g_tex now (deferred; it's empty at init). Then the textured draw fires.
-        if (getenv("REX_TEXTGLYPH") && !g_bgLoaded && g_texGeomVerts.load() >= 3) LoadFontAtlasOnce();
+        if (getenv("REX_TEXTGLYPH") && g_texGeomVerts.load() >= 3) LoadFontAtlasOnce();   // cont.140: keep calling past the first upload so it can RE-upload as the atlas fills (flaky-legibility fix)
         // Task #8: upload the submitted TEXTURED geometry (backdrop quadrants, pos.xy+uv.xy) BEFORE the
         // render pass — EnsureTexGeoVB may recreate the buffer (vkDeviceWaitIdle), unsafe inside a pass.
         int texVerts = g_menutex ? g_texGeomVerts.load() : 0;
@@ -1057,6 +1071,7 @@ bool PresentOnce() {
         }
         vkCmdEndRenderPass(g_cmd);
         static int s_maxCap = 0;   // capture the RICHEST frame seen (most submitted verts) — steady-state menu
+        if (g_atlasGrew.exchange(false)) s_maxCap = 0;   // cont.140: the atlas just RE-uploaded fuller → force a re-capture so the saved frame shows the more-legible text
         // cont.130: in REX_TEXTGLYPH mode the font-atlas upload is DEFERRED (cont.122/129), so the richest frame
         // (texVerts first maxing at the carve-once latch) would be captured BEFORE g_bgLoaded → no text. Only count
         // a frame as "richer" once the atlas is uploaded, so the default capture shows the rendered text.
