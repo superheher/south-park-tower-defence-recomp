@@ -3918,6 +3918,47 @@ PPC_FUNC(sub_821C6E58)
             }
             if (g_ktrace) fprintf(stderr, "[direxec] #%d executed %d dir segments (n=%d cmd-addrs in dir)\n", (int)dxn.load(), exn, n);
         }}
+        // cont.146: READ-ONLY parse of the build-cursor directory's command segments (the cont.108-109 segments that
+        // hold the real per-frame menu draws, cont.145) — shadow reg-0x4000 (the SET_CONSTANT World+Proj transform)
+        // and, at each prim-13/5 DRAW_INDX, dump its transform + origin→clip (cont.85 layout). NO execution / side
+        // effects. Goal: are the REAL menu draws' transforms ON-screen (→ game-accurate placement by reading)?
+        static const bool s_menuxform = getenv("REX_MENUXFORM") != nullptr;
+        if (s_menuxform) { static std::atomic<int> mxn{0}; if (mxn.fetch_add(1) < 20) { GpuLock _glmx;
+            uint32_t addrs[96]; int n = 0;
+            for (uint32_t off = 13400; off <= 13700 && n < 96; off += 4) { uint32_t v = GLD32(device + off);
+                if (v >= 0xA0090000u && v <= 0xA0220000u) addrs[n++] = v; }   // cont.146: widened (drawscan range reached 0xA01ABACC)
+            for (int i = 1; i < n; i++) { uint32_t k = addrs[i]; int j = i-1; while (j >= 0 && addrs[j] > k) { addrs[j+1]=addrs[j]; j--; } addrs[j+1]=k; }
+            uint32_t alu[128] = {0}; auto fa = [&](int idx){ float f; memcpy(&f, &alu[idx], 4); return f; };
+            int ndraw = 0;
+            for (int i = 0; i + 1 < n && ndraw < 24; i++) {
+                uint32_t seg = addrs[i], segEnd = addrs[i+1];
+                if (segEnd <= seg || (segEnd - seg) > 0x20000u) continue;
+                uint32_t a2 = seg;
+                while (a2 + 4 <= segEnd && ndraw < 24) {
+                    uint32_t pkt = GLD32(a2); a2 += 4; if (pkt == 0) continue;
+                    uint32_t t = pkt >> 30;
+                    if (t == 2) continue;
+                    if (t == 0) { uint32_t cnt=((pkt>>16)&0x3FFF)+1, bi=pkt&0x7FFF; bool one=(pkt>>15)&1;
+                        for (uint32_t m=0;m<cnt && a2+4<=segEnd;m++,a2+=4){ uint32_t ri=one?bi:bi+m; if(ri>=0x4000u&&ri<0x4080u) alu[ri-0x4000u]=GLD32(a2); }
+                        continue; }
+                    if (t == 1) { a2 += 8; continue; }
+                    uint32_t op=(pkt>>8)&0x7Fu, cnt=((pkt>>16)&0x3FFF)+1;
+                    if (op == 0x2Du) { uint32_t ot=GLD32(a2), index=ot&0x7FFu, type=(ot>>16)&0xFFu;
+                        if (type==0u) for (uint32_t k=1;k<cnt;k++){ uint32_t ri=index+(k-1); if(ri<128u) alu[ri]=GLD32(a2+k*4); } }
+                    else if (op==0x22u || op==0x36u) {
+                        uint32_t init=(op==0x22u)?GLD32(a2+4):GLD32(a2); uint32_t numI=init>>16, prim=init&0x3Fu;
+                        if (prim==13u || prim==5u) {
+                            float Tx=fa(3),Ty=fa(7),Px=fa(16),Pxw=fa(19),Py=fa(21),Pyw=fa(23);
+                            float ox=(0.f+Tx)*Px+Pxw, oy=(0.f+Ty)*Py+Pyw;
+                            bool on = ox>-1.2f&&ox<1.2f&&oy>-1.2f&&oy<1.2f;
+                            fprintf(stderr, "[menuxform] seg#%d@0x%X prim=%u numI=%u World=(%.0f,%.0f) origin->clip=(%.2f,%.2f) %s P=(%.5f,%.5f)\n",
+                                    i, seg, prim, numI, Tx, Ty, ox, oy, on?"ON":"off", Px, Py); ndraw++;
+                        }
+                    }
+                    a2 += cnt * 4u;
+                }
+            }
+        }}
         // cont.116: dump the menu font atlas (cont.115: 256x256 FMT_8 8bpp @ GPU 0xA337D000, untiled) -> grayscale PPM,
         // to verify the FMT_8 decode + SEE the glyphs before wiring the textured-text draw. GLD32 is BE-swapped, so
         // raw byte at linear offset i = (GLD32(base+(i&~3)) >> (8*(3-(i&3)))) & 0xFF. Fires once, when the atlas has data.
