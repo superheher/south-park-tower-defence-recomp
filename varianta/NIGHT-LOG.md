@@ -5808,3 +5808,14 @@ Sent the decoded atlas to the user (it shows the menu's real text + confirms the
 **Default boot UNREGRESSED:** the filter is inside the REX_MENURECON recon block; default boot (no flags, headless) = 499291 lines clean, 0 real crash markers, exit 137.
 
 **⭐NEXT (cont.154)** — the read-only wall is closed; the deep build is a deliberate multi-day user commitment (NOT something to auto-pilot overnight without verification). The loop stays on tractable work: (a) more deliverable cleanup (the residual white garble — a glyph-regularity / stable-across-frames filter); (b) extend the splash deliverable; (c) await the user's fork decision (morning report). Tools: kernel.cpp recon ~2966, tools/real_menu_clean_c153.png.
+
+================================================================================
+## cont.154 (2026-06-09, /loop "go next job", autonomous, NOT pushed) — stable-across-frames filter FAILED (architectural conflict) → reverted; tractable cleanup is exhausted
+
+**🟡↩️ cont.154** — tried cont.153-NEXT (a) to drop the residual white garble via a recurrence filter: real menu items re-render every frame (dynamic atlas, cont.74) → high hit-count; transient mis-decoded strings → low. Added a `hits` counter + `STAB=3` to the recon `RLabel` and composited only `hits>=STAB`.
+
+**FAILED (recon uploads=0, empty frame):** the recon block is INSIDE the `seenLbl` dedup gate (`if(isnew)`, kernel.cpp ~2918), so each label is processed exactly ONCE (hits=1, never reaches STAB) → the filter dropped everything. Counting hits would need the raster+composite moved OUT of the isnew gate (a restructure + per-frame cost) — not worth it for marginal garble. REVERTED (`git checkout runtime/kernel.cpp`); cont.153 stands; binary rebuilt. ⇒ cont.153 (white-ish filter, green noise gone) is the FINAL achievable deliverable; the residual white garble is the cont.142 limit (needs OCR or a stable per-label key — both unavailable here).
+
+**Default boot UNREGRESSED** (reverted to cont.153).
+
+**⭐NEXT — TRACTABLE WORK IS EXHAUSTED:** the menu wall is closed (cont.137-152, 3 gated axes), the deliverable is cleaned (cont.153), stable-frames failed (cont.154). What remains is only (a) the deep GPU build (multi-day, a user decision, NOT to auto-pilot unverified), (b) the VC-1 decoder (a stub for a complex system codec = deep), or (c) fixing the prod-oracle (off-limits here). The loop paces down to a long (1h) cadence to await the user's fork decision (MORNING-REPORT-2026-06-08.md); each wake = a brief reassessment, act only on genuine new value or user input.
