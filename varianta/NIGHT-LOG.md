@@ -5721,3 +5721,17 @@ Sent the decoded atlas to the user (it shows the menu's real text + confirms the
 **Default boot UNREGRESSED:** bigbuf is inside the gated REX_MENUXFORM diag. Verified — default boot 274295 lines clean, diag 0 fires, 0 crashes (exit 137).
 
 **⭐NEXT (cont.148)** — the deferred-state FLUSH gate: RE sub_821CAA18 / sub_821C6D58 (the cont.54 flush) + the WAIT_REG_MEM handshake — what gates the title from flushing its deferred menu draws, and can variant A satisfy it (model the GPU↔CPU WAIT_REG_MEM so the title emits the menu draws as PM4 → execute them → real completion → drain the cont.21 cycle). Tools: sub_821BEC00 hook ~2518, sub_821C6E58 ~3793, REX_FRAMEEXEC ~3806, the WAIT_REG_MEM note ~3954.
+
+================================================================================
+## cont.148 (2026-06-08, /loop "go job next", autonomous; cont.21 cycle-break) — MEASURED the exact WAIT_REG_MEM result-gates the title polls
+
+**🟢🔑 cont.148** (measurement-only, REX_RESULTSCAN + REX_CHUNKDUMP) — the title's deferred-flush gate is a guest-side `WAIT_REG_MEM` spin on these specific mailboxes, which look **unmodeled** (REX_CPCOMPLETE handles a different counter, device+0x2b04):
+- **reg:0xA31 ref=0x0 mask=0x80000000** — dominant (48→67/frame); wait for GPU reg 0xA31 bit-31 (busy) to clear (GPU-idle).
+- **mem:0x2011016 ref=0xC0090180** — wait for a mailbox to == ≈the build-cursor base (0xA0090180) = "CP consumed the frame".
+- **mem:0x2011012 ref=0x821CC7A0** — wait for the producer callback (= cont.107's 0x821CC7A0).
+- **mem:0x2011002 ref=0x4 / 0x0** — CP ring/submission state.
+- `[chunkdump] RESULT-GATES: waitRegMem=48-67 vizQuery=32-48 resolve(RB_COPY)=264-396` (occlusion query + EDRAM resolve present).
+
+**⇒** variant A's CP SKIPS WAIT_REG_MEM (kernel.cpp ~2086), so the CP doesn't block — but the GUEST flush spin (sub_821C6D58) on these mailboxes does. The title builds the menu (VBs filled) but its FLUSH blocks on these polls; REX_CPCOMPLETE (device+0x2b04) lets it KICK setup but doesn't satisfy reg:0xA31 / mem:0x2011xxx → the deferred menu frame never flushes. **Concrete, likely-unexplored cycle-break lever.** Measurement-only → default boot trivially UNREGRESSED.
+
+**⭐NEXT (cont.149)** — ATTEMPT to satisfy the gates: model reg 0xA31 bit-31 cleared (GPU-idle) + mem:0x2011016=0xC0090180 + mem:0x2011012=0x821CC7A0 + mem:0x2011002=0x4→0x0, gated behind a new flag, and measure whether the title's flush fires (menu DRAW_INDX appear in the build-cursor via REX_MENUXFORM/bigbuf) and progresses. Tools: WAIT_REG_MEM handler ~1557, GpuReg/GpuRegAddr, REX_CPCOMPLETE ~2303, REX_MENUXFORM/bigbuf ~3925.
