@@ -89,6 +89,10 @@ NOT required.
 
 ## Rules for working sessions
 
+- **Decision authority (maintainer, 2026-06-09):** success criteria are recorded
+  above; technical forks (which lever, revert-or-persist) are the agent's call —
+  decide by data, record here, keep going. Stop only on a verified result or a
+  hard external blocker. Do not wait on the maintainer overnight.
 - This file is the entry point; keep it ≤ ~120 lines; rewrite in place.
 - `docs/NEXT-SESSION-PROMPT.md` ≤ 3 KB, OVERWRITTEN each session — never
   append-grown.
