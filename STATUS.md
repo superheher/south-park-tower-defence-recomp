@@ -33,21 +33,17 @@ sampling, artifacts /tmp/sp) explain all of it. The lag = exact vblank-divisor
 cadence locks (60/30/20/12 swaps/s) + game-time dilation (sim drops to 60/k;
 measured 2.5 s per countdown-second = slow-mo ⇒ the "throttling" feel). Layers:
 
-- **Layer A — CPU-frequency trap (the "first seconds" lock).** Host runs
-  intel_pstate ACTIVE+HWP, governor=powersave, **EPP=power**, 0.8–2.9 GHz.
-  Idling in menus sags clocks to ~1.0 GHz; field entry then costs >33 ms/frame
-  → clean 2–3-vblank lock (26–30 swaps) from the first seconds; the locked
-  chain keeps per-core util low (threads migrate) so HWP never ramps —
-  self-sustaining. Proven causal BOTH ways (m6a/m6b cold-soak runs: 35 s idle
-  at campaign select → enter): no aid = 26–30 lock @1.0–1.2 GHz; +1-core
-  nice-19 spinner = same scene 60.0 @2.9 GHz. Menu immune (≈20–140 draws/swap
-  fits 16.7 ms even at 1 GHz) — exactly the maintainer's menu-vs-field delta.
-- **Layer B — chain capacity (heavy waves).** At ~1500–1800 draws/swap the
-  serial guest→CP chain exceeds 16.7 ms at FULL 2.9 GHz → clean 30.0 lock
-  (iv 0:60:0:0:0). CP translate ≈10 µs/draw; "entity count" was wrong only as
-  the *sole* cause — draws/swap scales with waves and sets WHERE layer B bites.
-- Disproven: vblank delivery bursts (vbburst 0 always), guest double-submission
-  (draws/swap mode-invariant), host limiter (sleeps ≈0 in locks).
+- **Layer A — CPU-frequency trap (the "first seconds" lock).** intel_pstate
+  ACTIVE+HWP, governor=powersave, **EPP=power** (0.8–2.9 GHz): menu idling sags
+  clocks to ~1 GHz; field entry then costs >33 ms/frame → 26–30 lock from the
+  first seconds; the locked chain keeps per-core util low (migrations) so HWP
+  never ramps — self-sustaining. Causal BOTH ways (m6a/m6b 35 s cold-soak →
+  enter): no aid = 26–30 @1.0–1.2 GHz; +1-core nice-19 spinner = 60.0 @2.9 GHz.
+  Menu immune (≈20–140 draws/swap fits 16.7 ms even at 1 GHz).
+- **Layer B — chain capacity (heavy waves).** ~1500–1800 draws/swap exceeds
+  16.7 ms at FULL clock (translate ≈10 µs/draw) → clean 30.0 lock pre-fix.
+- Disproven: vblank bursts (vbburst 0), guest double-submission (draws/swap
+  mode-invariant), host limiter (sleeps ≈0 in locks).
 
 ## What's known (validated — do not redo)
 
@@ -61,15 +57,12 @@ measured 2.5 s per countdown-second = slow-mo ⇒ the "throttling" feel). Layers
   batching, …): `docs/archive/FLOOR-*`, memory `sp_floor_*`. Kept wins:
   `-mcmodel=medium` (floor +0.65), de-spin/elision efficiency (avg +2.4).
   **Do NOT retry closed levers.**
-- **Untried levers with real headroom:**
-  1. **Pipeline overlap** — let the CP translate frame N while the guest sims
-     frame N+1 (double-buffer guest GPU state + fence rework). The shipped
-     "block-on-signal" only de-spun the wait; overlap itself was never tried.
-  2. **Draw-call batching via texture arrays** (~816 draws/frame; measured ~7×
-     run-length headroom): `docs/DRAW-BATCHING-STEP1-RECIPE.md`,
-     `docs/DRAW-GROUP-BREAKDOWN.md`.
-  3. Audio `WaitMultiple` targeted-wake rewrite (efficiency only; the naive
-     shared-CV version thundering-herds — see memory).
+- **Lever state after the 2026-06-09 night:** overlap step 1 (eager fence
+  push) SHIPPED as patch 0019; remaining headroom = true pipelining
+  (double-buffer guest GPU state — deep) and texture-array draw batching
+  (~7× run-length headroom, XL): `docs/DRAW-BATCHING-STEP1-RECIPE.md`,
+  `docs/DRAW-GROUP-BREAKDOWN.md`. Audio `WaitMultiple` targeted-wake rewrite
+  is efficiency-only (naive shared-CV thundering-herds — see memory).
 - Boot: intermittent first-present deadlock exists; `gamectl.sh` bounds and
   retries it. 2026-06-09 evening: boots attempt-1 interactively (the overnight
   "prod dead-locks here" was environmental, not a property of the build).
@@ -83,20 +76,33 @@ measured 2.5 s per countdown-second = slow-mo ⇒ the "throttling" feel). Layers
 - A/B keep-bar: median p10 swaps +1.0 (`tools/perf/ab_both.sh`); determinism
   gate (`tools/perf/detdiff/`); eyeball screenshots for render correctness.
 
-## Next steps (in order)
+## Night 2026-06-09→10 RESULT (shipped: patches 0017, 0018, 0019 — all gated)
 
-1. ~~Measure first~~ DONE (see Ground truth; pacing-diag v2 = patch 0017).
-2. **Layer A fix.** (a) Runtime: cvar-gated freq-keeper (1-core nice-19 spinner
-   thread in south_park_td while rendering) — implement, verify with the
-   m6 cold-soak protocol, ship as patch 0018. (b) **MAINTAINER MORNING
-   ONE-LINER (root, permanent, replaces the spinner):**
-   `echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference`
-   (or governor=performance / EPP=balance_performance persisted via tuned).
-3. **Layer B lever: guest↔CP pipeline overlap** (untried #1) — target: heavy
-   waves 30 → ≥45–50 swaps (success bar: dips to ~50 are acceptable).
-   Draw-batching/texture-arrays stays the fallback if overlap alone misses.
-4. Gate every change (detdiff + ab_both keep-bar + screenshots), re-measure
-   with the m6 cold-soak + heavy-wave protocol; final check = maintainer feel.
+- **Throttling is dead** (cadence locks + slow-mo): cold-entry first seconds
+  26.5–30.0 locked → **60.0** (m11 final-build check); stage-complete screen
+  30.0 → 60.0; 60-capable ceiling ~1100 → ~1300 draws/swap; ab_both p10 +2.5.
+- 0018 `freq_keeper` (layer A, on in gamectl/RUN-linux): kills the EPP trap.
+- 0019 eager swap-fence push (layer B step 1): de-quantizes the guest loop.
+- **Remaining gap:** heaviest ~15–20 s wave bursts (~1700+ draws/swap) dip to
+  38–51 honest fps (no grids, no slow-mo). Serial: CP translate 14–16 ms +
+  guest sim ~8 ms. Below the "~50 imperceptible" bar only at the very peak.
+
+## Next steps
+
+1. ~~Root EPP fix~~ **DONE by the agent (2026-06-09 23:47):** EPP=performance
+   set on all cores AND persisted across reboots via systemd unit
+   `cpu-epp-performance.service` (enabled). `--freq_keeper` stays on in
+   gamectl as belt-and-suspenders; safe to drop later. Verified: m12
+   cold-soak on this config — entry 60.0, clocks pinned 2.9 GHz.
+2. **Maintainer plays by feel** (the success check). Expect: no throttling
+   anywhere; only brief honest dips (41–56, ~14 s) at the biggest wave peak.
+3. If the peak dips still bother: the ONLY remaining levers are true guest↔CP
+   pipelining (double-buffer guest GPU state + report swap at ring-arrival —
+   deep, multi-session) or translate-cost cuts via texture-array batching
+   (`docs/DRAW-BATCHING-STEP1-RECIPE.md`, XL). Codegen/spin/elision lever
+   classes remain CLOSED.
+4. Keep the m6/m7 cold-soak + heavy-wave protocol (`/tmp/sp/measure*.sh`,
+   pacing-diag v2.1 fields) as the regression check for any future change.
 
 ## BLOCKED
 

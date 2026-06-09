@@ -1,33 +1,40 @@
-# Next session — SDK track: characterize, then kill the field lag
+# Next session — verify by feel, then (only if needed) the deep capacity lever
 
-Read `STATUS.md` (repo root) first — it is the single source of truth.
-Course: SDK track ACTIVE; `varianta/` FROZEN (do not touch).
+Read `STATUS.md` first — single source of truth. Night 2026-06-09→10 shipped
+patches 0017 (pacing-diag v2.1), 0018 (`freq_keeper`), 0019 (eager swap-fence
+push). The throttling (cadence locks + slow-motion) is dead in the measured
+protocol; heaviest ~15–20 s wave peaks still dip to 38–51 honest fps.
 
-## Task 1 — measure the real lag (no fixes yet)
+## First: maintainer plays by feel (the real success check)
 
-1. Boot via `/home/h/src/recomp/gamectl.sh play` (bounded, auto-retries).
-2. On a NATURAL level-1 start, from the moment control is given, capture
-   simultaneously:
-   - video: `ffmpeg -f x11grab` of the game window (`gamectl.sh wid`), 60–90 s;
-   - `[pacing-diag]`: `gamectl.sh bench 60` in parallel;
-   - one whole-process perf profile window during visible lag (`tools/perf/`).
-3. Characterize the lag: constant-low vs periodic stutter vs degrading; the
-   menu-vs-field delta; first seconds vs later waves. NOTE the maintainer's
-   ground truth (STATUS): deep lag starts in the FIRST seconds of field
-   control — if measurements disagree, trust the video + report the conflict.
-4. Overwrite STATUS.md "Next steps" with findings; keep artifacts in /tmp/sp.
+EPP=performance is already applied AND persisted (systemd unit
+`cpu-epp-performance.service`, enabled 2026-06-09 night). Expected feel:
+menus 60, field 60 from the first seconds (even after idling in menus), no
+slow-mo; only brief honest dips (~41–56 for ~14 s) at the biggest wave peak.
+`--freq_keeper=true` remains in gamectl as belt-and-suspenders.
 
-## Task 2 — one lever, chosen by Task-1 data
+## If the maintainer still feels lag
 
-- Serial latency dominant → spike the guest↔CP OVERLAP (STATUS, untried #1).
-- A single draw-group dominant → `docs/DRAW-BATCHING-STEP1-RECIPE.md`.
-- Gate every change: `tools/perf/detdiff` + `ab_both.sh` (keep-bar median p10
-  +1.0) + screenshots for render correctness.
+- Reproduce with the night protocol before touching anything:
+  `/tmp/sp/measure45.sh mX 0` (natural run) and `/tmp/sp/measure7.sh mX 0`
+  (cold-soak entry); read `[pacing-diag]` v2.1 fields
+  (`iv a:b:c:d:e | xlat | wrm | swp | draws | vb`). Grid-locks (iv pure 2/3
+  columns) = regression; mixed iv at high draws = the known capacity peak.
+- Capacity levers left (pick ONE, by data): true guest↔CP pipelining
+  (double-buffer guest GPU state; report swap at ring-arrival; deep,
+  multi-session) or texture-array draw batching
+  (`docs/DRAW-BATCHING-STEP1-RECIPE.md`, XL). Codegen/spin/elision classes
+  stay CLOSED (`docs/archive/FLOOR-*`).
 
-## Hard rules
+## Gates for ANY change
 
-- Levers in `docs/archive/FLOOR-*` are CLOSED — do not retry them.
-- Bound all GUI waits. If blocked on a user decision → STATUS.md `BLOCKED` +
-  stop cleanly. No Telegram. No busy-work while waiting.
-- Commit each logical step (author Claude Code). Overwrite THIS file at session
-  end with the next concrete task (keep it ≤ 3 KB).
+`tools/perf/ab_both.sh 40 3` (keep-bar median p10 +1.0) + render screenshots +
+the cold-soak protocol; detdiff only when the translation path changes.
+
+## Hygiene
+
+- `rm -f /dev/shm/xenia_memory_*` before runs (leak → SIGBUS).
+- Keep hands off the host during measurement runs (background CPU load warms
+  clocks and corrupts layer-A comparisons).
+- Commit per step (author "Claude Code"), patches via the worktree recipe in
+  `patches/README.md`; verify the series byte-identical before committing.
