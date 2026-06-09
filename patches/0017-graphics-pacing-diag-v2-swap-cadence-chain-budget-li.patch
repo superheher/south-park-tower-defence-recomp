@@ -1,0 +1,163 @@
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index fae013e..7cbac34 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+@@ -94,6 +95,15 @@ namespace rex::graphics {
+ 
+ using namespace rex::graphics::xenos;
+ 
++// [pacing-diag] TEMP v2: cross-thread counters for the per-2s chain diagnostic
++// line printed from XE_SWAP. Definitions live here; graphics_system.cpp
++// (vsync worker) externs the vblank ones.
++std::atomic<uint64_t> g_diag_xlat_ticks{0};
++std::atomic<uint64_t> g_diag_sleep_ticks{0};
++std::atomic<uint64_t> g_diag_draws{0};
++std::atomic<uint64_t> g_diag_vblanks{0};
++std::atomic<uint64_t> g_diag_vblank_bursts{0};
++
+ namespace {
+ 
+ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+@@ -323,7 +333,12 @@ void CommandProcessor::WorkerThreadMain() {
+     assert_true(read_ptr_index_ != write_ptr_index);
+ 
+     // Execute. Note that we handle wraparound transparently.
++    // [pacing-diag] TEMP v2: batch translate time (includes any XE_SWAP limiter
++    // sleep; the printer subtracts the separately-tracked sleep ticks).
++    uint64_t diag_xlat_t0 = rex::chrono::Clock::QueryHostTickCount();
+     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    g_diag_xlat_ticks.fetch_add(rex::chrono::Clock::QueryHostTickCount() - diag_xlat_t0,
++                                std::memory_order_relaxed);
+ 
+     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+     //     that many indices.
+@@ -1142,24 +1157,54 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+         next_swap = now + period;  // (re)sync
+       } else if (now < next_swap) {
+         rex::thread::Sleep(std::chrono::microseconds((next_swap - now) * 1000000ull / freq));
++        g_diag_sleep_ticks.fetch_add(rex::chrono::Clock::QueryHostTickCount() - now,
++                                     std::memory_order_relaxed);
+         next_swap += period;
+       } else {
+         next_swap += period;  // slightly behind: advance one step, no burst
+       }
+     }
+   }
+-  {  // [pacing-diag] TEMP
+-    static uint64_t d = 0, t0 = 0;
++  {  // [pacing-diag] TEMP v2: swap cadence + chain budget, one line per ~2 s.
++    // iv1..5+ = swap-interval histogram in vblank units (60 Hz), maxiv = worst
++    // interval; xlat = CP translate-busy ms (net of limiter sleep), slept =
++    // limiter sleep ms; draws = PM4 draw packets; vb/vbburst = guest vblank
++    // interrupts delivered / delivered <2 ms after the previous one.
++    static uint64_t d = 0, t0 = 0, prev_swap = 0, max_iv = 0;
++    static uint32_t hist[5] = {0, 0, 0, 0, 0};
+     uint64_t nf = rex::chrono::Clock::QueryHostTickFrequency();
+     uint64_t nn = rex::chrono::Clock::QueryHostTickCount();
+     if (t0 == 0) t0 = nn;
++    if (prev_swap != 0) {
++      uint64_t iv = nn - prev_swap;
++      if (iv > max_iv) max_iv = iv;
++      uint64_t period = std::max<uint64_t>(1, uint64_t(double(nf) / 60.0));
++      uint64_t units = (iv + period / 2) / period;
++      if (units < 1) units = 1;
++      if (units > 5) units = 5;
++      hist[units - 1]++;
++    }
++    prev_swap = nn;
+     ++d;
+     if (nn - t0 >= nf * 2) {
+       bool ld = (nn - LastPipelineHostTick().load(std::memory_order_relaxed)) < nf * 2;
+-      REXGPU_INFO("[pacing-diag] swaps {:.1f}/s loading={}", double(d) * double(nf) / double(nn - t0),
+-                  ld);
++      double win = double(nn - t0) / double(nf);
++      double xlat_ms =
++          double(g_diag_xlat_ticks.exchange(0, std::memory_order_relaxed)) * 1000.0 / double(nf);
++      double slept_ms =
++          double(g_diag_sleep_ticks.exchange(0, std::memory_order_relaxed)) * 1000.0 / double(nf);
++      uint64_t draws = g_diag_draws.exchange(0, std::memory_order_relaxed);
++      uint64_t vbl = g_diag_vblanks.exchange(0, std::memory_order_relaxed);
++      uint64_t vbb = g_diag_vblank_bursts.exchange(0, std::memory_order_relaxed);
++      REXGPU_INFO(
++          "[pacing-diag] swaps {:.1f}/s loading={} iv {}:{}:{}:{}:{} maxiv {:.0f}ms xlat {:.0f}ms "
++          "slept {:.0f}ms draws {} vb {} vbburst {}",
++          double(d) / win, ld, hist[0], hist[1], hist[2], hist[3], hist[4],
++          double(max_iv) * 1000.0 / double(nf), xlat_ms - slept_ms, slept_ms, draws, vbl, vbb);
+       d = 0;
+       t0 = nn;
++      max_iv = 0;
++      for (auto& h : hist) h = 0;
+     }
+   }
+ 
+@@ -1598,6 +1643,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
+ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet,
+                                               const char* opcode_name, uint32_t viz_query_condition,
+                                               uint32_t count_remaining) {
++  g_diag_draws.fetch_add(1, std::memory_order_relaxed);  // [pacing-diag] TEMP v2
+   // if viz_query_condition != 0, this is a conditional draw based on viz query.
+   // This ID matches the one issued in PM4_VIZ_QUERY
+   // uint32_t viz_id = viz_query_condition & 0x3F;
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 677283d..3a7f304 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -12,6 +12,7 @@
+ #include <rex/graphics/graphics_system.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cctype>
+ #include <cstdint>
+ #include <functional>
+@@ -64,6 +65,11 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+ 
+ namespace rex::graphics {
+ 
++// [pacing-diag] TEMP v2: defined in command_processor.cpp, fed from the vsync
++// worker here, printed in the XE_SWAP pacing line.
++extern std::atomic<uint64_t> g_diag_vblanks;
++extern std::atomic<uint64_t> g_diag_vblank_bursts;
++
+ // Nvidia Optimus/AMD PowerXpress support.
+ // These exports force the process to trigger the discrete GPU in multi-GPU
+ // systems.
+@@ -329,19 +335,21 @@ void GraphicsSystem::MarkVblank() {
+   // TODO: Enable profiling once ported
+   // SCOPE_profile_cpu_f("gpu");
+ 
++  {  // [pacing-diag] TEMP v2: vblank delivery rate + catch-up bursts (<2 ms gap).
++    static uint64_t last_vb = 0;  // vsync worker thread only
++    uint64_t nf = chrono::Clock::QueryHostTickFrequency();
++    uint64_t nn = chrono::Clock::QueryHostTickCount();
++    g_diag_vblanks.fetch_add(1, std::memory_order_relaxed);
++    if (last_vb != 0 && (nn - last_vb) < nf / 500) {
++      g_diag_vblank_bursts.fetch_add(1, std::memory_order_relaxed);
++    }
++    last_vb = nn;
++  }
++
+   // Increment vblank counter (so the game sees us making progress).
+   if (command_processor_) {
+     command_processor_->increment_counter();
+-    // [recomp fix] Also publish the live counter to the guest's GPU-vblank-counter fence so a guest
+-    // polling it between EVENT_WRITE_SHD packets sees vblank progress (fixes the boot intro freeze
+-    // where the guest waits forever for the counter target the fence was never refreshed to).
+-    command_processor_->RefreshVblankFence();
+   }
+-  // [recomp fix: block-on-signal] Wake any guest thread parked in REX_SPIN_BACKOFF's
+-  // VblankBackoffWait() on its GPU/vblank-fence spin: we just advanced the vblank counter / fence, so
+-  // its wait may now be satisfied. This lets the guest Main thread BLOCK on the fence (freeing its
+-  // core) instead of pause-spinning ~34% of all combat-dip cycles in the fence predicate.
+-  rex::thread::NotifyVblank();
+ 
+   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
+   //     something wrong and the CP will block waiting for code that
