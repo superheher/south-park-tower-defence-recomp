@@ -1,5 +1,14 @@
 # Variant A — XenonRecomp full-stack recomp (bootstrap)
 
+> **FROZEN (2026-06-09, maintainer decision — course reset).** The SDK track is
+> active again; variant A is kept as a research asset only — do **not** iterate
+> here. Journals/plans moved to `archive/` (NIGHT-LOG, NEXT-SESSION-PROMPT,
+> morning reports, GPU/renderer plans). Verdict at freeze: deterministic boot;
+> renders real boot splashes + reconstructed menu text via its own Vulkan
+> engine; blocked on the A↔B wall (the title gates on REAL GPU results, which
+> needs the full GPU pipeline built); estimated 4–6 weeks to playable.
+> Live project state: `../STATUS.md`.
+
 Chosen 2026-05-31 after the variant-B native-render NO-GO (`docs/HLE-PHASE1-FINDINGS.md`): this
 title's XDK Direct3D is inlined with no hookable API, so HLE-in-place is blocked. Variant A re-recomps
 from the clean XEX2 with the Unleashed-style stack (XenonRecomp CPU + XenosRecomp shaders + a native
