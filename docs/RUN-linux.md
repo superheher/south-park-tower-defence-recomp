@@ -76,12 +76,17 @@ SDL_VIDEODRIVER=x11 LD_LIBRARY_PATH=. REX_INPUT_FILE=$PWD/live_input.txt \
   ./south_park_td \
     --game_data_root="$ROOT/private/extracted" \
     --user_data_root="$ROOT/private/userdata" \
-    --license_mask=1 --mnk_mode=true \
+    --license_mask=1 --mnk_mode=true --freq_keeper=true \
     --window_width=960 --window_height=540 \
     --log_file=run.log --log_level=info
 ```
 
 - `--license_mask=1` runs the full (non-trial) version.
+- `--freq_keeper=true` holds the CPU package frequency up (1 low-priority
+  spinner core). Needed on powersave/EPP=power hosts or gameplay enters
+  2-3-vblank cadence locks from a cold (idle-menu) entry — see STATUS.md
+  "Layer A". Root alternative (better, makes the flag unnecessary):
+  `echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference`.
 - `--always_win=true` makes the base invincible (handy for automated runs).
 - `SDL_VIDEODRIVER=x11` makes the window an XWayland window so the harness can screenshot it.
 - First boot is slow (~1-3 min) translating shaders; subsequent boots ~45 s.

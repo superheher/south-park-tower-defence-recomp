@@ -48,6 +48,7 @@ launch_detached() {     # one fresh instance, fully detached so it survives this
       ./south_park_td \
         --game_data_root="$GAME_DATA" --user_data_root="$USER_DATA" \
         --license_mask=1 --mnk_mode=true --always_win=true \
+        --freq_keeper=true \
         --window_width=960 --window_height=540 \
         --log_file=run.log --log_level=info >/dev/null 2>&1 & )
 }

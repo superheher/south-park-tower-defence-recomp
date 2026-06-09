@@ -1,0 +1,90 @@
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index 8fe5ca1..111f304 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -125,6 +125,12 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   std::atomic<bool> vsync_worker_running_;
+   system::object_ref<system::XHostThread> vsync_worker_thread_;
+ 
++  // cvar freq_keeper: low-priority host spinner that holds the package CPU
++  // frequency up while the title runs (powersave/EPP=power hosts otherwise
++  // never ramp HWP for the low-per-core-util serial render chain).
++  std::atomic<bool> freq_keeper_running_{false};
++  std::thread freq_keeper_thread_;
++
+   RegisterFile register_file_;
+   std::unique_ptr<CommandProcessor> command_processor_;
+ 
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 3a7f304..cb919b5 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -20,6 +20,13 @@
+ #include <mutex>
+ #include <utility>
+ 
++#if defined(__linux__)
++#include <pthread.h>
++#include <sys/resource.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
++
+ #include <rex/cvar.h>
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/flags.h>
+@@ -63,6 +70,15 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+ }
+ }  // namespace
+ 
++REXCVAR_DEFINE_BOOL(
++    freq_keeper, false, "GPU",
++    "Hold the package CPU frequency up while the title runs by burning one "
++    "low-priority (nice 19) core. Workaround for powersave/EPP=power hosts: "
++    "the serial guest->CP render chain keeps per-core utilization low (threads "
++    "migrate), HWP never ramps, and gameplay locks into 2-3-vblank cadences "
++    "from the first seconds after a cold (idle-menu) entry. Costs ~1 core of "
++    "power; prefer fixing the host EPP/governor where root is available.");
++
+ namespace rex::graphics {
+ 
+ // [pacing-diag] TEMP v2: defined in command_processor.cpp, fed from the vsync
+@@ -185,6 +201,26 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+   vsync_worker_thread_->set_name("GPU VSync");
+   vsync_worker_thread_->Create();
+ 
++  if (REXCVAR_GET(freq_keeper)) {
++    freq_keeper_running_.store(true, std::memory_order_relaxed);
++    freq_keeper_thread_ = std::thread([this]() {
++#if defined(__linux__)
++      pthread_setname_np(pthread_self(), "FreqKeeper");
++      // Lowest priority: never compete with game threads, only deny the
++      // package an idle state so HWP holds frequency.
++      setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 19);
++#endif
++      while (freq_keeper_running_.load(std::memory_order_relaxed)) {
++        for (int i = 0; i < 4096; ++i) {
++#if defined(__x86_64__) || defined(__i386__)
++          __builtin_ia32_pause();
++#endif
++        }
++      }
++    });
++    REXGPU_INFO("freq_keeper: low-priority frequency-hold spinner started");
++  }
++
+   if (REXCVAR_GET(trace_gpu_stream)) {
+     BeginTracing();
+   }
+@@ -193,6 +229,11 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+ }
+ 
+ void GraphicsSystem::Shutdown() {
++  if (freq_keeper_thread_.joinable()) {
++    freq_keeper_running_.store(false, std::memory_order_relaxed);
++    freq_keeper_thread_.join();
++  }
++
+   if (command_processor_) {
+     EndTracing();
+     command_processor_->Shutdown();
