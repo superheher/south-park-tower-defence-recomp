@@ -25,18 +25,29 @@ NOT required.
   on a user decision: record it under BLOCKED below, finish cleanly, stop. No
   busy-work iterations while waiting.
 
-## Ground truth on the lag (maintainer, 2026-06-09 — overrides ALL prior framings)
+## Ground truth on the lag (maintainer 2026-06-09 + night measurement — ROOT-CAUSED, two layers)
 
-- The lag is there **from the very first seconds of control on level 1, first
-  wave** — not only in late heavy waves.
-- **Menu/frontend: no lag. Game field: lag.** That delta is the thing to
-  explain and fix.
-- Prior framings — "only heavy combat" and "scales with entity count" — are
-  **wrong** per the maintainer's direct observation. He describes the behavior
-  as **"throttling"-like**, not mere fps dips.
-- Measure with a screen **video recording** (ffmpeg x11grab) + `[pacing-diag]`
-  log on a NATURAL level-1 start. The host is fully dedicated to this project —
-  recording/profiling is always OK.
+Maintainer: lag from the FIRST seconds of field control; menu fine; feels like
+"throttling". Night runs m1–m6 (video + pacing-diag v2 + perf + per-core freq
+sampling, artifacts /tmp/sp) explain all of it. The lag = exact vblank-divisor
+cadence locks (60/30/20/12 swaps/s) + game-time dilation (sim drops to 60/k;
+measured 2.5 s per countdown-second = slow-mo ⇒ the "throttling" feel). Layers:
+
+- **Layer A — CPU-frequency trap (the "first seconds" lock).** Host runs
+  intel_pstate ACTIVE+HWP, governor=powersave, **EPP=power**, 0.8–2.9 GHz.
+  Idling in menus sags clocks to ~1.0 GHz; field entry then costs >33 ms/frame
+  → clean 2–3-vblank lock (26–30 swaps) from the first seconds; the locked
+  chain keeps per-core util low (threads migrate) so HWP never ramps —
+  self-sustaining. Proven causal BOTH ways (m6a/m6b cold-soak runs: 35 s idle
+  at campaign select → enter): no aid = 26–30 lock @1.0–1.2 GHz; +1-core
+  nice-19 spinner = same scene 60.0 @2.9 GHz. Menu immune (≈20–140 draws/swap
+  fits 16.7 ms even at 1 GHz) — exactly the maintainer's menu-vs-field delta.
+- **Layer B — chain capacity (heavy waves).** At ~1500–1800 draws/swap the
+  serial guest→CP chain exceeds 16.7 ms at FULL 2.9 GHz → clean 30.0 lock
+  (iv 0:60:0:0:0). CP translate ≈10 µs/draw; "entity count" was wrong only as
+  the *sole* cause — draws/swap scales with waves and sets WHERE layer B bites.
+- Disproven: vblank delivery bursts (vbburst 0 always), guest double-submission
+  (draws/swap mode-invariant), host limiter (sleeps ≈0 in locks).
 
 ## What's known (validated — do not redo)
 
@@ -74,14 +85,18 @@ NOT required.
 
 ## Next steps (in order)
 
-1. **Measure first, fix nothing:** reproduce the maintainer-visible lag on a
-   natural level-1 start; record video + pacing log + one whole-process perf
-   window during visible lag. Characterize: constant-low vs stutter vs
-   degrading-over-time; menu-vs-field delta; first seconds vs later waves.
-2. Pick the lever by data: guest↔CP overlap (likely) and/or draw-batching
-   step 1.
-3. Re-measure against the success bar; final check = the maintainer plays and
-   confirms by feel.
+1. ~~Measure first~~ DONE (see Ground truth; pacing-diag v2 = patch 0017).
+2. **Layer A fix.** (a) Runtime: cvar-gated freq-keeper (1-core nice-19 spinner
+   thread in south_park_td while rendering) — implement, verify with the
+   m6 cold-soak protocol, ship as patch 0018. (b) **MAINTAINER MORNING
+   ONE-LINER (root, permanent, replaces the spinner):**
+   `echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference`
+   (or governor=performance / EPP=balance_performance persisted via tuned).
+3. **Layer B lever: guest↔CP pipeline overlap** (untried #1) — target: heavy
+   waves 30 → ≥45–50 swaps (success bar: dips to ~50 are acceptable).
+   Draw-batching/texture-arrays stays the fallback if overlap alone misses.
+4. Gate every change (detdiff + ab_both keep-bar + screenshots), re-measure
+   with the m6 cold-soak + heavy-wave protocol; final check = maintainer feel.
 
 ## BLOCKED
 
