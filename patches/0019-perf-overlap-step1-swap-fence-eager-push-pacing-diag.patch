@@ -1,0 +1,86 @@
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 7cbac34..cfe7387 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -36,6 +36,7 @@
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/user_module.h>
++#include <rex/thread.h>
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
+@@ -103,6 +104,10 @@ std::atomic<uint64_t> g_diag_sleep_ticks{0};
+ std::atomic<uint64_t> g_diag_draws{0};
+ std::atomic<uint64_t> g_diag_vblanks{0};
+ std::atomic<uint64_t> g_diag_vblank_bursts{0};
++// v2.1: split the CP frame slot — time blocked in-stream (WAIT_REG_MEM) and
++// time inside IssueSwap (present path), both inside the xlat batch wall.
++std::atomic<uint64_t> g_diag_wrm_ticks{0};
++std::atomic<uint64_t> g_diag_swap_ticks{0};
+ 
+ namespace {
+ 
+@@ -1196,11 +1201,16 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+       uint64_t draws = g_diag_draws.exchange(0, std::memory_order_relaxed);
+       uint64_t vbl = g_diag_vblanks.exchange(0, std::memory_order_relaxed);
+       uint64_t vbb = g_diag_vblank_bursts.exchange(0, std::memory_order_relaxed);
++      double wrm_ms =
++          double(g_diag_wrm_ticks.exchange(0, std::memory_order_relaxed)) * 1000.0 / double(nf);
++      double swp_ms =
++          double(g_diag_swap_ticks.exchange(0, std::memory_order_relaxed)) * 1000.0 / double(nf);
+       REXGPU_INFO(
+           "[pacing-diag] swaps {:.1f}/s loading={} iv {}:{}:{}:{}:{} maxiv {:.0f}ms xlat {:.0f}ms "
+-          "slept {:.0f}ms draws {} vb {} vbburst {}",
++          "slept {:.0f}ms wrm {:.0f}ms swp {:.0f}ms draws {} vb {} vbburst {}",
+           double(d) / win, ld, hist[0], hist[1], hist[2], hist[3], hist[4],
+-          double(max_iv) * 1000.0 / double(nf), xlat_ms - slept_ms, slept_ms, draws, vbl, vbb);
++          double(max_iv) * 1000.0 / double(nf), xlat_ms - slept_ms - wrm_ms - swp_ms, slept_ms,
++          wrm_ms, swp_ms, draws, vbl, vbb);
+       d = 0;
+       t0 = nn;
+       max_iv = 0;
+@@ -1236,9 +1246,25 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
+   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
+-  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++  {  // [pacing-diag] TEMP v2.1: present-path share of the CP frame slot
++    uint64_t st0 = rex::chrono::Clock::QueryHostTickCount();
++    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++    g_diag_swap_ticks.fetch_add(rex::chrono::Clock::QueryHostTickCount() - st0,
++                                std::memory_order_relaxed);
++  }
+ 
+   ++counter_;
++  // [perf overlap step 1] Surface the swap-advanced counter to the guest NOW instead of letting it
++  // sit until the next vsync tick. The guest's frame loop polls the counter fence in memory; that
++  // value only changes when an event stores it (vblank RefreshVblankFence / EVENT_WRITE_SHD), so
++  // after a swap that lands just past a vblank the guest idles up to a full vblank seeing a stale
++  // value -> its whole frame loop snaps to the 60 Hz grid -> heavy frames quantize to clean 30/20
++  // cadences (measured: iv 0:60:0:0:0 at ~1700 draws/swap). Pushing the live counter_ at swap
++  // execution (same value the next vblank would push, just earlier) plus waking the parked guest
++  // spin de-quantizes the chain: the guest starts frame N+1 when swap N is actually done. The
++  // value SERIES the guest observes is unchanged; only its visibility latency shrinks (<16.7 ms).
++  RefreshVblankFence();
++  rex::thread::NotifyVblank();
+   return true;
+ }
+ 
+@@ -1267,6 +1293,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+ 
+   bool is_memory = (wait_info & 0x10) != 0;
+ 
++  uint64_t diag_wrm_t0 = rex::chrono::Clock::QueryHostTickCount();  // [pacing-diag] TEMP v2.1
+   bool matched = false;
+   uint32_t spin_count = 0;  // [diag] detect a WAIT_REG_MEM that never satisfies
+   // [recomp fix: block-on-signal] Wall-clock start of CP-vblank-fence blocking, for a deadlock
+@@ -1394,6 +1421,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     }
+   } while (!matched);
+ 
++  g_diag_wrm_ticks.fetch_add(rex::chrono::Clock::QueryHostTickCount() - diag_wrm_t0,
++                             std::memory_order_relaxed);  // [pacing-diag] TEMP v2.1
+   return true;
+ }
+ 
