@@ -21,8 +21,9 @@ session; do not re-derive.
   password scrubbed from ALL history (it HAD been pushed to GitHub in the old
   origin/main ⇒ rotate the host password), ~369 frozen-track commits prefixed
   `[variant-a]`; LICENSE (MIT) + `docs/HISTORY.md` + `era/*` tags added.
-  Pre-rewrite mirror backup: `/home/h/src/recomp/backups/`. Force-push to
-  github.com/superheher/south-park-tower-defence-recomp pending maintainer GO.
+  Pre-rewrite mirror backup: `/home/h/src/recomp/backups/`. Published
+  (force-push, maintainer GO) 2026-06-10 to
+  github.com/superheher/south-park-tower-defence-recomp.
 - **FROZEN: variant A** (`varianta/`) — research asset, do NOT iterate.
 - **No Telegram.** Never message the maintainer via Telegram tools. Blocked →
   record under BLOCKED, finish cleanly, stop. No busy-work.
