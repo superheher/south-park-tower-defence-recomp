@@ -6,8 +6,12 @@ PowerPC executable, running on the [`rexglue-sdk`](https://github.com/rexglue/re
 runtime (with [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) /
 [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) as references/fallback).
 
-Part of the `sotuh-park-xbla-recomp` super-repository. See `../PLAN.md` for the
-roadmap and `../knowledge-base/` for analysis.
+**Status: v1.0 (2026-06-10)** — fully playable natively on Linux/Vulkan (boot →
+menus → matches → saves, audio + input), mostly-60 fps gameplay; the heaviest
+wave peaks still dip (the v2 plan: `docs/ROADMAP-V2.md`). The distilled result
+is the granular fix series against upstream rexglue-sdk in
+[`patches/`](patches/README.md); `STATUS.md` is the current state;
+`docs/HISTORY.md` is the map of this repository's full working history.
 
 > **Bring your own dump.** No copyrighted game code or assets are stored in this
 > repository. Everything derived from the game (the extracted `default.xex`,
@@ -32,3 +36,20 @@ cmake --preset win-amd64-debug
 cmake --build --preset win-amd64-debug --target south_park_td_codegen
 cmake --build --preset win-amd64-debug
 ```
+
+For the **Linux build and run** (the v1.0 target) see `docs/RUN-linux.md`;
+apply the SDK patch series first (`patches/README.md`). Note the Windows-port
+caveats in `docs/ROADMAP-V2.md` §"Windows port checklist".
+
+## Repository history
+
+This repository intentionally keeps its full working history (~520 commits),
+research dead ends included — notably the frozen from-scratch track
+(`[variant-a]`-prefixed commits, ~370 of them, between the `era/variant-a-start`
+and `era/variant-a-frozen` tags). `docs/HISTORY.md` is the reader's map; the
+curated change story is the patch series itself.
+
+## License
+
+MIT — see `LICENSE`. It covers this repository's code and documentation only;
+no game code or assets are stored here.

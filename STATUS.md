@@ -17,6 +17,12 @@ session; do not re-derive.
   repo). SDK rollback anchor: branch `checkpoint/2026-06-10-playable`
   (`c38a35e`) in rexglue-sdk = upstream `e8ce24f` + patch series 0001–0019
   (byte-verified == the shipped tree, `9e8c411`).
+- **Publication prep 2026-06-10:** one-time filter-repo rewrite — host sudo
+  password scrubbed from ALL history (it HAD been pushed to GitHub in the old
+  origin/main ⇒ rotate the host password), ~369 frozen-track commits prefixed
+  `[variant-a]`; LICENSE (MIT) + `docs/HISTORY.md` + `era/*` tags added.
+  Pre-rewrite mirror backup: `/home/h/src/recomp/backups/`. Force-push to
+  github.com/superheher/south-park-tower-defence-recomp pending maintainer GO.
 - **FROZEN: variant A** (`varianta/`) — research asset, do NOT iterate.
 - **No Telegram.** Never message the maintainer via Telegram tools. Blocked →
   record under BLOCKED, finish cleanly, stop. No busy-work.
