@@ -29,6 +29,7 @@ mkdir -p "$SHOTDIR"
 
 wid()      { timeout 4 xdotool search --classname south_park_td 2>/dev/null | tail -1; }  # timeout: X can glitch; never hang play
 fps_line() { grep 'pacing-diag' "$LOG" 2>/dev/null | tail -1 | grep -oE 'swaps [0-9.]+/s loading=(true|false)'; }
+loading()  { fps_line | grep -oE 'loading=(true|false)' | cut -d= -f2; }
 press()    { printf '%s 0 0' "${1:?mask}" >"$LIVE"; sleep "${2:-0.4}"; printf '0 0 0' >"$LIVE"; }
 
 kill_all() {            # exact-name match only -- never `pkill -f south_park_td` (matches this shell!)
@@ -50,7 +51,7 @@ launch_detached() {     # one fresh instance, fully detached so it survives this
         --license_mask=1 --mnk_mode=true --always_win=true \
         --freq_keeper=true \
         --window_width=960 --window_height=540 \
-        --log_file=run.log --log_level=info >/dev/null 2>&1 & )
+        --log_file=run.log --log_level="${REX_LOG_LEVEL:-info}" ${REX_EXTRA_ARGS:-} >/dev/null 2>&1 & )
 }
 
 # Launch and wait for the first present; retry the intermittent boot-deadlock (see KB doc 60).
@@ -95,7 +96,7 @@ nav_to_level() {
 
 case "${1:-}" in
   play)
-    if [ "${2:-}" = "--keep" ] && [ -n "$(wid)" ]; then echo "[play] reusing running instance"; exit 0; fi
+    if [ "${2:-}" = "--keep" ] && [ -n "$(wid)" ] && [ "$(loading)" = "false" ]; then echo "[play] reusing running instance"; exit 0; fi
     boot_until_title || { echo "[play] boot failed"; exit 1; }
     if nav_to_level; then
       sleep 2; id=$(wid); out="$SHOTDIR/play_result.png"
@@ -150,7 +151,7 @@ usage: gamectl.sh <command>
   shot <name>          capture the game window -> $REX_SHOT_DIR/<name>.png (default /tmp/sp)
   press <mask> [s] | move <lx> <ly> [s] | set <mask> <lx> <ly> | release | wid
   masks: 0010=START 1000=A 2000=B 0020=BACK 0001/2/4/8=DPAD U/D/L/R ; sticks: [-32768,32767]
-  env: REX_GAME_DIR REX_GAME_DATA REX_USER_DATA REX_SHOT_DIR
+  env: REX_GAME_DIR REX_GAME_DATA REX_USER_DATA REX_SHOT_DIR REX_LOG_LEVEL REX_EXTRA_ARGS
 EOF
    exit 2 ;;
 esac
