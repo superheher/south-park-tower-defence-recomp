@@ -2,7 +2,7 @@
 
 > Rewrite this file in place; do NOT let it grow. History lives in git; closed
 > investigations live in `docs/archive/` and `varianta/archive/`.
-> Last update: 2026-06-10 — **v1.0 SHIPPED, project parked.**
+> Last update: 2026-06-14 — **v1.0 SHIPPED, parked.** All repos synced/published.
 
 ## State: v1.0 (maintainer decision 2026-06-10)
 
@@ -24,6 +24,13 @@ session; do not re-derive.
   Pre-rewrite mirror backup: `/home/h/src/recomp/backups/`. Published
   (force-push, maintainer GO) 2026-06-10 to
   github.com/superheher/south-park-tower-defence-recomp.
+- **Repos synced 2026-06-14 (maintainer GO):** the SDK-track work had landed
+  in THIS repo only. Now propagated: super-repo `rexglue-recomps` (35 local
+  commits — the whole perf arc + v1.0 + publication) pushed to its origin/main;
+  the June perf/v1.0 lessons recorded in the knowledge-base and pushed
+  (`general/55` performance & pacing, `general/95` triage,
+  `titles/south-park-lgtdp/75`). The SDK working tree stays the applied patch
+  series (reconstructable from `patches/`; anchor branch `c38a35e`).
 - **FROZEN: variant A** (`varianta/`) — research asset, do NOT iterate.
 - **No Telegram.** Never message the maintainer via Telegram tools. Blocked →
   record under BLOCKED, finish cleanly, stop. No busy-work.
